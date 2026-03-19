@@ -167,6 +167,9 @@ pub const OpenAiCompatibleProvider = struct {
     /// Whether this provider supports native OpenAI-style tool_calls.
     /// When false, the agent uses XML tool format via system prompt.
     native_tools: bool = true,
+    /// When true, disable streaming (force non-streaming requests).
+    /// Required for providers where native tool_calls only work in non-streaming mode.
+    disable_streaming: bool = false,
     /// When set, cap max_tokens in non-streaming requests to this value.
     /// Some providers (e.g. Fireworks) reject large max_tokens without streaming.
     max_tokens_non_streaming: ?u32 = null,
@@ -841,8 +844,9 @@ pub const OpenAiCompatibleProvider = struct {
         return result;
     }
 
-    fn supportsStreamingImpl(_: *anyopaque) bool {
-        return true;
+    fn supportsStreamingImpl(ptr: *anyopaque) bool {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        return !self.disable_streaming;
     }
 
     fn chatWithSystemImpl(
@@ -1105,8 +1109,12 @@ fn buildChatRequestBody(
 
     try buf.append(allocator, ']');
     try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
-    if (thinking_param and reasoning_enabled) {
-        try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\"}");
+    if (thinking_param) {
+        if (reasoning_enabled) {
+            try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\"}");
+        } else {
+            try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"disabled\"}");
+        }
     }
     if (enable_thinking_param and reasoning_enabled) {
         try buf.appendSlice(allocator, ",\"enable_thinking\":true");
@@ -1150,8 +1158,12 @@ fn buildStreamingChatRequestBody(
 
     try buf.append(allocator, ']');
     try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
-    if (thinking_param and reasoning_enabled) {
-        try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\"}");
+    if (thinking_param) {
+        if (reasoning_enabled) {
+            try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\"}");
+        } else {
+            try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"disabled\"}");
+        }
     }
     if (enable_thinking_param and reasoning_enabled) {
         try buf.appendSlice(allocator, ",\"enable_thinking\":true");
@@ -1361,7 +1373,7 @@ test "buildChatRequestBody emits reasoning_split when configured" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_split\":true") != null);
 }
 
-test "buildChatRequestBody omits provider thinking params when reasoning_effort none" {
+test "buildChatRequestBody sends thinking disabled when reasoning_effort none" {
     const allocator = std.testing.allocator;
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("test")};
     const req = root.ChatRequest{
@@ -1371,7 +1383,7 @@ test "buildChatRequestBody omits provider thinking params when reasoning_effort 
     };
     const body = try buildChatRequestBody(allocator, req, "glm-4.7-thinking", 0.7, false, true, true, true);
     defer allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"disabled\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":true") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_split\":true") == null);
 }
@@ -1782,7 +1794,7 @@ test "buildStreamingChatRequestBody contains stream true" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"include_usage\":true") != null);
 }
 
-test "buildStreamingChatRequestBody omits provider thinking params when reasoning_effort none" {
+test "buildStreamingChatRequestBody sends thinking disabled when reasoning_effort none" {
     const allocator = std.testing.allocator;
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
     const req = root.ChatRequest{
@@ -1792,7 +1804,7 @@ test "buildStreamingChatRequestBody omits provider thinking params when reasonin
     };
     const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7, false, true, true, true);
     defer allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"disabled\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":true") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_split\":true") == null);
 }

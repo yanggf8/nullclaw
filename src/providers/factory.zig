@@ -57,6 +57,8 @@ const CompatProvider = struct {
     /// When true, include `"reasoning_split":true` in request bodies
     /// when reasoning_effort is set. Used by MiniMax to separate reasoning output.
     reasoning_split_param: bool = false,
+    /// When true, disable streaming so native tool_calls work correctly.
+    disable_streaming: bool = false,
 };
 
 const compat_providers = [_]CompatProvider{
@@ -109,9 +111,9 @@ const compat_providers = [_]CompatProvider{
     // ── China Providers — CN endpoints ────────────────────────────────────
     .{ .name = "moonshot-cn", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
     .{ .name = "kimi-cn", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
-    .{ .name = "glm-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
-    .{ .name = "zhipu-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
-    .{ .name = "bigmodel", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
+    .{ .name = "glm-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = true, .thinking_param = false, .disable_streaming = true },
+    .{ .name = "zhipu-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = true, .thinking_param = false, .disable_streaming = true },
+    .{ .name = "bigmodel", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = true, .thinking_param = false, .disable_streaming = true },
     .{ .name = "zai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
     .{ .name = "z.ai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
     .{ .name = "minimax-cn", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
@@ -389,6 +391,7 @@ pub const ProviderHolder = union(enum) {
                     if (c.thinking_param) prov.thinking_param = true;
                     if (c.enable_thinking_param) prov.enable_thinking_param = true;
                     if (c.reasoning_split_param) prov.reasoning_split_param = true;
+                    if (c.disable_streaming) prov.disable_streaming = true;
                 }
 
                 // Apply config-level native_tools override (can only force to false).
