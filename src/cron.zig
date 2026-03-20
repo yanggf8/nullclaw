@@ -1,10 +1,18 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const platform = @import("platform.zig");
 const bus = @import("bus.zig");
 const fs_compat = @import("fs_compat.zig");
 const json_util = @import("json_util.zig");
 const Config = @import("config.zig").Config;
+
+const sqlite_mod = if (build_options.enable_sqlite)
+    @import("memory/engines/sqlite.zig")
+else
+    @import("memory/engines/sqlite_disabled.zig");
+const c = sqlite_mod.c;
+const SQLITE_STATIC = sqlite_mod.SQLITE_STATIC;
 
 const log = std.log.scoped(.cron);
 
@@ -173,8 +181,8 @@ pub fn normalizeExpression(expression: []const u8) !CronNormalized {
     var field_count: usize = 0;
     var in_field = false;
 
-    for (trimmed) |c| {
-        if (c == ' ' or c == '\t') {
+    for (trimmed) |ch| {
+        if (ch == ' ' or ch == '\t') {
             if (in_field) {
                 in_field = false;
             }
@@ -400,7 +408,6 @@ pub const CronScheduler = struct {
     jobs: std.ArrayListUnmanaged(CronJob),
     runs: std.ArrayListUnmanaged(CronRun) = .empty,
     next_run_id: u64 = 1,
-    next_job_id: u64 = 1,
     max_tasks: usize,
     enabled: bool,
     allocator: std.mem.Allocator,
@@ -457,15 +464,23 @@ pub const CronScheduler = struct {
     }
 
     fn allocateJobId(self: *CronScheduler, prefix: []const u8) ![]const u8 {
-        while (true) {
-            var id_buf: [48]u8 = undefined;
-            const id = std.fmt.bufPrint(&id_buf, "{s}-{d}", .{ prefix, self.next_job_id }) catch unreachable;
-            self.next_job_id +%= 1;
-            if (self.next_job_id == 0) self.next_job_id = 1;
-            if (self.getJob(id) == null) {
-                return try self.allocator.dupe(u8, id);
-            }
-        }
+        // UUID v4: 16 random bytes formatted as 8-4-4-4-12 hex groups
+        var rand_bytes: [16]u8 = undefined;
+        std.crypto.random.bytes(&rand_bytes);
+        // Set version 4 and variant bits (RFC 4122)
+        rand_bytes[6] = (rand_bytes[6] & 0x0f) | 0x40;
+        rand_bytes[8] = (rand_bytes[8] & 0x3f) | 0x80;
+        // Format: prefix-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+        var id_buf: [80]u8 = undefined;
+        const id = std.fmt.bufPrint(&id_buf, "{s}-{x:0>8}-{x:0>4}-{x:0>4}-{x:0>4}-{x:0>12}", .{
+            prefix,
+            std.mem.readInt(u32, rand_bytes[0..4], .big),
+            std.mem.readInt(u16, rand_bytes[4..6], .big),
+            std.mem.readInt(u16, rand_bytes[6..8], .big),
+            std.mem.readInt(u16, rand_bytes[8..10], .big),
+            std.mem.readInt(u48, rand_bytes[10..16], .big),
+        }) catch unreachable;
+        return try self.allocator.dupe(u8, id);
     }
 
     fn clearJobs(self: *CronScheduler) void {
@@ -542,7 +557,7 @@ pub const CronScheduler = struct {
             .model = if (model) |m| try self.allocator.dupe(u8, m) else null,
             .delivery = .{
                 .mode = delivery.mode,
-                .channel = if (delivery.channel) |c| try self.allocator.dupe(u8, c) else null,
+                .channel = if (delivery.channel) |ch| try self.allocator.dupe(u8, ch) else null,
                 .account_id = if (delivery.account_id) |aid| try self.allocator.dupe(u8, aid) else null,
                 .to = if (delivery.to) |t| try self.allocator.dupe(u8, t) else null,
                 .channel_owned = delivery.channel != null,
@@ -1232,7 +1247,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
         // Agent jobs may omit "command" and rely solely on "prompt".
         // Shell jobs still require a command.
         const command: []const u8 = blk: {
-            if (command_raw) |c| break :blk c;
+            if (command_raw) |cmd_raw| break :blk cmd_raw;
             if (job_type == .agent) {
                 if (prompt) |p| break :blk p;
             }
@@ -1307,7 +1322,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .delete_after_run = delete_after_run,
             .delivery = .{
                 .mode = delivery_mode,
-                .channel = if (delivery_channel) |c| try scheduler.allocator.dupe(u8, c) else null,
+                .channel = if (delivery_channel) |ch| try scheduler.allocator.dupe(u8, ch) else null,
                 .account_id = if (delivery_account_id) |aid| try scheduler.allocator.dupe(u8, aid) else null,
                 .to = if (delivery_to) |t| try scheduler.allocator.dupe(u8, t) else null,
                 .channel_owned = delivery_channel != null,
@@ -1363,6 +1378,362 @@ pub fn deliverResult(
     return true;
 }
 
+// ── SQLite Persistence ───────────────────────────────────────────
+
+/// Get the path to the cron SQLite DB: ~/.nullclaw/cron.db
+fn cronDbPath(allocator: std.mem.Allocator) ![]const u8 {
+    const home = try platform.getHomeDir(allocator);
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron.db" });
+}
+
+/// Open a SQLite DB at the given null-terminated path.
+/// Caller must call c.sqlite3_close on the returned handle.
+fn openCronDbAtPath(path_z: [*:0]const u8) !*c.sqlite3 {
+    if (!build_options.enable_sqlite) return error.SqliteDisabled;
+
+    var db: ?*c.sqlite3 = null;
+    const rc = c.sqlite3_open(path_z, &db);
+    if (rc != c.SQLITE_OK) {
+        if (db) |d| _ = c.sqlite3_close(d);
+        return error.SqliteOpenFailed;
+    }
+    if (db) |d| {
+        _ = c.sqlite3_busy_timeout(d, 5000);
+        var err_msg: [*c]u8 = null;
+        _ = c.sqlite3_exec(d, "PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;", null, null, &err_msg);
+        if (err_msg) |msg| c.sqlite3_free(msg);
+    }
+    return db.?;
+}
+
+/// Open (and create if needed) the cron SQLite DB.
+/// Caller must call c.sqlite3_close on the returned handle.
+fn openCronDb(allocator: std.mem.Allocator) !*c.sqlite3 {
+    if (!build_options.enable_sqlite) return error.SqliteDisabled;
+
+    try ensureCronDir(allocator);
+    const path = try cronDbPath(allocator);
+    defer allocator.free(path);
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    return openCronDbAtPath(path_z);
+}
+
+const CRON_TABLE_SQL =
+    \\CREATE TABLE IF NOT EXISTS cron_jobs (
+    \\  id                  TEXT PRIMARY KEY,
+    \\  expression          TEXT NOT NULL,
+    \\  job_type            TEXT NOT NULL DEFAULT 'shell',
+    \\  command             TEXT,
+    \\  prompt              TEXT,
+    \\  name                TEXT,
+    \\  model               TEXT,
+    \\  next_run_secs       INTEGER NOT NULL DEFAULT 0,
+    \\  last_run_secs       INTEGER,
+    \\  last_status         TEXT,
+    \\  paused              INTEGER NOT NULL DEFAULT 0,
+    \\  one_shot            INTEGER NOT NULL DEFAULT 0,
+    \\  delete_after_run    INTEGER NOT NULL DEFAULT 0,
+    \\  enabled             INTEGER NOT NULL DEFAULT 1,
+    \\  delivery_mode       TEXT NOT NULL DEFAULT 'none',
+    \\  delivery_channel    TEXT,
+    \\  delivery_account_id TEXT,
+    \\  delivery_to         TEXT,
+    \\  created_at_s        INTEGER NOT NULL DEFAULT 0
+    \\)
+;
+
+/// Ensure the cron_jobs table exists in the given DB.
+fn ensureCronTable(db: *c.sqlite3) !void {
+    var err_msg: [*c]u8 = null;
+    const rc = c.sqlite3_exec(db, CRON_TABLE_SQL, null, null, &err_msg);
+    if (rc != c.SQLITE_OK) {
+        if (err_msg) |msg| c.sqlite3_free(msg);
+        return error.CronTableCreateFailed;
+    }
+}
+
+/// Insert or replace a single job row in the DB.
+fn dbSaveJob(db: *c.sqlite3, job: *const CronJob) !void {
+    const sql =
+        "INSERT OR REPLACE INTO cron_jobs " ++
+        "(id, expression, job_type, command, prompt, name, model, " ++
+        "next_run_secs, last_run_secs, last_status, paused, one_shot, " ++
+        "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
+        "delivery_account_id, delivery_to, created_at_s) " ++
+        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)";
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
+    if (rc != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+
+    _ = c.sqlite3_bind_text(stmt, 1, job.id.ptr, @intCast(job.id.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_text(stmt, 2, job.expression.ptr, @intCast(job.expression.len), SQLITE_STATIC);
+    const jt = job.job_type.asStr();
+    _ = c.sqlite3_bind_text(stmt, 3, jt.ptr, @intCast(jt.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_text(stmt, 4, job.command.ptr, @intCast(job.command.len), SQLITE_STATIC);
+    if (job.prompt) |p| {
+        _ = c.sqlite3_bind_text(stmt, 5, p.ptr, @intCast(p.len), SQLITE_STATIC);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 5);
+    }
+    if (job.name) |n| {
+        _ = c.sqlite3_bind_text(stmt, 6, n.ptr, @intCast(n.len), SQLITE_STATIC);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 6);
+    }
+    if (job.model) |m| {
+        _ = c.sqlite3_bind_text(stmt, 7, m.ptr, @intCast(m.len), SQLITE_STATIC);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 7);
+    }
+    _ = c.sqlite3_bind_int64(stmt, 8, job.next_run_secs);
+    if (job.last_run_secs) |lrs| {
+        _ = c.sqlite3_bind_int64(stmt, 9, lrs);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 9);
+    }
+    if (job.last_status) |ls| {
+        _ = c.sqlite3_bind_text(stmt, 10, ls.ptr, @intCast(ls.len), SQLITE_STATIC);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 10);
+    }
+    _ = c.sqlite3_bind_int(stmt, 11, if (job.paused) 1 else 0);
+    _ = c.sqlite3_bind_int(stmt, 12, if (job.one_shot) 1 else 0);
+    _ = c.sqlite3_bind_int(stmt, 13, if (job.delete_after_run) 1 else 0);
+    _ = c.sqlite3_bind_int(stmt, 14, if (job.enabled) 1 else 0);
+    const dm = job.delivery.mode.asStr();
+    _ = c.sqlite3_bind_text(stmt, 15, dm.ptr, @intCast(dm.len), SQLITE_STATIC);
+    if (job.delivery.channel) |ch| {
+        _ = c.sqlite3_bind_text(stmt, 16, ch.ptr, @intCast(ch.len), SQLITE_STATIC);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 16);
+    }
+    if (job.delivery.account_id) |aid| {
+        _ = c.sqlite3_bind_text(stmt, 17, aid.ptr, @intCast(aid.len), SQLITE_STATIC);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 17);
+    }
+    if (job.delivery.to) |t| {
+        _ = c.sqlite3_bind_text(stmt, 18, t.ptr, @intCast(t.len), SQLITE_STATIC);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 18);
+    }
+    _ = c.sqlite3_bind_int64(stmt, 19, job.created_at_s);
+
+    rc = c.sqlite3_step(stmt);
+    if (rc != c.SQLITE_DONE) return error.StepFailed;
+}
+
+/// Delete a single job row by id.
+fn dbDeleteJob(db: *c.sqlite3, id: []const u8) !void {
+    const sql = "DELETE FROM cron_jobs WHERE id = ?1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
+    if (rc != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+
+    _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
+    rc = c.sqlite3_step(stmt);
+    if (rc != c.SQLITE_DONE) return error.StepFailed;
+}
+
+/// Read a nullable TEXT column as an optional allocated slice.
+fn dbColumnTextOpt(stmt: ?*c.sqlite3_stmt, col: c_int, allocator: std.mem.Allocator) !?[]const u8 {
+    if (c.sqlite3_column_type(stmt, col) == c.SQLITE_NULL) return null;
+    const raw = c.sqlite3_column_text(stmt, col);
+    if (raw == null or raw[0] == 0) return null;
+    const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
+    if (len == 0) return null;
+    return try allocator.dupe(u8, raw[0..len]);
+}
+
+/// Read a TEXT column as a required allocated slice (errors on null/empty).
+fn dbColumnText(stmt: ?*c.sqlite3_stmt, col: c_int, allocator: std.mem.Allocator) ![]const u8 {
+    const raw = c.sqlite3_column_text(stmt, col);
+    if (raw == null) return error.NullColumn;
+    const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
+    if (len == 0) return error.EmptyColumn;
+    return try allocator.dupe(u8, raw[0..len]);
+}
+
+/// Load all rows from cron_jobs into scheduler, replacing existing jobs.
+fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronScheduler) !void {
+    const sql =
+        "SELECT id, expression, job_type, command, prompt, name, model, " ++
+        "next_run_secs, last_run_secs, last_status, paused, one_shot, " ++
+        "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
+        "delivery_account_id, delivery_to, created_at_s " ++
+        "FROM cron_jobs ORDER BY rowid ASC";
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    const rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
+    if (rc != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        const id = dbColumnText(stmt, 0, allocator) catch continue;
+        errdefer allocator.free(id);
+        const expression = dbColumnText(stmt, 1, allocator) catch {
+            allocator.free(id);
+            continue;
+        };
+        errdefer allocator.free(expression);
+
+        const job_type_str = dbColumnText(stmt, 2, allocator) catch {
+            allocator.free(id);
+            allocator.free(expression);
+            continue;
+        };
+        const job_type = JobType.parse(job_type_str);
+        allocator.free(job_type_str);
+
+        // command may be null for agent jobs — fall back to prompt
+        const command_opt = try dbColumnTextOpt(stmt, 3, allocator);
+        const prompt_opt = try dbColumnTextOpt(stmt, 4, allocator);
+
+        const command: []const u8 = blk: {
+            if (command_opt) |cmd| break :blk cmd;
+            if (job_type == .agent) {
+                if (prompt_opt) |p| break :blk try allocator.dupe(u8, p) else break :blk try allocator.dupe(u8, "");
+            }
+            allocator.free(id);
+            allocator.free(expression);
+            if (prompt_opt) |p| allocator.free(p);
+            continue;
+        };
+        errdefer allocator.free(command);
+
+        const name_opt = try dbColumnTextOpt(stmt, 5, allocator);
+        const model_opt = try dbColumnTextOpt(stmt, 6, allocator);
+
+        const next_run_secs = c.sqlite3_column_int64(stmt, 7);
+        const last_run_secs: ?i64 = if (c.sqlite3_column_type(stmt, 8) == c.SQLITE_NULL)
+            null
+        else
+            c.sqlite3_column_int64(stmt, 8);
+
+        // last_status is always a short literal ("ok"/"error"/null).
+        // Read it without allocating so we can match to a static string.
+        const last_status_raw: ?[]const u8 = blk: {
+            if (c.sqlite3_column_type(stmt, 9) == c.SQLITE_NULL) break :blk null;
+            const raw = c.sqlite3_column_text(stmt, 9);
+            if (raw == null) break :blk null;
+            const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 9));
+            if (len == 0) break :blk null;
+            break :blk raw[0..len]; // points into SQLite's internal buffer; use before next step
+        };
+        const paused = c.sqlite3_column_int(stmt, 10) != 0;
+        const one_shot = c.sqlite3_column_int(stmt, 11) != 0;
+        const delete_after_run = c.sqlite3_column_int(stmt, 12) != 0;
+        const enabled = c.sqlite3_column_int(stmt, 13) != 0;
+
+        const delivery_mode_str = try dbColumnTextOpt(stmt, 14, allocator);
+        const delivery_mode = if (delivery_mode_str) |s| blk: {
+            const dm = DeliveryMode.parse(s);
+            allocator.free(s);
+            break :blk dm;
+        } else DeliveryMode.none;
+
+        const delivery_channel = try dbColumnTextOpt(stmt, 15, allocator);
+        const delivery_account_id = try dbColumnTextOpt(stmt, 16, allocator);
+        const delivery_to = try dbColumnTextOpt(stmt, 17, allocator);
+        const created_at_s = c.sqlite3_column_int64(stmt, 18);
+
+        // Normalize last_status to a static literal ("ok"/"error"/null).
+        // freeJobOwned does NOT free last_status, so we must never heap-allocate it.
+        const last_status: ?[]const u8 = if (last_status_raw) |ls| blk: {
+            if (std.mem.eql(u8, ls, "ok") or std.mem.eql(u8, ls, "success")) break :blk "ok";
+            if (std.mem.eql(u8, ls, "error") or std.mem.eql(u8, ls, "failed")) break :blk "error";
+            break :blk null; // unknown value — treat as no status
+        } else null;
+
+        try scheduler.jobs.append(allocator, .{
+            .id = id,
+            .expression = expression,
+            .command = command,
+            .next_run_secs = next_run_secs,
+            .last_run_secs = last_run_secs,
+            .last_status = last_status,
+            .paused = paused,
+            .one_shot = one_shot,
+            .job_type = job_type,
+            .prompt = prompt_opt,
+            .name = name_opt,
+            .model = model_opt,
+            .enabled = enabled,
+            .delete_after_run = delete_after_run,
+            .created_at_s = created_at_s,
+            .delivery = .{
+                .mode = delivery_mode,
+                .channel = delivery_channel,
+                .account_id = delivery_account_id,
+                .to = delivery_to,
+                .channel_owned = delivery_channel != null,
+                .account_id_owned = delivery_account_id != null,
+                .to_owned = delivery_to != null,
+            },
+        });
+    }
+}
+
+/// Count rows in cron_jobs table. Returns 0 on any error.
+fn dbCountJobs(db: *c.sqlite3) usize {
+    const sql = "SELECT COUNT(*) FROM cron_jobs";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return 0;
+    defer _ = c.sqlite3_finalize(stmt);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+    const n = c.sqlite3_column_int64(stmt, 0);
+    return if (n < 0) 0 else @intCast(n);
+}
+
+/// Migrate existing cron.json into the DB (if DB is empty and JSON exists).
+/// After import, renames cron.json to cron.json.migrated.
+fn migrateJsonToDb(allocator: std.mem.Allocator, db: *c.sqlite3) void {
+    // Load from JSON into a temporary scheduler
+    var temp = CronScheduler.init(allocator, 65535, true);
+    defer temp.deinit();
+    loadJobsWithPolicy(&temp, .best_effort) catch return;
+    if (temp.jobs.items.len == 0) return;
+
+    // Begin transaction for atomicity
+    var err_msg: [*c]u8 = null;
+    _ = c.sqlite3_exec(db, "BEGIN;", null, null, &err_msg);
+    if (err_msg) |msg| c.sqlite3_free(msg);
+
+    var all_ok = true;
+    for (temp.jobs.items) |*job| {
+        dbSaveJob(db, job) catch {
+            all_ok = false;
+            break;
+        };
+    }
+
+    if (all_ok) {
+        var commit_err: [*c]u8 = null;
+        _ = c.sqlite3_exec(db, "COMMIT;", null, null, &commit_err);
+        if (commit_err) |msg| c.sqlite3_free(msg);
+    } else {
+        var rollback_err: [*c]u8 = null;
+        _ = c.sqlite3_exec(db, "ROLLBACK;", null, null, &rollback_err);
+        if (rollback_err) |msg| c.sqlite3_free(msg);
+        return;
+    }
+
+    // Rename cron.json → cron.json.migrated so we don't re-import
+    const json_path = cronJsonPath(allocator) catch return;
+    defer allocator.free(json_path);
+    const migrated_path = std.fmt.allocPrint(allocator, "{s}.migrated", .{json_path}) catch return;
+    defer allocator.free(migrated_path);
+    std.fs.renameAbsolute(json_path, migrated_path) catch {};
+    log.info("Migrated {d} cron jobs from cron.json to cron.db", .{temp.jobs.items.len});
+}
+
 // ── JSON Persistence ─────────────────────────────────────────────
 
 /// Serializable representation of a cron job for JSON persistence.
@@ -1401,8 +1772,59 @@ fn ensureCronDir(allocator: std.mem.Allocator) !void {
     };
 }
 
-/// Save scheduler jobs to ~/.nullclaw/cron.json.
+/// Save scheduler jobs to the SQLite DB (~/.nullclaw/cron.db).
+/// Falls back to cron.json if SQLite is unavailable or fails.
 pub fn saveJobs(scheduler: *const CronScheduler) !void {
+    if (build_options.enable_sqlite) {
+        if (saveJobsToDb(scheduler)) {
+            return;
+        } else |err| {
+            log.warn("cron DB save failed ({s}); falling back to cron.json", .{@errorName(err)});
+        }
+    }
+    try saveJobsToJson(scheduler);
+}
+
+/// Write all in-memory jobs to the cron.db using a transaction.
+fn saveJobsToDb(scheduler: *const CronScheduler) !void {
+    const db = try openCronDb(scheduler.allocator);
+    defer _ = c.sqlite3_close(db);
+
+    try ensureCronTable(db);
+
+    var err_msg: [*c]u8 = null;
+    var rc = c.sqlite3_exec(db, "BEGIN;", null, null, &err_msg);
+    if (err_msg) |msg| c.sqlite3_free(msg);
+    if (rc != c.SQLITE_OK) return error.TransactionBeginFailed;
+
+    // Delete all then re-insert (simple and correct for full-scheduler saves)
+    var del_err: [*c]u8 = null;
+    rc = c.sqlite3_exec(db, "DELETE FROM cron_jobs;", null, null, &del_err);
+    if (del_err) |msg| c.sqlite3_free(msg);
+    if (rc != c.SQLITE_OK) {
+        var rb_err: [*c]u8 = null;
+        _ = c.sqlite3_exec(db, "ROLLBACK;", null, null, &rb_err);
+        if (rb_err) |msg| c.sqlite3_free(msg);
+        return error.DeleteFailed;
+    }
+
+    for (scheduler.jobs.items) |*job| {
+        dbSaveJob(db, job) catch |err| {
+            var rb_err: [*c]u8 = null;
+            _ = c.sqlite3_exec(db, "ROLLBACK;", null, null, &rb_err);
+            if (rb_err) |msg| c.sqlite3_free(msg);
+            return err;
+        };
+    }
+
+    var commit_err: [*c]u8 = null;
+    rc = c.sqlite3_exec(db, "COMMIT;", null, null, &commit_err);
+    if (commit_err) |msg| c.sqlite3_free(msg);
+    if (rc != c.SQLITE_OK) return error.TransactionCommitFailed;
+}
+
+/// Save scheduler jobs to ~/.nullclaw/cron.json (legacy / fallback).
+fn saveJobsToJson(scheduler: *const CronScheduler) !void {
     try ensureCronDir(scheduler.allocator);
     const path = try cronJsonPath(scheduler.allocator);
     defer scheduler.allocator.free(path);
@@ -1500,25 +1922,65 @@ pub fn saveJobs(scheduler: *const CronScheduler) !void {
     try writeFileAtomic(scheduler.allocator, path, buf.items);
 }
 
-/// Load jobs from ~/.nullclaw/cron.json into the scheduler.
+/// Load jobs from the SQLite DB (primary) or cron.json (fallback) into the scheduler.
 pub fn loadJobs(scheduler: *CronScheduler) !void {
+    if (build_options.enable_sqlite) {
+        if (loadJobsFromDb(scheduler)) {
+            // DB loaded successfully. If it returned jobs, we're done. If it returned
+            // zero jobs, also check cron.json — a prior saveJobs() DB failure may have
+            // written new state there while the DB remained stale.
+            if (scheduler.jobs.items.len > 0) return;
+            log.info("cron DB is empty; checking cron.json for unsynced jobs", .{});
+        } else |err| {
+            log.warn("cron DB load failed ({s}); falling back to cron.json", .{@errorName(err)});
+        }
+    }
     try loadJobsWithPolicy(scheduler, .best_effort);
 }
 
-/// Load jobs from ~/.nullclaw/cron.json; unlike loadJobs, this returns
-/// parse/read errors (except missing file/path).
+/// Load jobs from the SQLite DB; returns parse/read errors (except missing file).
 pub fn loadJobsStrict(scheduler: *CronScheduler) !void {
+    if (build_options.enable_sqlite) {
+        try loadJobsFromDb(scheduler);
+        if (scheduler.jobs.items.len > 0) return;
+    }
     try loadJobsWithPolicy(scheduler, .strict);
+}
+
+/// Load all rows from cron.db into the scheduler.
+/// If DB is empty and cron.json exists, migrates automatically.
+fn loadJobsFromDb(scheduler: *CronScheduler) !void {
+    const db = try openCronDb(scheduler.allocator);
+    defer _ = c.sqlite3_close(db);
+
+    try ensureCronTable(db);
+
+    // If DB is empty, try migrating from cron.json
+    if (dbCountJobs(db) == 0) {
+        migrateJsonToDb(scheduler.allocator, db);
+    }
+
+    try dbLoadAllJobs(db, scheduler.allocator, scheduler);
 }
 
 /// Replace in-memory jobs with the persisted store content.
 pub fn reloadJobs(scheduler: *CronScheduler) !void {
     var loaded = CronScheduler.init(scheduler.allocator, scheduler.max_tasks, scheduler.enabled);
     defer loaded.deinit();
+
+    if (build_options.enable_sqlite) {
+        loadJobsFromDb(&loaded) catch |err| {
+            log.warn("cron DB reload failed ({s}); healing from in-memory state", .{@errorName(err)});
+            try saveJobs(scheduler);
+            return;
+        };
+        std.mem.swap(std.ArrayListUnmanaged(CronJob), &scheduler.jobs, &loaded.jobs);
+        return;
+    }
+
     loadJobsStrict(&loaded) catch |err| {
         if (isRecoverableCronStoreError(err)) {
             // Heal malformed/truncated cron.json by persisting current in-memory jobs.
-            // This prevents endless reload warnings after upgrades or interrupted writes.
             try saveJobs(scheduler);
             return;
         }
@@ -1800,6 +2262,25 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
         }
     }
 
+    // Build the job in-memory to get an ID and computed next_run_secs,
+    // then write it atomically to the DB (no load-all required).
+    if (build_options.enable_sqlite) db_blk: {
+        var temp = CronScheduler.init(allocator, 65535, true);
+        defer temp.deinit();
+        const job = temp.addJob(expression, command) catch break :db_blk;
+        const db = openCronDb(allocator) catch break :db_blk;
+        defer _ = c.sqlite3_close(db);
+        ensureCronTable(db) catch break :db_blk;
+        // Migrate any legacy cron.json jobs before inserting so they are not lost.
+        if (dbCountJobs(db) == 0) migrateJsonToDb(allocator, db);
+        _ = dbSaveJob(db, job) catch break :db_blk;
+        log.info("Added cron job {s}", .{job.id});
+        log.info("  Expr: {s}", .{job.expression});
+        log.info("  Next: {d}", .{job.next_run_secs});
+        log.info("  Cmd : {s}", .{job.command});
+        return;
+    }
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -1842,6 +2323,22 @@ pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prom
         }
     }
 
+    if (build_options.enable_sqlite) db_blk: {
+        var temp = CronScheduler.init(allocator, 65535, true);
+        defer temp.deinit();
+        const job = temp.addAgentJob(expression, prompt, model, delivery) catch break :db_blk;
+        const db = openCronDb(allocator) catch break :db_blk;
+        defer _ = c.sqlite3_close(db);
+        ensureCronTable(db) catch break :db_blk;
+        if (dbCountJobs(db) == 0) migrateJsonToDb(allocator, db);
+        _ = dbSaveJob(db, job) catch break :db_blk;
+        log.info("Added agent cron job {s}", .{job.id});
+        log.info("  Expr : {s}", .{job.expression});
+        log.info("  Type : {s}", .{job.job_type.asStr()});
+        if (job.model) |m| log.info("  Model: {s}", .{m});
+        return;
+    }
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -1857,6 +2354,21 @@ pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prom
 
 /// CLI: add a one-shot delayed task.
 pub fn cliAddOnce(allocator: std.mem.Allocator, delay: []const u8, command: []const u8) !void {
+    if (build_options.enable_sqlite) db_blk: {
+        var temp = CronScheduler.init(allocator, 65535, true);
+        defer temp.deinit();
+        const job = temp.addOnce(delay, command) catch break :db_blk;
+        const db = openCronDb(allocator) catch break :db_blk;
+        defer _ = c.sqlite3_close(db);
+        ensureCronTable(db) catch break :db_blk;
+        if (dbCountJobs(db) == 0) migrateJsonToDb(allocator, db);
+        _ = dbSaveJob(db, job) catch break :db_blk;
+        log.info("Added one-shot task {s}", .{job.id});
+        log.info("  Runs at: {d}", .{job.next_run_secs});
+        log.info("  Cmd    : {s}", .{job.command});
+        return;
+    }
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -1871,6 +2383,22 @@ pub fn cliAddOnce(allocator: std.mem.Allocator, delay: []const u8, command: []co
 
 /// CLI: add a one-shot delayed agent task.
 pub fn cliAddAgentOnce(allocator: std.mem.Allocator, delay: []const u8, prompt: []const u8, model: ?[]const u8) !void {
+    if (build_options.enable_sqlite) db_blk: {
+        var temp = CronScheduler.init(allocator, 65535, true);
+        defer temp.deinit();
+        const job = temp.addAgentOnce(delay, prompt, model) catch break :db_blk;
+        const db = openCronDb(allocator) catch break :db_blk;
+        defer _ = c.sqlite3_close(db);
+        ensureCronTable(db) catch break :db_blk;
+        if (dbCountJobs(db) == 0) migrateJsonToDb(allocator, db);
+        _ = dbSaveJob(db, job) catch break :db_blk;
+        log.info("Added one-shot agent task {s}", .{job.id});
+        log.info("  Runs at: {d}", .{job.next_run_secs});
+        log.info("  Type   : {s}", .{job.job_type.asStr()});
+        if (job.model) |m| log.info("  Model  : {s}", .{m});
+        return;
+    }
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -1894,6 +2422,15 @@ pub fn cliRemoveJob(allocator: std.mem.Allocator, id: []const u8) !void {
         json_util.appendJsonKeyValue(&body_buf, allocator, "id", id) catch {};
         body_buf.appendSlice(allocator, "}") catch {};
         if (gatewayPost(allocator, url, "/cron/remove", body_buf.items)) return;
+    }
+
+    if (build_options.enable_sqlite) db_blk: {
+        const db = openCronDb(allocator) catch break :db_blk;
+        defer _ = c.sqlite3_close(db);
+        ensureCronTable(db) catch break :db_blk;
+        dbDeleteJob(db, id) catch break :db_blk;
+        log.info("Removed cron job {s}", .{id});
+        return;
     }
 
     var scheduler = CronScheduler.init(allocator, 1024, true);
@@ -1920,6 +2457,20 @@ pub fn cliPauseJob(allocator: std.mem.Allocator, id: []const u8) !void {
         if (gatewayPost(allocator, url, "/cron/pause", body_buf.items)) return;
     }
 
+    if (build_options.enable_sqlite) db_blk: {
+        const db = openCronDb(allocator) catch break :db_blk;
+        defer _ = c.sqlite3_close(db);
+        ensureCronTable(db) catch break :db_blk;
+        const sql = "UPDATE cron_jobs SET paused = 1 WHERE id = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) break :db_blk;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) break :db_blk;
+        log.info("Paused job {s}", .{id});
+        return;
+    }
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -1942,6 +2493,20 @@ pub fn cliResumeJob(allocator: std.mem.Allocator, id: []const u8) !void {
         json_util.appendJsonKeyValue(&body_buf, allocator, "id", id) catch {};
         body_buf.appendSlice(allocator, "}") catch {};
         if (gatewayPost(allocator, url, "/cron/resume", body_buf.items)) return;
+    }
+
+    if (build_options.enable_sqlite) db_blk: {
+        const db = openCronDb(allocator) catch break :db_blk;
+        defer _ = c.sqlite3_close(db);
+        ensureCronTable(db) catch break :db_blk;
+        const sql = "UPDATE cron_jobs SET paused = 0 WHERE id = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) break :db_blk;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) break :db_blk;
+        log.info("Resumed job {s}", .{id});
+        return;
     }
 
     var scheduler = CronScheduler.init(allocator, 1024, true);
@@ -2054,9 +2619,9 @@ pub fn cliUpdateJob(
             body_buf.appendSlice(allocator, ",") catch {};
             json_util.appendJsonKeyValue(&body_buf, allocator, "expression", e) catch {};
         }
-        if (command) |c| {
+        if (command) |cmd| {
             body_buf.appendSlice(allocator, ",") catch {};
-            json_util.appendJsonKeyValue(&body_buf, allocator, "command", c) catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "command", cmd) catch {};
         }
         if (prompt) |p| {
             body_buf.appendSlice(allocator, ",") catch {};
@@ -2074,6 +2639,8 @@ pub fn cliUpdateJob(
         if (gatewayPost(allocator, url, "/cron/update", body_buf.items)) return;
     }
 
+    // For update, we load the current state, apply the patch in memory,
+    // then write back. saveJobs writes to DB (primary) or JSON (fallback).
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -2086,6 +2653,17 @@ pub fn cliUpdateJob(
         .enabled = enabled,
     };
     if (scheduler.updateJob(allocator, id, patch)) {
+        // If SQLite is enabled, write only the updated row directly to the DB
+        // to avoid rewriting all rows just to patch one.
+        if (build_options.enable_sqlite) direct_db: {
+            const updated_job = scheduler.getJob(id) orelse break :direct_db;
+            const db = openCronDb(allocator) catch break :direct_db;
+            defer _ = c.sqlite3_close(db);
+            ensureCronTable(db) catch break :direct_db;
+            dbSaveJob(db, updated_job) catch break :direct_db;
+            log.info("Updated job {s}", .{id});
+            return;
+        }
         try saveJobs(&scheduler);
         log.info("Updated job {s}", .{id});
     } else {
@@ -2380,20 +2958,42 @@ test "save and load roundtrip" {
 }
 
 test "load agent job without command field falls back to prompt" {
+    // This test verifies that agent jobs without an explicit command inherit the prompt.
+    // When SQLite is enabled, we write to the DB; otherwise we write JSON and parse it.
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    // Write a cron.json with an agent job that has no "command" field
-    const json =
-        \\[{"id":"ag-1","expression":"0 7 * * 1","job_type":"agent","prompt":"Check traffic","model":"glm-cn/glm-5-turbo","paused":false,"one_shot":false,"enabled":true,"delete_after_run":false,"delivery_mode":"none"}]
-    ;
-    const path = try cronJsonPath(std.testing.allocator);
-    defer std.testing.allocator.free(path);
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(json);
+    if (build_options.enable_sqlite) {
+        // Use an isolated tmpDir so this test never touches ~/.nullclaw/cron.db.
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+        defer std.testing.allocator.free(tmp_path);
+        const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "cron_test.db" });
+        defer std.testing.allocator.free(db_path);
 
-    try loadJobs(&scheduler);
+        const db = try openCronDbAtPath(db_path);
+        defer _ = c.sqlite3_close(db);
+        try ensureCronTable(db);
+
+        var temp = CronScheduler.init(std.testing.allocator, 10, true);
+        defer temp.deinit();
+        const job = try temp.addAgentJob("0 7 * * 1", "Check traffic", "glm-cn/glm-5-turbo", .{});
+        try dbSaveJob(db, job);
+
+        try dbLoadAllJobs(db, std.testing.allocator, &scheduler);
+    } else {
+        // Write a cron.json with an agent job that has no "command" field
+        const json =
+            \\[{"id":"ag-1","expression":"0 7 * * 1","job_type":"agent","prompt":"Check traffic","model":"glm-cn/glm-5-turbo","paused":false,"one_shot":false,"enabled":true,"delete_after_run":false,"delivery_mode":"none"}]
+        ;
+        const path = try cronJsonPath(std.testing.allocator);
+        defer std.testing.allocator.free(path);
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(json);
+        try loadJobs(&scheduler);
+    }
 
     const jobs = scheduler.listJobs();
     try std.testing.expectEqual(@as(usize, 1), jobs.len);
@@ -3200,4 +3800,167 @@ test "tick reschedules anchored recurring job using cron expression" {
 
     _ = scheduler.tick(3480, null);
     try std.testing.expectEqual(@as(i64, 4080), scheduler.jobs.items[0].next_run_secs);
+}
+
+// ── SQLite DB persistence tests ──────────────────────────────────
+
+test "db save and load roundtrip" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/cron.db", .{base});
+    defer std.testing.allocator.free(db_path_str);
+    const db_path_z = try std.testing.allocator.dupeZ(u8, db_path_str);
+    defer std.testing.allocator.free(db_path_z);
+
+    const db = try openCronDbAtPath(db_path_z);
+    defer _ = c.sqlite3_close(db);
+    try ensureCronTable(db);
+
+    // Build a job in a temporary scheduler (for ID allocation and next_run calc)
+    var temp = CronScheduler.init(std.testing.allocator, 10, true);
+    defer temp.deinit();
+    const job = try temp.addJob("*/10 * * * *", "echo db-roundtrip");
+    if (temp.getMutableJob(job.id)) |mj| {
+        mj.last_run_secs = 1_772_455_140;
+        mj.last_status = "ok";
+    }
+    try dbSaveJob(db, temp.getMutableJob(job.id).?);
+
+    // Load into a new scheduler
+    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    defer loaded.deinit();
+    try dbLoadAllJobs(db, std.testing.allocator, &loaded);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.jobs.items.len);
+    const lj = loaded.jobs.items[0];
+    try std.testing.expectEqualStrings("*/10 * * * *", lj.expression);
+    try std.testing.expectEqualStrings("echo db-roundtrip", lj.command);
+    try std.testing.expect(lj.last_run_secs != null);
+    try std.testing.expectEqual(@as(i64, 1_772_455_140), lj.last_run_secs.?);
+    try std.testing.expectEqualStrings("ok", lj.last_status.?);
+}
+
+test "db save and load agent job with delivery" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/cron.db", .{base});
+    defer std.testing.allocator.free(db_path_str);
+    const db_path_z = try std.testing.allocator.dupeZ(u8, db_path_str);
+    defer std.testing.allocator.free(db_path_z);
+
+    const db = try openCronDbAtPath(db_path_z);
+    defer _ = c.sqlite3_close(db);
+    try ensureCronTable(db);
+
+    var temp = CronScheduler.init(std.testing.allocator, 10, true);
+    defer temp.deinit();
+    // addAgentJob makes its own copies of the delivery strings, so pass literals.
+    const job = try temp.addAgentJob("*/15 * * * *", "Summarize status", "glm-4", .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "backup",
+        .to = "chat-42",
+    });
+    try dbSaveJob(db, job);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    defer loaded.deinit();
+    try dbLoadAllJobs(db, std.testing.allocator, &loaded);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.jobs.items.len);
+    const lj = loaded.jobs.items[0];
+    try std.testing.expectEqual(JobType.agent, lj.job_type);
+    try std.testing.expect(lj.prompt != null);
+    try std.testing.expectEqualStrings("Summarize status", lj.prompt.?);
+    try std.testing.expect(lj.model != null);
+    try std.testing.expectEqualStrings("glm-4", lj.model.?);
+    try std.testing.expectEqual(DeliveryMode.always, lj.delivery.mode);
+    try std.testing.expectEqualStrings("telegram", lj.delivery.channel.?);
+    try std.testing.expectEqualStrings("backup", lj.delivery.account_id.?);
+    try std.testing.expectEqualStrings("chat-42", lj.delivery.to.?);
+}
+
+test "dbDeleteJob removes a row" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/cron.db", .{base});
+    defer std.testing.allocator.free(db_path_str);
+    const db_path_z = try std.testing.allocator.dupeZ(u8, db_path_str);
+    defer std.testing.allocator.free(db_path_z);
+
+    const db = try openCronDbAtPath(db_path_z);
+    defer _ = c.sqlite3_close(db);
+    try ensureCronTable(db);
+
+    var temp = CronScheduler.init(std.testing.allocator, 10, true);
+    defer temp.deinit();
+    const job = try temp.addJob("*/5 * * * *", "echo delete-me");
+    const job_id = try std.testing.allocator.dupe(u8, job.id);
+    defer std.testing.allocator.free(job_id);
+    try dbSaveJob(db, job);
+
+    try std.testing.expectEqual(@as(usize, 1), dbCountJobs(db));
+    try dbDeleteJob(db, job_id);
+    try std.testing.expectEqual(@as(usize, 0), dbCountJobs(db));
+}
+
+test "dbCountJobs returns zero on empty table" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/empty.db", .{base});
+    defer std.testing.allocator.free(db_path_str);
+    const db_path_z = try std.testing.allocator.dupeZ(u8, db_path_str);
+    defer std.testing.allocator.free(db_path_z);
+
+    const db = try openCronDbAtPath(db_path_z);
+    defer _ = c.sqlite3_close(db);
+    try ensureCronTable(db);
+    try std.testing.expectEqual(@as(usize, 0), dbCountJobs(db));
+}
+
+test "ensureCronTable is idempotent" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/idem.db", .{base});
+    defer std.testing.allocator.free(db_path_str);
+    const db_path_z = try std.testing.allocator.dupeZ(u8, db_path_str);
+    defer std.testing.allocator.free(db_path_z);
+
+    const db = try openCronDbAtPath(db_path_z);
+    defer _ = c.sqlite3_close(db);
+
+    // Call three times — must not error
+    try ensureCronTable(db);
+    try ensureCronTable(db);
+    try ensureCronTable(db);
 }
