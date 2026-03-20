@@ -6,6 +6,14 @@ const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
 
+pub fn persistSchedulerOrFail(allocator: std.mem.Allocator, scheduler: *const CronScheduler) !?ToolResult {
+    cron.saveJobs(scheduler) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "Failed to persist scheduler state: {s}", .{@errorName(err)});
+        return ToolResult{ .success = false, .output = "", .error_msg = msg };
+    };
+    return null;
+}
+
 /// CronAdd tool — creates a new cron job with either a cron expression or a delay.
 pub const CronAddTool = struct {
     pub const tool_name = "cron_add";
@@ -57,7 +65,7 @@ pub const CronAddTool = struct {
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
 
-            cron.saveJobs(&scheduler) catch {};
+            if (try persistSchedulerOrFail(allocator, &scheduler)) |result| return result;
 
             const msg = try std.fmt.allocPrint(allocator, "Created cron job {s}: {s} \u{2192} {s}", .{
                 job.id,
@@ -73,7 +81,7 @@ pub const CronAddTool = struct {
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
 
-            cron.saveJobs(&scheduler) catch {};
+            if (try persistSchedulerOrFail(allocator, &scheduler)) |result| return result;
 
             const msg = try std.fmt.allocPrint(allocator, "Created cron job {s}: {s} \u{2192} {s}", .{
                 job.id,
@@ -87,7 +95,7 @@ pub const CronAddTool = struct {
     }
 };
 
-/// Load the CronScheduler from persisted state (~/.nullclaw/cron.json).
+/// Load the CronScheduler from persisted state (~/.nullclaw/cron.db, falling back to cron.json).
 /// Shared by cron_add, cron_list, cron_remove, and schedule tools.
 pub fn loadScheduler(allocator: std.mem.Allocator) !CronScheduler {
     var scheduler = CronScheduler.init(allocator, 1024, true);
