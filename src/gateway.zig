@@ -2210,6 +2210,16 @@ const WebhookHandlerContext = struct {
     response_body: []const u8 = "",
 };
 
+fn persistCronSchedulerOr500(ctx: *WebhookHandlerContext, scheduler: *cron_mod.CronScheduler) bool {
+    cron_mod.saveJobs(scheduler) catch |err| {
+        std.log.scoped(.gateway).warn("cron persistence failed: {s}", .{@errorName(err)});
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"failed to persist cron state\"}";
+        return false;
+    };
+    return true;
+}
+
 const WebhookHandlerFn = *const fn (ctx: *WebhookHandlerContext) void;
 
 const WebhookRouteDescriptor = struct {
@@ -2244,12 +2254,13 @@ const CronRouteDescriptor = struct {
 };
 
 const cron_route_descriptors = [_]CronRouteDescriptor{
-    .{ .path = "/cron",        .method = "GET",  .handler = handleCronList },
-    .{ .path = "/cron/add",    .method = "POST", .handler = handleCronAdd },
+    .{ .path = "/cron", .method = "GET", .handler = handleCronList },
+    .{ .path = "/cron/add", .method = "POST", .handler = handleCronAdd },
     .{ .path = "/cron/remove", .method = "POST", .handler = handleCronRemove },
-    .{ .path = "/cron/pause",  .method = "POST", .handler = handleCronPause },
+    .{ .path = "/cron/pause", .method = "POST", .handler = handleCronPause },
     .{ .path = "/cron/resume", .method = "POST", .handler = handleCronResume },
     .{ .path = "/cron/update", .method = "POST", .handler = handleCronUpdate },
+    .{ .path = "/cron/run", .method = "POST", .handler = handleCronRun },
 };
 
 fn findCronRouteDescriptor(path: []const u8) ?*const CronRouteDescriptor {
@@ -2421,7 +2432,7 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
         };
     };
 
-    cron_mod.saveJobs(sched) catch {};
+    if (!persistCronSchedulerOr500(ctx, sched)) return;
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     appendCronJobJson(&buf, ctx.req_allocator, job_ptr.*) catch {
@@ -2464,7 +2475,7 @@ fn handleCronRemove(ctx: *WebhookHandlerContext) void {
         ctx.response_body = "{\"error\":\"job not found\"}";
         return;
     }
-    cron_mod.saveJobs(sched) catch {};
+    if (!persistCronSchedulerOr500(ctx, sched)) return;
     ctx.response_status = "200 OK";
     ctx.response_body = "{\"status\":\"removed\"}";
 }
@@ -2500,7 +2511,7 @@ fn handleCronPause(ctx: *WebhookHandlerContext) void {
         ctx.response_body = "{\"error\":\"job not found\"}";
         return;
     }
-    cron_mod.saveJobs(sched) catch {};
+    if (!persistCronSchedulerOr500(ctx, sched)) return;
     ctx.response_status = "200 OK";
     ctx.response_body = "{\"status\":\"paused\"}";
 }
@@ -2536,7 +2547,7 @@ fn handleCronResume(ctx: *WebhookHandlerContext) void {
         ctx.response_body = "{\"error\":\"job not found\"}";
         return;
     }
-    cron_mod.saveJobs(sched) catch {};
+    if (!persistCronSchedulerOr500(ctx, sched)) return;
     ctx.response_status = "200 OK";
     ctx.response_body = "{\"status\":\"resumed\"}";
 }
@@ -2598,9 +2609,104 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
         ctx.response_body = "{\"error\":\"job not found or update failed\"}";
         return;
     }
-    cron_mod.saveJobs(sched) catch {};
+    if (!persistCronSchedulerOr500(ctx, sched)) return;
     ctx.response_status = "200 OK";
     ctx.response_body = "{\"status\":\"updated\"}";
+}
+
+fn handleCronRun(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+    const id = jsonStringField(body, "id") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing id\"}";
+        return;
+    };
+
+    ctx.state.scheduler_mutex.lock();
+    defer ctx.state.scheduler_mutex.unlock();
+
+    const sched = ctx.state.scheduler orelse {
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+
+    const job = sched.getMutableJob(id) orelse {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"job not found\"}";
+        return;
+    };
+
+    const now = std.time.timestamp();
+    const run_cwd: ?[]const u8 = if (sched.shell_cwd) |cwd| blk: {
+        std.fs.accessAbsolute(cwd, .{}) catch break :blk null;
+        break :blk cwd;
+    } else null;
+
+    switch (job.job_type) {
+        .shell => {
+            const result = std.process.Child.run(.{
+                .allocator = ctx.req_allocator,
+                .argv = &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), job.command },
+                .cwd = run_cwd,
+                .max_output_bytes = 65536,
+            }) catch |err| {
+                job.last_run_secs = now;
+                job.last_status = "error";
+                _ = cron_mod.saveJobs(sched) catch {};
+                const msg = std.fmt.allocPrint(ctx.req_allocator, "{{\"error\":\"exec failed: {s}\"}}", .{@errorName(err)}) catch "{\"error\":\"exec failed\"}";
+                ctx.response_status = "500 Internal Server Error";
+                ctx.response_body = msg;
+                return;
+            };
+            defer ctx.req_allocator.free(result.stdout);
+            defer ctx.req_allocator.free(result.stderr);
+            const exit_code: u8 = switch (result.term) {
+                .Exited => |code| code,
+                else => 1,
+            };
+            const success = exit_code == 0;
+            job.last_run_secs = now;
+            job.last_status = if (success) "ok" else "error";
+            const output = if (result.stdout.len > 0) result.stdout else result.stderr;
+            if (ctx.state.event_bus) |eb| {
+                _ = cron_mod.deliverResult(ctx.req_allocator, job.delivery, output, success, eb) catch {};
+            }
+            _ = cron_mod.saveJobs(sched) catch {};
+            ctx.response_status = "200 OK";
+            ctx.response_body = "{\"status\":\"ok\"}";
+        },
+        .agent => {
+            const prompt = job.prompt orelse job.command;
+            const agent_result = cron_mod.runAgentJob(ctx.req_allocator, run_cwd, prompt, job.model, sched.agent_timeout_secs) catch |err| {
+                job.last_run_secs = now;
+                job.last_status = "error";
+                _ = cron_mod.saveJobs(sched) catch {};
+                const msg = std.fmt.allocPrint(ctx.req_allocator, "{{\"error\":\"agent failed: {s}\"}}", .{@errorName(err)}) catch "{\"error\":\"agent failed\"}";
+                ctx.response_status = "500 Internal Server Error";
+                ctx.response_body = msg;
+                return;
+            };
+            defer ctx.req_allocator.free(agent_result.output);
+            job.last_run_secs = now;
+            job.last_status = if (agent_result.success) "ok" else "error";
+            if (ctx.state.event_bus) |eb| {
+                _ = cron_mod.deliverResult(ctx.req_allocator, job.delivery, agent_result.output, agent_result.success, eb) catch {};
+            }
+            _ = cron_mod.saveJobs(sched) catch {};
+            ctx.response_status = "200 OK";
+            ctx.response_body = "{\"status\":\"ok\"}";
+        },
+    }
 }
 
 fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
@@ -7178,4 +7284,90 @@ test "run returns AddressInUse when port is already bound" {
     // Try to start gateway on the same port - should fail with AddressInUse
     const result = run(std.testing.allocator, "127.0.0.1", bound_port, null, null);
     try std.testing.expectError(error.AddressInUse, result);
+}
+
+test "handleCronRun rejects non-POST" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var state = GatewayState.init(allocator);
+    var ctx = WebhookHandlerContext{
+        .root_allocator = allocator,
+        .req_allocator = allocator,
+        .raw_request = "GET /cron/run HTTP/1.1\r\n\r\n",
+        .method = "GET",
+        .target = "/cron/run",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronRun(&ctx);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", ctx.response_status);
+}
+
+test "handleCronRun returns 400 when id missing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var state = GatewayState.init(allocator);
+    var ctx = WebhookHandlerContext{
+        .root_allocator = allocator,
+        .req_allocator = allocator,
+        .raw_request = "POST /cron/run HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}",
+        .method = "POST",
+        .target = "/cron/run",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronRun(&ctx);
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+}
+
+test "handleCronRun returns 503 when scheduler not running" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var state = GatewayState.init(allocator);
+    // scheduler remains null (not running)
+    var ctx = WebhookHandlerContext{
+        .root_allocator = allocator,
+        .req_allocator = allocator,
+        .raw_request = "POST /cron/run HTTP/1.1\r\nContent-Length: 14\r\n\r\n{\"id\":\"job-1\"}",
+        .method = "POST",
+        .target = "/cron/run",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronRun(&ctx);
+    try std.testing.expectEqualStrings("503 Service Unavailable", ctx.response_status);
+}
+
+test "handleCronRun returns 404 for unknown job" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var scheduler = cron_mod.CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+    var state = GatewayState.init(allocator);
+    state.scheduler = &scheduler;
+    var ctx = WebhookHandlerContext{
+        .root_allocator = allocator,
+        .req_allocator = allocator,
+        .raw_request = "POST /cron/run HTTP/1.1\r\nContent-Length: 22\r\n\r\n{\"id\":\"nonexistent-job\"}",
+        .method = "POST",
+        .target = "/cron/run",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronRun(&ctx);
+    try std.testing.expectEqualStrings("404 Not Found", ctx.response_status);
+}
+
+test "/cron/run is registered in route table" {
+    const desc = findCronRouteDescriptor("/cron/run");
+    try std.testing.expect(desc != null);
+    try std.testing.expectEqualStrings("POST", desc.?.method);
 }
