@@ -1773,14 +1773,13 @@ fn ensureCronDir(allocator: std.mem.Allocator) !void {
 }
 
 /// Save scheduler jobs to the SQLite DB (~/.nullclaw/cron.db).
-/// Falls back to cron.json if SQLite is unavailable or fails.
+/// When SQLite is enabled, DB is authoritative: a DB write failure is returned
+/// as an error rather than silently falling back to cron.json.  Falling back
+/// would produce divergent state (JSON newer than DB) that the load path
+/// cannot safely resolve without re-introducing the empty-DB ambiguity bug.
 pub fn saveJobs(scheduler: *const CronScheduler) !void {
     if (build_options.enable_sqlite) {
-        if (saveJobsToDb(scheduler)) {
-            return;
-        } else |err| {
-            log.warn("cron DB save failed ({s}); falling back to cron.json", .{@errorName(err)});
-        }
+        return saveJobsToDb(scheduler);
     }
     try saveJobsToJson(scheduler);
 }
@@ -1926,11 +1925,7 @@ fn saveJobsToJson(scheduler: *const CronScheduler) !void {
 pub fn loadJobs(scheduler: *CronScheduler) !void {
     if (build_options.enable_sqlite) {
         if (loadJobsFromDb(scheduler)) {
-            // DB loaded successfully. If it returned jobs, we're done. If it returned
-            // zero jobs, also check cron.json — a prior saveJobs() DB failure may have
-            // written new state there while the DB remained stale.
-            if (scheduler.jobs.items.len > 0) return;
-            log.info("cron DB is empty; checking cron.json for unsynced jobs", .{});
+            return;
         } else |err| {
             log.warn("cron DB load failed ({s}); falling back to cron.json", .{@errorName(err)});
         }
@@ -1941,8 +1936,10 @@ pub fn loadJobs(scheduler: *CronScheduler) !void {
 /// Load jobs from the SQLite DB; returns parse/read errors (except missing file).
 pub fn loadJobsStrict(scheduler: *CronScheduler) !void {
     if (build_options.enable_sqlite) {
-        try loadJobsFromDb(scheduler);
-        if (scheduler.jobs.items.len > 0) return;
+        // DB is authoritative when SQLite is enabled: an empty DB means zero jobs,
+        // not "fall back to cron.json". Falling through to JSON would make an
+        // intentionally empty DB indistinguishable from a stale one.
+        return loadJobsFromDb(scheduler);
     }
     try loadJobsWithPolicy(scheduler, .strict);
 }
