@@ -5277,12 +5277,27 @@ pub fn setSharedScheduler(sched: *cron_mod.CronScheduler) void {
     g_shared_scheduler_mutex.lock();
     defer g_shared_scheduler_mutex.unlock();
     g_shared_scheduler = sched;
+    // Also wire into GatewayState.scheduler so /cron/run and queue worker can find it.
+    g_state_mutex.lock();
+    defer g_state_mutex.unlock();
+    if (g_state_ptr) |gs| {
+        gs.scheduler_mutex.lock();
+        defer gs.scheduler_mutex.unlock();
+        gs.scheduler = sched;
+    }
 }
 
 pub fn clearSharedScheduler() void {
     g_shared_scheduler_mutex.lock();
     defer g_shared_scheduler_mutex.unlock();
     g_shared_scheduler = null;
+    g_state_mutex.lock();
+    defer g_state_mutex.unlock();
+    if (g_state_ptr) |gs| {
+        gs.scheduler_mutex.lock();
+        defer gs.scheduler_mutex.unlock();
+        gs.scheduler = null;
+    }
 }
 
 /// RAII guard that holds GatewayState.scheduler_mutex for the duration of a
