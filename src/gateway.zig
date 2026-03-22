@@ -5891,6 +5891,13 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             writeHttpResponse(&conn.stream, response_status, response_content_type, response_body);
         }
     }
+
+    // Drain barrier: wait for any thread currently holding scheduler_mutex (e.g. the
+    // daemon's schedulerThread with a locked_gs token) to release it before we let
+    // state go out of scope.  Acquire + immediate release is sufficient because once
+    // we hold it we know no other thread is inside the critical section.
+    state.scheduler_mutex.lock();
+    state.scheduler_mutex.unlock();
 }
 
 // ── Tests ────────────────────────────────────────────────────────
