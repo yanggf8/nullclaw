@@ -246,6 +246,7 @@ pub const Agent = struct {
     default_model: []const u8 = "anthropic/claude-sonnet-4",
     profile_name: ?[]const u8 = null,
     profile_system_prompt: ?[]const u8 = null,
+    profile_system_prompt_owned: bool = false,
     model_routes: []const config_types.ModelRouteConfig = &.{},
     model_pinned_by_user: bool = false,
     last_route_trace: ?[]u8 = null,
@@ -511,6 +512,7 @@ pub const Agent = struct {
         if (self.bootstrap) |bp| bp.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
+        if (self.profile_system_prompt_owned and self.profile_system_prompt != null) self.allocator.free(self.profile_system_prompt.?);
         if (self.workspace_dir_owned) self.allocator.free(self.workspace_dir);
         if (self.system_prompt_model_name) |model| self.allocator.free(model);
         if (self.last_route_trace) |trace| self.allocator.free(trace);
@@ -1596,6 +1598,7 @@ pub const Agent = struct {
                 .workspace_dir = self.workspace_dir,
                 .model_name = turn_model_name,
                 .tools = self.tools,
+                .timezone = if (cfg_for_prompt_ptr) |cfg_ptr| cfg_ptr.agent.timezone else "UTC",
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
                 .bootstrap_provider = self.bootstrap,

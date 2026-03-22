@@ -459,6 +459,34 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 
 // ── Cron ─────────────────────────────────────────────────────────
 
+const CronAddAgentOptions = struct {
+    model: ?[]const u8 = null,
+    delivery: yc.cron.DeliveryConfig = .{},
+};
+
+fn parseCronAddAgentOptions(sub_args: []const []const u8) CronAddAgentOptions {
+    var options = CronAddAgentOptions{};
+    var i: usize = 3;
+    while (i < sub_args.len) : (i += 1) {
+        if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--model")) {
+            options.model = sub_args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, sub_args[i], "--announce")) {
+            options.delivery.mode = .always;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--channel")) {
+            options.delivery.channel = sub_args[i + 1];
+            i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--account")) {
+            options.delivery.account_id = sub_args[i + 1];
+            i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--to")) {
+            options.delivery.to = sub_args[i + 1];
+            i += 1;
+        }
+    }
+    return options;
+}
+
 fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 1) {
         std.debug.print(std.fmt.comptimePrint(
@@ -468,7 +496,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  list                          List all scheduled tasks
             \\  status                        Show scheduler daemon status
             \\  add <expression> <command>    Add a recurring cron job
-            \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--to <id>]
+            \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
             \\                                Add a recurring agent cron job
             \\  once <delay> <command>        Add a one-shot delayed task
             \\  once-agent <delay> <prompt> [--model <model>]
@@ -501,40 +529,8 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--account <id>] [--to <id>]\n", .{});
             std.process.exit(1);
         }
-        var model: ?[]const u8 = null;
-        var delivery_mode: yc.cron.DeliveryMode = .none;
-        var channel: ?[]const u8 = null;
-        var account_id: ?[]const u8 = null;
-        var to: ?[]const u8 = null;
-
-        var i: usize = 3;
-        while (i < sub_args.len) : (i += 1) {
-            if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--model")) {
-                model = sub_args[i + 1];
-                i += 1;
-            } else if (std.mem.eql(u8, sub_args[i], "--announce")) {
-                delivery_mode = .always;
-            } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--channel")) {
-                channel = sub_args[i + 1];
-                i += 1;
-            } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--account")) {
-                account_id = sub_args[i + 1];
-                i += 1;
-            } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--to")) {
-                to = sub_args[i + 1];
-                i += 1;
-            }
-        }
-        const delivery = yc.cron.DeliveryConfig{
-            .mode = delivery_mode,
-            .channel = channel,
-            .account_id = account_id,
-            .to = to,
-            .channel_owned = false,
-            .account_id_owned = false,
-            .to_owned = false,
-        };
-        try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], model, delivery);
+        const options = parseCronAddAgentOptions(sub_args);
+        try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], options.model, options.delivery);
     } else if (std.mem.eql(u8, subcmd, "once")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron once <delay> <command>\n", .{});
@@ -4153,4 +4149,32 @@ test "hasConfiguredButBuildDisabledStartableChannels detects configured disabled
     };
 
     try std.testing.expectEqual(!yc.channel_catalog.isBuildEnabled(.telegram), hasConfiguredButBuildDisabledStartableChannels(&cfg));
+}
+
+test "parseCronAddAgentOptions preserves delivery account flag" {
+    // Regression: cron add-agent ignored --account and dropped delivery account routing.
+    const args = [_][]const u8{
+        "add-agent",
+        "0 7 * * 1,2,4",
+        "Check traffic",
+        "--model",
+        "glm-cn/glm-5-turbo",
+        "--announce",
+        "--channel",
+        "telegram",
+        "--account",
+        "main",
+        "--to",
+        "7972814626",
+    };
+
+    const options = parseCronAddAgentOptions(&args);
+    try std.testing.expectEqualStrings("glm-cn/glm-5-turbo", options.model.?);
+    try std.testing.expectEqual(yc.cron.DeliveryMode.always, options.delivery.mode);
+    try std.testing.expectEqualStrings("telegram", options.delivery.channel.?);
+    try std.testing.expectEqualStrings("main", options.delivery.account_id.?);
+    try std.testing.expectEqualStrings("7972814626", options.delivery.to.?);
+    try std.testing.expect(!options.delivery.channel_owned);
+    try std.testing.expect(!options.delivery.account_id_owned);
+    try std.testing.expect(!options.delivery.to_owned);
 }

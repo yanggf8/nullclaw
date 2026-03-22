@@ -29,6 +29,7 @@ const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const thread_stacks = @import("thread_stacks.zig");
 const tunnel_mod = @import("tunnel.zig");
+const Atomic = @import("portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.daemon);
 
@@ -41,7 +42,7 @@ const HEARTBEAT_THREAD_STACK_SIZE: usize = thread_stacks.SESSION_TURN_STACK_SIZE
 
 /// Maximum number of supervised components.
 const MAX_COMPONENTS: usize = 8;
-var outbound_draft_id_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
+var outbound_draft_id_counter: Atomic(u64) = Atomic(u64).init(1);
 
 /// Component status for state file serialization.
 pub const ComponentStatus = struct {
@@ -431,6 +432,7 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
         // scheduler.jobs (swapped by reloadJobs) or next_run_secs (updated by tick).
         gateway_mod.lockSharedSchedulerMutex();
 
+        var snapshot_ok = true;
         // Refresh scheduler view from store so jobs created/updated after daemon startup are picked up.
         cron.reloadJobs(&scheduler) catch |err| {
             log.warn("scheduler reload failed: {}", .{err});
@@ -443,20 +445,26 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
             log.warn("scheduler snapshot failed: {}", .{err});
             state.markError("scheduler", @errorName(err));
             health.markComponentError("scheduler", @errorName(err));
+            snapshot_ok = false;
+        };
+
+        if (snapshot_ok) {
+            const changed = scheduler.tick(std.time.timestamp(), event_bus);
+            if (changed) {
+                mergeSchedulerTickChangesAndSave(allocator, &scheduler, &before_tick) catch |err| {
+                    log.warn("scheduler merge-save failed: {}", .{err});
+                    state.markError("scheduler", @errorName(err));
+                    health.markComponentError("scheduler", @errorName(err));
+                };
+            }
+        }
+
+        if (!snapshot_ok) {
             var snapshot_sleep: u64 = 0;
             while (snapshot_sleep < poll_secs and !isShutdownRequested()) : (snapshot_sleep += 1) {
                 std.Thread.sleep(std.time.ns_per_s);
             }
             continue;
-        };
-
-        const changed = scheduler.tick(std.time.timestamp(), event_bus);
-        if (changed) {
-            mergeSchedulerTickChangesAndSave(allocator, &scheduler, &before_tick) catch |err| {
-                log.warn("scheduler merge-save failed: {}", .{err});
-                state.markError("scheduler", @errorName(err));
-                health.markComponentError("scheduler", @errorName(err));
-            };
         }
 
         gateway_mod.unlockSharedSchedulerMutex();
@@ -2228,6 +2236,35 @@ test "makeAssistantReplyOutbound extracts structured choices from assistant repl
     try std.testing.expectEqualStrings("yes", msg.choices[0].id);
     try std.testing.expectEqualStrings("No", msg.choices[1].label);
     try std.testing.expectEqual(@as(u64, 17), msg.draft_id);
+}
+
+test "nextOutboundDraftId stays unique across concurrent callers" {
+    const Worker = struct {
+        fn run(out: *u64) void {
+            out.* = nextOutboundDraftId();
+        }
+    };
+
+    const previous = outbound_draft_id_counter.swap(1, .monotonic);
+    defer _ = outbound_draft_id_counter.swap(previous, .monotonic);
+
+    var results: [8]u64 = undefined;
+    var threads: [results.len]std.Thread = undefined;
+    const max_id: u64 = results.len;
+
+    for (&results, 0..) |*result, i| {
+        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{result});
+    }
+    for (threads) |thread| thread.join();
+
+    var seen: [results.len + 1]bool = [_]bool{false} ** (results.len + 1);
+    for (results) |id| {
+        // Regression: daemon draft IDs must remain unique after replacing the
+        // mutex-protected counter with portable atomic access on 32-bit targets.
+        try std.testing.expect(id >= 1 and id <= max_id);
+        try std.testing.expect(!seen[@intCast(id)]);
+        seen[@intCast(id)] = true;
+    }
 }
 
 test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" {

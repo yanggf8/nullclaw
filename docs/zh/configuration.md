@@ -172,6 +172,7 @@ nullclaw onboard --interactive
 - 相对路径会相对于 `config.json` 所在目录解析。
 - 绝对路径会原样使用。
 - 配置中可以写 `/` 或 `\`，运行时会按当前操作系统规范化路径分隔符。
+- `workspace_path` 不会禁用 `system_prompt`。如果两者同时设置，nullclaw 仍会应用命名 agent 的 profile prompt，并从该独立工作区加载 bootstrap 上下文。
 - 首次使用时，如果工作区不存在，nullclaw 会自动创建并初始化：
   - `AGENTS.md`
   - `SOUL.md`

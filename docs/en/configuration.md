@@ -231,6 +231,7 @@ Behavior:
 - Relative paths are resolved relative to the directory that contains `config.json`.
 - Absolute paths are used as-is.
 - Both `/` and `\` are accepted in config; the runtime normalizes separators for the current OS.
+- `workspace_path` does not disable `system_prompt`. If both are set, nullclaw keeps the named profile prompt and also loads bootstrap context from that dedicated workspace.
 - On first use, nullclaw scaffolds the workspace if missing and creates:
   - `AGENTS.md`
   - `SOUL.md`
