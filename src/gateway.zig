@@ -5284,19 +5284,23 @@ pub fn clearSharedScheduler() void {
 
 /// Acquire the gateway's scheduler_mutex so the daemon's scheduler thread
 /// can safely reload/tick/save without racing the HTTP handlers and queue worker.
-/// Must be paired with unlockSharedSchedulerMutex. No-op if no gateway is running.
-pub fn lockSharedSchedulerMutex() void {
+/// Returns the locked GatewayState pointer (to be passed to unlockSharedSchedulerMutex),
+/// or null if no gateway is running. The caller must pass the returned value to
+/// unlockSharedSchedulerMutex regardless of whether it is null.
+pub fn lockSharedSchedulerMutex() ?*GatewayState {
     g_state_mutex.lock();
     defer g_state_mutex.unlock();
-    if (g_state_ptr) |gs| gs.scheduler_mutex.lock();
+    if (g_state_ptr) |gs| {
+        gs.scheduler_mutex.lock();
+        return gs;
+    }
+    return null;
 }
 
-/// Release the gateway's scheduler_mutex acquired by lockSharedSchedulerMutex.
-/// No-op if no gateway is running.
-pub fn unlockSharedSchedulerMutex() void {
-    g_state_mutex.lock();
-    defer g_state_mutex.unlock();
-    if (g_state_ptr) |gs| gs.scheduler_mutex.unlock();
+/// Release the gateway's scheduler_mutex. Pass the value returned by lockSharedSchedulerMutex.
+/// No-op if null (gateway was not running when lock was called).
+pub fn unlockSharedSchedulerMutex(gs: ?*GatewayState) void {
+    if (gs) |s| s.scheduler_mutex.unlock();
 }
 
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.

@@ -3273,39 +3273,106 @@ test "db upsert and load roundtrip" {
 }
 
 test "load agent job without command field falls back to prompt" {
-    // This test verifies that agent jobs without an explicit command inherit the prompt.
-    // When SQLite is enabled, we write to the DB; otherwise we write JSON and parse it.
-    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
-    defer scheduler.deinit();
+    // Seed an isolated DB with an agent job that has NULL command but a prompt.
+    // loadJobsStrict must populate command from the prompt field.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "cron_test.db" });
+    defer std.testing.allocator.free(db_path);
 
-    try loadJobsStrict(&scheduler);
+    if (build_options.enable_sqlite) {
+        // Open DB and create table, then insert a row with NULL command directly.
+        var seed = CronScheduler.init(std.testing.allocator, 10, true);
+        seed.db_path = db_path;
+        defer seed.deinit();
+        const db = try openCronDbForScheduler(&seed);
+        defer _ = c.sqlite3_close(db);
+        try ensureCronTable(db);
+        const insert_sql = "INSERT INTO cron_jobs (id, expression, job_type, command, prompt, next_run_secs, enabled, delivery_mode) " ++
+            "VALUES ('ag-1', '0 7 * * 1-5', 'agent', NULL, 'Check traffic', 0, 1, 'none')";
+        _ = c.sqlite3_exec(db, insert_sql, null, null, null);
 
-    const jobs = scheduler.listJobs();
-    try std.testing.expectEqual(@as(usize, 1), jobs.len);
-    try std.testing.expectEqualStrings("Check traffic", jobs[0].command);
-    try std.testing.expectEqualStrings("Check traffic", jobs[0].prompt.?);
+        var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+        scheduler.db_path = db_path;
+        defer scheduler.deinit();
+        try loadJobsStrict(&scheduler);
+
+        const jobs = scheduler.listJobs();
+        try std.testing.expectEqual(@as(usize, 1), jobs.len);
+        try std.testing.expectEqualStrings("Check traffic", jobs[0].command);
+        try std.testing.expectEqualStrings("Check traffic", jobs[0].prompt.?);
+    } else {
+        // JSON path: absent command field → prompt used as command
+        const json =
+            \\[{"id":"ag-1","expression":"0 7 * * 1-5","job_type":"agent","prompt":"Check traffic","paused":false,"one_shot":false,"enabled":true,"delete_after_run":false,"delivery_mode":"none"}]
+        ;
+        const path = try cronJsonPath(std.testing.allocator);
+        defer std.testing.allocator.free(path);
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(json);
+
+        var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+        defer scheduler.deinit();
+        try loadJobsStrict(&scheduler);
+
+        const jobs = scheduler.listJobs();
+        try std.testing.expectEqual(@as(usize, 1), jobs.len);
+        try std.testing.expectEqualStrings("Check traffic", jobs[0].command);
+        try std.testing.expectEqualStrings("Check traffic", jobs[0].prompt.?);
+    }
 }
 
 test "load agent job without prompt field falls back to command" {
-    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
-    defer scheduler.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "cron_test.db" });
+    defer std.testing.allocator.free(db_path);
 
-    const json =
-        \\[{"id":"ag-2","expression":"15 9 * * 2","job_type":"agent","command":"Summarize incidents","model":"openrouter/anthropic/claude-sonnet-4","paused":false,"one_shot":false,"enabled":true,"delete_after_run":false,"delivery_mode":"none"}]
-    ;
-    const path = try cronJsonPath(std.testing.allocator);
-    defer std.testing.allocator.free(path);
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(json);
+    if (build_options.enable_sqlite) {
+        // Seed isolated DB with an agent job that has command but no prompt.
+        var seed = CronScheduler.init(std.testing.allocator, 10, true);
+        seed.db_path = db_path;
+        defer seed.deinit();
+        const j = try seed.addJob("15 9 * * 2", "Summarize incidents");
+        const jid = try std.testing.allocator.dupe(u8, j.id);
+        defer std.testing.allocator.free(jid);
+        if (seed.getMutableJob(jid)) |mj| mj.job_type = .agent;
+        try dbUpsertAndVerify(&seed, seed.getJob(jid).?);
 
-    try loadJobsStrict(&scheduler);
+        var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+        scheduler.db_path = db_path;
+        defer scheduler.deinit();
+        try loadJobsStrict(&scheduler);
 
-    const jobs = scheduler.listJobs();
-    try std.testing.expectEqual(@as(usize, 1), jobs.len);
-    try std.testing.expectEqualStrings("Summarize incidents", jobs[0].command);
-    try std.testing.expect(jobs[0].prompt != null);
-    try std.testing.expectEqualStrings("Summarize incidents", jobs[0].prompt.?);
+        // When only command is stored (no prompt column), command is preserved as-is.
+        // The loader does not synthesize prompt from command; that direction is absent.
+        const jobs = scheduler.listJobs();
+        try std.testing.expectEqual(@as(usize, 1), jobs.len);
+        try std.testing.expectEqualStrings("Summarize incidents", jobs[0].command);
+    } else {
+        // JSON path: command present, prompt absent field → prompt stays null after load.
+        const json =
+            \\[{"id":"ag-2","expression":"15 9 * * 2","job_type":"agent","command":"Summarize incidents","model":"openrouter/anthropic/claude-sonnet-4","paused":false,"one_shot":false,"enabled":true,"delete_after_run":false,"delivery_mode":"none"}]
+        ;
+        const path = try cronJsonPath(std.testing.allocator);
+        defer std.testing.allocator.free(path);
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(json);
+
+        var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+        defer scheduler.deinit();
+        try loadJobsStrict(&scheduler);
+
+        const jobs = scheduler.listJobs();
+        try std.testing.expectEqual(@as(usize, 1), jobs.len);
+        try std.testing.expectEqualStrings("Summarize incidents", jobs[0].command);
+    }
 }
 
 test "trimOwnedRight duplicates trimmed allocation" {

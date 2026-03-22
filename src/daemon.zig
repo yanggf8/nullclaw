@@ -430,7 +430,9 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
         // Hold the gateway's scheduler_mutex for the entire reload/tick/save block so
         // HTTP handlers and runQueueWorker cannot race against structural changes to
         // scheduler.jobs (swapped by reloadJobs) or next_run_secs (updated by tick).
-        gateway_mod.lockSharedSchedulerMutex();
+        // Capture the locked state pointer so unlock is always paired with the same instance
+        // even if the gateway shuts down and clears g_state_ptr between lock and unlock.
+        const locked_gs = gateway_mod.lockSharedSchedulerMutex();
 
         var snapshot_ok = true;
         // Refresh scheduler view from store so jobs created/updated after daemon startup are picked up.
@@ -441,7 +443,7 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
         };
 
         buildSchedulerSnapshot(allocator, &scheduler, &before_tick) catch |err| {
-            gateway_mod.unlockSharedSchedulerMutex();
+            gateway_mod.unlockSharedSchedulerMutex(locked_gs);
             log.warn("scheduler snapshot failed: {}", .{err});
             state.markError("scheduler", @errorName(err));
             health.markComponentError("scheduler", @errorName(err));
@@ -467,7 +469,7 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
             continue;
         }
 
-        gateway_mod.unlockSharedSchedulerMutex();
+        gateway_mod.unlockSharedSchedulerMutex(locked_gs);
 
         state.markRunning("scheduler");
         health.markComponentOk("scheduler");
