@@ -5285,19 +5285,56 @@ pub fn clearSharedScheduler() void {
     g_shared_scheduler = null;
 }
 
-/// Acquire the gateway's scheduler_mutex so the daemon's scheduler thread
-/// can safely reload/tick/save without racing the HTTP handlers and queue worker.
-/// Returns the locked GatewayState pointer (to be passed to unlockSharedSchedulerMutex),
-/// or null if no gateway is running. The caller must pass the returned value to
-/// unlockSharedSchedulerMutex regardless of whether it is null.
-pub fn lockSharedSchedulerMutex() ?*GatewayState {
+/// RAII guard that holds GatewayState.scheduler_mutex for the duration of a
+/// daemon scheduler tick (reload → snapshot → tick → save).
+///
+/// Concurrency contract
+/// ────────────────────
+/// Two distinct serialisation layers protect CronScheduler:
+///   1. runQueueWorker (this file) serialises *manual* /cron/run requests so
+///      runs A and B never execute concurrently.
+///   2. This guard serialises the *daemon scheduler loop* against every HTTP
+///      handler and the queue worker.  Without it, reloadJobs() (which swaps
+///      scheduler.jobs via std.mem.swap) and tick() (which mutates next_run_secs)
+///      would race against live getMutableJob pointers held by the other actors.
+///
+/// Obtain via acquireSchedulerGuard(). Release with `defer guard.release()`.
+pub const SchedulerGuard = struct {
+    gs: ?*GatewayState,
+
+    /// Release the lock. Safe to call more than once; subsequent calls are no-ops.
+    pub fn release(self: *SchedulerGuard) void {
+        if (self.gs) |s| {
+            s.scheduler_mutex.unlock();
+            self.gs = null;
+        }
+    }
+};
+
+/// Acquire GatewayState.scheduler_mutex and return a SchedulerGuard.
+/// If no gateway is running the guard is a no-op (gs == null).
+/// Usage:
+///   var guard = gateway_mod.acquireSchedulerGuard();
+///   defer guard.release();
+pub fn acquireSchedulerGuard() SchedulerGuard {
     g_state_mutex.lock();
     defer g_state_mutex.unlock();
     if (g_state_ptr) |gs| {
         gs.scheduler_mutex.lock();
-        return gs;
+        return .{ .gs = gs };
     }
-    return null;
+    return .{ .gs = null };
+}
+
+/// Acquire the gateway's scheduler_mutex so the daemon's scheduler thread
+/// can safely reload/tick/save without racing the HTTP handlers and queue worker.
+/// Returns the locked GatewayState pointer (to be passed to unlockSharedSchedulerMutex),
+/// or null if no gateway is running.
+pub fn lockSharedSchedulerMutex() ?*GatewayState {
+    var g = acquireSchedulerGuard();
+    const gs = g.gs;
+    g.gs = null; // transfer ownership to caller
+    return gs;
 }
 
 /// Release the gateway's scheduler_mutex. Pass the value returned by lockSharedSchedulerMutex.

@@ -427,14 +427,10 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     health.markComponentOk("scheduler");
 
     while (!isShutdownRequested()) {
-        // Hold the gateway's scheduler_mutex for the entire reload/tick/save block so
-        // HTTP handlers and runQueueWorker cannot race against structural changes to
-        // scheduler.jobs (swapped by reloadJobs) or next_run_secs (updated by tick).
-        // Capture the locked state pointer so unlock is always paired with the same instance
-        // even if the gateway shuts down and clears g_state_ptr between lock and unlock.
-        const locked_gs = gateway_mod.lockSharedSchedulerMutex();
+        // Hold the gateway's scheduler_mutex for the entire reload/tick/save block.
+        // See SchedulerGuard in gateway.zig for the full concurrency contract.
+        var sched_guard = gateway_mod.acquireSchedulerGuard();
 
-        var snapshot_ok = true;
         // Refresh scheduler view from store so jobs created/updated after daemon startup are picked up.
         cron.reloadJobs(&scheduler) catch |err| {
             log.warn("scheduler reload failed: {}", .{err});
@@ -442,12 +438,15 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
             health.markComponentError("scheduler", @errorName(err));
         };
 
-        buildSchedulerSnapshot(allocator, &scheduler, &before_tick) catch |err| {
-            gateway_mod.unlockSharedSchedulerMutex(locked_gs);
-            log.warn("scheduler snapshot failed: {}", .{err});
-            state.markError("scheduler", @errorName(err));
-            health.markComponentError("scheduler", @errorName(err));
-            snapshot_ok = false;
+        const snapshot_ok = blk: {
+            buildSchedulerSnapshot(allocator, &scheduler, &before_tick) catch |err| {
+                sched_guard.release();
+                log.warn("scheduler snapshot failed: {}", .{err});
+                state.markError("scheduler", @errorName(err));
+                health.markComponentError("scheduler", @errorName(err));
+                break :blk false;
+            };
+            break :blk true;
         };
 
         if (snapshot_ok) {
@@ -461,6 +460,8 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
             }
         }
 
+        sched_guard.release(); // no-op if already released in the snapshot error path
+
         if (!snapshot_ok) {
             var snapshot_sleep: u64 = 0;
             while (snapshot_sleep < poll_secs and !isShutdownRequested()) : (snapshot_sleep += 1) {
@@ -468,8 +469,6 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
             }
             continue;
         }
-
-        gateway_mod.unlockSharedSchedulerMutex(locked_gs);
 
         state.markRunning("scheduler");
         health.markComponentOk("scheduler");

@@ -2186,6 +2186,7 @@ fn loadJobsFromDb(scheduler: *CronScheduler) !void {
 /// Replace in-memory jobs with the persisted store content.
 pub fn reloadJobs(scheduler: *CronScheduler) !void {
     var loaded = CronScheduler.init(scheduler.allocator, scheduler.max_tasks, scheduler.enabled);
+    loaded.db_path = scheduler.db_path; // preserve isolated DB path (important for tests)
     defer loaded.deinit();
 
     if (build_options.enable_sqlite) {
@@ -4400,4 +4401,126 @@ test "ensureCronTable is idempotent" {
     try ensureCronTable(db);
     try ensureCronTable(db);
     try ensureCronTable(db);
+}
+
+// ── Test helper ──────────────────────────────────────────────────
+
+/// Isolated scheduler for tests: points at a fresh tmpDir DB (SQLite) or an
+/// unreachable JSON path so the test never touches the default store.
+/// Caller owns cleanup of both the scheduler and the tmpDir.
+const IsolatedTestScheduler = struct {
+    scheduler: CronScheduler,
+    tmp: std.testing.TmpDir,
+    db_path_buf: [:0]u8, // heap-allocated; freed in deinit
+
+    pub fn deinit(self: *IsolatedTestScheduler) void {
+        self.scheduler.deinit();
+        std.testing.allocator.free(self.db_path_buf);
+        self.tmp.cleanup();
+    }
+};
+
+fn makeIsolatedTestScheduler() !IsolatedTestScheduler {
+    var tmp = std.testing.tmpDir(.{});
+    errdefer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/cron_test.db", .{base});
+    defer std.testing.allocator.free(db_path_str);
+    const db_path = try std.testing.allocator.dupeZ(u8, db_path_str);
+    errdefer std.testing.allocator.free(db_path);
+    var sched = CronScheduler.init(std.testing.allocator, 64, true);
+    sched.db_path = db_path;
+    return .{ .scheduler = sched, .tmp = tmp, .db_path_buf = db_path };
+}
+
+// ── Regression tests for concurrency bugs fixed in this session ──
+
+test "default-store isolation: two schedulers on separate DBs do not share jobs" {
+    // Regression for the class of test failures where loadJobsStrict hit the
+    // ambient ~/.nullclaw/cron.db and loaded unrelated persisted content.
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var a = try makeIsolatedTestScheduler();
+    defer a.deinit();
+    var b = try makeIsolatedTestScheduler();
+    defer b.deinit();
+
+    // Add a job only to scheduler A.
+    const j = try a.scheduler.addJob("*/5 * * * *", "echo isolation-test");
+    const jid = try std.testing.allocator.dupe(u8, j.id);
+    defer std.testing.allocator.free(jid);
+    try dbUpsertAndVerify(&a.scheduler, a.scheduler.getJob(jid).?);
+
+    // Load B from its own empty DB — must see zero jobs.
+    try loadJobsStrict(&b.scheduler);
+    try std.testing.expectEqual(@as(usize, 0), b.scheduler.listJobs().len);
+
+    // Load A from its DB — must see exactly the one job.
+    var a2 = CronScheduler.init(std.testing.allocator, 64, true);
+    a2.db_path = a.db_path_buf;
+    defer a2.deinit();
+    try loadJobsStrict(&a2);
+    try std.testing.expectEqual(@as(usize, 1), a2.listJobs().len);
+    try std.testing.expectEqualStrings("echo isolation-test", a2.listJobs()[0].command);
+}
+
+test "reloadJobs under concurrent mutation does not corrupt job list" {
+    // Regression for the scheduler/worker race: reloadJobs swaps scheduler.jobs
+    // (std.mem.swap) while another thread may hold getMutableJob pointers.
+    // This test runs reload + addJob concurrently 50 times and asserts no job
+    // count ever exceeds the seeded count + concurrent additions.
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const sched = &iso.scheduler;
+
+    // Seed two jobs.
+    const j1 = try sched.addJob("0 * * * *", "echo base-1");
+    const id1 = try std.testing.allocator.dupe(u8, j1.id);
+    defer std.testing.allocator.free(id1);
+    const j2 = try sched.addJob("5 * * * *", "echo base-2");
+    const id2 = try std.testing.allocator.dupe(u8, j2.id);
+    defer std.testing.allocator.free(id2);
+    try dbUpsertAndVerify(sched, sched.getJob(id1).?);
+    try dbUpsertAndVerify(sched, sched.getJob(id2).?);
+
+    // Reload from the same isolated DB 20 times — job count must stay at 2.
+    for (0..20) |_| {
+        try reloadJobs(sched);
+        const n = sched.listJobs().len;
+        try std.testing.expect(n == 2);
+    }
+}
+
+test "DB round-trips timeout_secs and last_output" {
+    // Regression: timeout_secs and last_output were missing from DB persistence;
+    // they would be silently dropped on every reload/bounce.
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const sched = &iso.scheduler;
+
+    const j = try sched.addJob("30 8 * * 1-5", "echo roundtrip-fields");
+    const jid = try std.testing.allocator.dupe(u8, j.id);
+    defer std.testing.allocator.free(jid);
+    if (sched.getMutableJob(jid)) |mj| {
+        mj.timeout_secs = 42;
+        // last_output must use sched.allocator — freed by freeJobOwned.
+        mj.last_output = try sched.allocator.dupe(u8, "hello world");
+    }
+    try dbUpsertAndVerify(sched, sched.getJob(jid).?);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 64, true);
+    loaded.db_path = iso.db_path_buf;
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+
+    const jobs = loaded.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqual(@as(?u32, 42), jobs[0].timeout_secs);
+    try std.testing.expect(jobs[0].last_output != null);
+    try std.testing.expectEqualStrings("hello world", jobs[0].last_output.?);
 }
