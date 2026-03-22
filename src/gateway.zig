@@ -3282,7 +3282,10 @@ fn runQueueWorker(state: *GatewayState) void {
                         log.err("[{s}] delivery failed: {s}", .{ id, @errorName(err) });
                         break :blk false;
                     };
-                    if (!delivered and delivery.mode != .none and delivery.channel != null) {
+                    // Only warn when delivery was silently skipped with non-empty output;
+                    // error and empty-output cases are already logged by the catch block
+                    // and deliverResult respectively.
+                    if (!delivered and raw_output.len > 0 and delivery.mode != .none and delivery.channel != null) {
                         log.warn("[{s}] output not delivered (len={d}): {s}...", .{ id, output.len, output[0..@min(200, output.len)] });
                     }
                 }
@@ -3319,7 +3322,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         log.err("[{s}] delivery failed: {s}", .{ id, @errorName(err) });
                         break :blk false;
                     };
-                    if (!delivered and delivery.mode != .none and delivery.channel != null) {
+                    if (!delivered and raw_agent.len > 0 and delivery.mode != .none and delivery.channel != null) {
                         log.warn("[{s}] output not delivered (len={d}): {s}...", .{ id, agent_output.len, agent_output[0..@min(200, agent_output.len)] });
                     }
                 }
