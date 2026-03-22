@@ -334,9 +334,13 @@ pub const ProviderHolder = union(enum) {
             .anthropic_provider => .{ .anthropic = anthropic.AnthropicProvider.init(
                 allocator,
                 api_key,
-                if (std.mem.startsWith(u8, provider_name, "anthropic-custom:"))
-                    provider_name["anthropic-custom:".len..]
-                else
+                if (std.mem.startsWith(u8, provider_name, "anthropic-custom:")) blk: {
+                    // Prefer explicit base_url from config. Fall back to the suffix
+                    // only when it looks like a URL (starts with "http").
+                    if (base_url) |u| break :blk u;
+                    const suffix = provider_name["anthropic-custom:".len..];
+                    break :blk if (std.mem.startsWith(u8, suffix, "http")) suffix else null;
+                } else
                     base_url,
             ) },
             .openai_provider => .{ .openai = openai.OpenAiProvider.init(allocator, api_key, user_agent) },

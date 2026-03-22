@@ -414,8 +414,10 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
 
     const poll_secs: u64 = @max(@as(u64, 1), config.reliability.scheduler_poll_secs);
 
-    // Initial load from disk (ignore errors — start empty if file missing/corrupt)
-    cron.loadJobs(&scheduler) catch {};
+    // Initial load from disk (log errors but keep going — missing/corrupt store starts empty)
+    cron.loadJobs(&scheduler) catch |err| {
+        std.log.scoped(.scheduler).err("cron job load failed: {s} — starting with empty scheduler", .{@errorName(err)});
+    };
 
     // Register live scheduler pointer with the gateway for /cron HTTP endpoints.
     gateway_mod.setSharedScheduler(&scheduler);
@@ -424,6 +426,11 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     health.markComponentOk("scheduler");
 
     while (!isShutdownRequested()) {
+        // Hold the gateway's scheduler_mutex for the entire reload/tick/save block so
+        // HTTP handlers and runQueueWorker cannot race against structural changes to
+        // scheduler.jobs (swapped by reloadJobs) or next_run_secs (updated by tick).
+        gateway_mod.lockSharedSchedulerMutex();
+
         // Refresh scheduler view from store so jobs created/updated after daemon startup are picked up.
         cron.reloadJobs(&scheduler) catch |err| {
             log.warn("scheduler reload failed: {}", .{err});
@@ -432,6 +439,7 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
         };
 
         buildSchedulerSnapshot(allocator, &scheduler, &before_tick) catch |err| {
+            gateway_mod.unlockSharedSchedulerMutex();
             log.warn("scheduler snapshot failed: {}", .{err});
             state.markError("scheduler", @errorName(err));
             health.markComponentError("scheduler", @errorName(err));
@@ -450,6 +458,8 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
                 health.markComponentError("scheduler", @errorName(err));
             };
         }
+
+        gateway_mod.unlockSharedSchedulerMutex();
 
         state.markRunning("scheduler");
         health.markComponentOk("scheduler");

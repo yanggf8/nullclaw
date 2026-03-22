@@ -658,6 +658,8 @@ pub const TelegramChannel = struct {
     pending_interactions: std.StringHashMapUnmanaged(PendingInteraction) = .empty,
     interaction_seq: Atomic(u64) = Atomic(u64).init(1),
 
+    stopped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     draft_mu: std.Thread.Mutex = .{},
     draft_send_mu: std.Thread.Mutex = .{},
     draft_buffers: std.StringHashMapUnmanaged(DraftState) = .empty,
@@ -2716,6 +2718,8 @@ pub const TelegramChannel = struct {
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        // Clear stopped flag so sends work after a restart.
+        self.stopped.store(false, .release);
         // Verify bot token by calling getMe
         if (self.api().getMe(self.allocator)) |resp| {
             self.allocator.free(resp);
@@ -2728,6 +2732,8 @@ pub const TelegramChannel = struct {
 
     fn vtableStop(ptr: *anyopaque) void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        // Signal all concurrent vtable send functions to bail out before we free buffers.
+        self.stopped.store(true, .release);
         self.stopAllTyping();
         self.deinitPendingInteractions();
         self.deinitDraftBuffers();
@@ -3035,6 +3041,7 @@ pub const TelegramChannel = struct {
         stage: root.Channel.OutboundStage,
     ) anyerror!void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        if (self.stopped.load(.acquire)) return;
         if (!self.streaming_enabled) {
             if (stage == .final and message.len > 0) {
                 return vtableSend(ptr, target, message, &.{});
@@ -3085,6 +3092,7 @@ pub const TelegramChannel = struct {
 
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, media: []const []const u8) anyerror!void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        if (self.stopped.load(.acquire)) return;
         var payload = try buildOwnedOutboundPayloadFromLegacy(self.allocator, message, media, true);
         defer payload.deinit(self.allocator);
         try self.sendRichMessageWithReply(target, "", false, payload.payload(), null);
@@ -3092,6 +3100,7 @@ pub const TelegramChannel = struct {
 
     fn vtableSendRich(ptr: *anyopaque, target: []const u8, payload: root.Channel.OutboundPayload) anyerror!void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        if (self.stopped.load(.acquire)) return;
         try self.sendRichMessageWithReply(target, "", false, payload, null);
     }
 

@@ -5,7 +5,9 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
-const loadScheduler = @import("cron_add.zig").loadScheduler;
+const cron_add = @import("cron_add.zig");
+const loadScheduler = cron_add.loadScheduler;
+const persistSchedulerOrFail = cron_add.persistSchedulerOrFail;
 
 /// CronRemove tool — removes a scheduled cron job by its ID.
 pub const CronRemoveTool = struct {
@@ -37,7 +39,7 @@ pub const CronRemoveTool = struct {
         defer scheduler.deinit();
 
         if (scheduler.removeJob(job_id)) {
-            cron.saveJobs(&scheduler) catch {};
+            if (try persistSchedulerOrFail(allocator, &scheduler)) |result| return result;
             const msg = try std.fmt.allocPrint(allocator, "Removed cron job {s}", .{job_id});
             return ToolResult{ .success = true, .output = msg };
         }

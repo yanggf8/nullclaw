@@ -477,6 +477,15 @@ pub const GatewayState = struct {
     scheduler: ?*cron_mod.CronScheduler = null,
     scheduler_mutex: std.Thread.Mutex = .{},
 
+    // Job run queue — handleCronRun enqueues job IDs here; a single worker
+    // thread pops and executes them sequentially to avoid concurrent Telegram
+    // deliveries racing each other.
+    run_queue: std.ArrayListUnmanaged([]const u8) = .empty,
+    run_queue_mutex: std.Thread.Mutex = .{},
+    run_queue_cond: std.Thread.Condition = .{},
+    run_queue_stop: bool = false,
+    run_queue_thread: ?std.Thread = null,
+
     pub fn init(allocator: std.mem.Allocator) GatewayState {
         return initWithVerifyToken(allocator, "");
     }
@@ -494,7 +503,39 @@ pub const GatewayState = struct {
         };
     }
 
+    /// Start the single-threaded job run worker.
+    pub fn startRunQueue(self: *GatewayState) !void {
+        self.run_queue_thread = try std.Thread.spawn(.{}, runQueueWorker, .{self});
+    }
+
+    /// Signal the worker to stop and wait for it to exit.
+    pub fn stopRunQueue(self: *GatewayState) void {
+        {
+            self.run_queue_mutex.lock();
+            defer self.run_queue_mutex.unlock();
+            self.run_queue_stop = true;
+            self.run_queue_cond.signal();
+        }
+        if (self.run_queue_thread) |t| {
+            t.join();
+            self.run_queue_thread = null;
+        }
+        // Free any remaining queued ids.
+        for (self.run_queue.items) |id| self.allocator.free(id);
+        self.run_queue.deinit(self.allocator);
+        self.run_queue = .empty;
+    }
+
+    /// Enqueue a job id for sequential execution. Takes ownership of id_dupe.
+    pub fn enqueueRunJob(self: *GatewayState, id_dupe: []const u8) !void {
+        self.run_queue_mutex.lock();
+        defer self.run_queue_mutex.unlock();
+        try self.run_queue.append(self.allocator, id_dupe);
+        self.run_queue_cond.signal();
+    }
+
     pub fn deinit(self: *GatewayState) void {
+        self.stopRunQueue();
         for (self.qq_channels.items) |*qq_ch| {
             qq_ch.channel().stop();
         }
@@ -2261,6 +2302,8 @@ const cron_route_descriptors = [_]CronRouteDescriptor{
     .{ .path = "/cron/resume", .method = "POST", .handler = handleCronResume },
     .{ .path = "/cron/update", .method = "POST", .handler = handleCronUpdate },
     .{ .path = "/cron/run", .method = "POST", .handler = handleCronRun },
+    .{ .path = "/cron/output", .method = "POST", .handler = handleCronOutput },
+    .{ .path = "/cron/sync-seed", .method = "POST", .handler = handleCronSyncSeed },
 };
 
 fn findCronRouteDescriptor(path: []const u8) ?*const CronRouteDescriptor {
@@ -2294,6 +2337,8 @@ fn appendCronJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Alloca
     } else {
         try buf.appendSlice(allocator, "null");
     }
+    try buf.appendSlice(allocator, ",\"last_output\":");
+    if (job.last_output) |lo| try appendJsonStringBuf(buf, allocator, lo) else try buf.appendSlice(allocator, "null");
     try buf.appendSlice(allocator, ",\"paused\":");
     try buf.appendSlice(allocator, if (job.paused) "true" else "false");
     try buf.appendSlice(allocator, ",\"one_shot\":");
@@ -2308,6 +2353,18 @@ fn appendCronJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Alloca
     if (job.model) |m| try appendJsonStringBuf(buf, allocator, m) else try buf.appendSlice(allocator, "null");
     try buf.appendSlice(allocator, ",\"created_at_s\":");
     try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{job.created_at_s}) catch "0");
+    try buf.appendSlice(allocator, ",\"delivery_mode\":");
+    try appendJsonStringBuf(buf, allocator, job.delivery.mode.asStr());
+    try buf.appendSlice(allocator, ",\"delivery_channel\":");
+    if (job.delivery.channel) |ch| try appendJsonStringBuf(buf, allocator, ch) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"delivery_to\":");
+    if (job.delivery.to) |t| try appendJsonStringBuf(buf, allocator, t) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"timeout_secs\":");
+    if (job.timeout_secs) |t| {
+        try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{t}) catch "null");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
     try buf.appendSlice(allocator, "}");
 }
 
@@ -2385,6 +2442,11 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
     const model_opt = jsonStringField(body, "model");
     const delivery_channel_opt = jsonStringField(body, "delivery_channel");
     const delivery_to_opt = jsonStringField(body, "delivery_to");
+    const timeout_secs_add: ?u32 = blk: {
+        const v = jsonIntField(body, "timeout_secs") orelse break :blk null;
+        if (v <= 0) break :blk null;
+        break :blk @intCast(v);
+    };
 
     ctx.state.scheduler_mutex.lock();
     defer ctx.state.scheduler_mutex.unlock();
@@ -2395,10 +2457,12 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
         return;
     };
 
+    const best_effort_add = std.mem.indexOf(u8, body, "\"best_effort\":true") != null;
     const delivery = cron_mod.DeliveryConfig{
         .mode = if (delivery_channel_opt != null) .always else .none,
         .channel = delivery_channel_opt,
         .to = delivery_to_opt,
+        .best_effort = best_effort_add,
         .channel_owned = false,
         .to_owned = false,
     };
@@ -2432,7 +2496,14 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
         };
     };
 
-    if (!persistCronSchedulerOr500(ctx, sched)) return;
+    if (timeout_secs_add) |t| job_ptr.timeout_secs = t;
+
+    cron_mod.saveJobs(sched) catch |err| {
+        std.log.scoped(.gateway).warn("cron add persist failed: {s}", .{@errorName(err)});
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"failed to persist job\"}";
+        return;
+    };
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     appendCronJobJson(&buf, ctx.req_allocator, job_ptr.*) catch {
@@ -2475,7 +2546,12 @@ fn handleCronRemove(ctx: *WebhookHandlerContext) void {
         ctx.response_body = "{\"error\":\"job not found\"}";
         return;
     }
-    if (!persistCronSchedulerOr500(ctx, sched)) return;
+    cron_mod.saveJobs(sched) catch |err| {
+        std.log.scoped(.gateway).warn("cron delete failed: {s}", .{@errorName(err)});
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"failed to persist job\"}";
+        return;
+    };
     ctx.response_status = "200 OK";
     ctx.response_body = "{\"status\":\"removed\"}";
 }
@@ -2511,7 +2587,12 @@ fn handleCronPause(ctx: *WebhookHandlerContext) void {
         ctx.response_body = "{\"error\":\"job not found\"}";
         return;
     }
-    if (!persistCronSchedulerOr500(ctx, sched)) return;
+    cron_mod.saveJobs(sched) catch |err| {
+        std.log.scoped(.gateway).warn("cron pause persist failed: {s}", .{@errorName(err)});
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"failed to persist job\"}";
+        return;
+    };
     ctx.response_status = "200 OK";
     ctx.response_body = "{\"status\":\"paused\"}";
 }
@@ -2547,7 +2628,12 @@ fn handleCronResume(ctx: *WebhookHandlerContext) void {
         ctx.response_body = "{\"error\":\"job not found\"}";
         return;
     }
-    if (!persistCronSchedulerOr500(ctx, sched)) return;
+    cron_mod.saveJobs(sched) catch |err| {
+        std.log.scoped(.gateway).warn("cron resume persist failed: {s}", .{@errorName(err)});
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"failed to persist job\"}";
+        return;
+    };
     ctx.response_status = "200 OK";
     ctx.response_body = "{\"status\":\"resumed\"}";
 }
@@ -2573,6 +2659,9 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
     const command = jsonStringField(body, "command");
     const prompt = jsonStringField(body, "prompt");
     const model = jsonStringField(body, "model");
+    const delivery_channel = jsonStringField(body, "delivery_channel");
+    const delivery_to = jsonStringField(body, "delivery_to");
+    const delivery_mode = jsonStringField(body, "delivery_mode");
 
     // Parse optional boolean "paused" field
     var enabled_opt: ?bool = null;
@@ -2586,6 +2675,12 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
     } else if (std.mem.indexOf(u8, body, "\"enabled\":false") != null) {
         enabled_opt = false;
     }
+
+    const timeout_secs_opt: ?u32 = blk: {
+        const v = jsonIntField(body, "timeout_secs") orelse break :blk null;
+        if (v <= 0) break :blk null;
+        break :blk @intCast(v);
+    };
 
     ctx.state.scheduler_mutex.lock();
     defer ctx.state.scheduler_mutex.unlock();
@@ -2602,14 +2697,23 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
         .prompt = prompt,
         .model = model,
         .enabled = enabled_opt,
+        .delivery_channel = delivery_channel,
+        .delivery_to = delivery_to,
+        .delivery_mode = delivery_mode,
+        .timeout_secs = timeout_secs_opt,
     };
 
-    if (!sched.updateJob(ctx.req_allocator, id, patch)) {
+    if (!sched.updateJob(sched.allocator, id, patch)) {
         ctx.response_status = "404 Not Found";
         ctx.response_body = "{\"error\":\"job not found or update failed\"}";
         return;
     }
-    if (!persistCronSchedulerOr500(ctx, sched)) return;
+    cron_mod.saveJobs(sched) catch |err| {
+        std.log.scoped(.gateway).warn("cron update persist failed: {s}", .{@errorName(err)});
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"failed to persist job\"}";
+        return;
+    };
     ctx.response_status = "200 OK";
     ctx.response_body = "{\"status\":\"updated\"}";
 }
@@ -2631,81 +2735,325 @@ fn handleCronRun(ctx: *WebhookHandlerContext) void {
         return;
     };
 
+    // Verify the job exists before queuing.
+    {
+        ctx.state.scheduler_mutex.lock();
+        defer ctx.state.scheduler_mutex.unlock();
+        const sched = ctx.state.scheduler orelse {
+            ctx.response_status = "503 Service Unavailable";
+            ctx.response_body = "{\"error\":\"scheduler not running\"}";
+            return;
+        };
+        if (sched.getMutableJob(id) == null) {
+            ctx.response_status = "404 Not Found";
+            ctx.response_body = "{\"error\":\"job not found\"}";
+            return;
+        }
+    }
+
+    // Enqueue — worker thread executes sequentially to avoid concurrent delivery races.
+    const id_dupe = ctx.state.allocator.dupe(u8, id) catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"out of memory\"}";
+        return;
+    };
+    ctx.state.enqueueRunJob(id_dupe) catch {
+        ctx.state.allocator.free(id_dupe);
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"queue full\"}";
+        return;
+    };
+
+    ctx.response_status = "200 OK";
+    ctx.response_body = "{\"status\":\"queued\"}";
+}
+
+fn handleCronOutput(ctx: *WebhookHandlerContext) void {
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+    const id = jsonStringField(body, "id") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"id required\"}";
+        return;
+    };
     ctx.state.scheduler_mutex.lock();
     defer ctx.state.scheduler_mutex.unlock();
-
     const sched = ctx.state.scheduler orelse {
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
     };
-
-    const job = sched.getMutableJob(id) orelse {
+    const job = sched.getJob(id) orelse {
         ctx.response_status = "404 Not Found";
-        ctx.response_body = "{\"error\":\"job not found\"}";
+        ctx.response_body = "{\"error\":\"not found\"}";
         return;
     };
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    buf.appendSlice(ctx.req_allocator, "{\"id\":") catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"out of memory\"}";
+        return;
+    };
+    appendJsonStringBuf(&buf, ctx.req_allocator, job.id) catch {};
+    buf.appendSlice(ctx.req_allocator, ",\"last_output\":") catch {};
+    if (job.last_output) |lo| {
+        appendJsonStringBuf(&buf, ctx.req_allocator, lo) catch {};
+    } else {
+        buf.appendSlice(ctx.req_allocator, "null") catch {};
+    }
+    buf.appendSlice(ctx.req_allocator, ",\"last_run_secs\":") catch {};
+    if (job.last_run_secs) |lrs| {
+        var int_buf: [32]u8 = undefined;
+        buf.appendSlice(ctx.req_allocator, std.fmt.bufPrint(&int_buf, "{d}", .{lrs}) catch "0") catch {};
+    } else {
+        buf.appendSlice(ctx.req_allocator, "null") catch {};
+    }
+    buf.appendSlice(ctx.req_allocator, ",\"last_status\":") catch {};
+    if (job.last_status) |ls| {
+        appendJsonStringBuf(&buf, ctx.req_allocator, ls) catch {};
+    } else {
+        buf.appendSlice(ctx.req_allocator, "null") catch {};
+    }
+    buf.append(ctx.req_allocator, '}') catch {};
+    ctx.response_status = "200 OK";
+    ctx.response_body = buf.items;
+}
 
-    const now = std.time.timestamp();
-    const run_cwd: ?[]const u8 = if (sched.shell_cwd) |cwd| blk: {
-        std.fs.accessAbsolute(cwd, .{}) catch break :blk null;
-        break :blk cwd;
-    } else null;
+/// POST /cron/sync-seed — export current DB state to ~/.nullclaw/cron-seed.json immediately.
+fn handleCronSyncSeed(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const home = @import("platform.zig").getHomeDir(ctx.req_allocator) catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"could not determine home dir\"}";
+        return;
+    };
+    const script = std.fs.path.join(ctx.req_allocator, &.{ home, ".nullclaw", "sync-cron-seed.sh" }) catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"out of memory\"}";
+        return;
+    };
+    const result = std.process.Child.run(.{
+        .allocator = ctx.req_allocator,
+        .argv = &.{ "/bin/bash", script },
+        .max_output_bytes = 4096,
+    }) catch |err| {
+        std.log.scoped(.gateway).err("sync-seed failed: {s}", .{@errorName(err)});
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"sync script failed to run\"}";
+        return;
+    };
+    defer ctx.req_allocator.free(result.stdout);
+    defer ctx.req_allocator.free(result.stderr);
+    const success = switch (result.term) { .Exited => |c| c == 0, else => false };
+    if (!success) {
+        std.log.scoped(.gateway).err("sync-seed script exited with error: {s}", .{result.stderr});
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"sync script exited with error\"}";
+        return;
+    }
+    ctx.response_body = "{\"status\":\"synced\"}";
+}
 
-    switch (job.job_type) {
-        .shell => {
-            const result = std.process.Child.run(.{
-                .allocator = ctx.req_allocator,
-                .argv = &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), job.command },
-                .cwd = run_cwd,
-                .max_output_bytes = 65536,
-            }) catch |err| {
-                job.last_run_secs = now;
-                job.last_status = "error";
-                _ = cron_mod.saveJobs(sched) catch {};
-                const msg = std.fmt.allocPrint(ctx.req_allocator, "{{\"error\":\"exec failed: {s}\"}}", .{@errorName(err)}) catch "{\"error\":\"exec failed\"}";
-                ctx.response_status = "500 Internal Server Error";
-                ctx.response_body = msg;
-                return;
-            };
-            defer ctx.req_allocator.free(result.stdout);
-            defer ctx.req_allocator.free(result.stderr);
-            const exit_code: u8 = switch (result.term) {
-                .Exited => |code| code,
-                else => 1,
-            };
-            const success = exit_code == 0;
-            job.last_run_secs = now;
-            job.last_status = if (success) "ok" else "error";
-            const output = if (result.stdout.len > 0) result.stdout else result.stderr;
-            if (ctx.state.event_bus) |eb| {
-                _ = cron_mod.deliverResult(ctx.req_allocator, job.delivery, output, success, eb) catch {};
+/// Worker thread: pops job IDs from the run queue and executes them one at a time.
+fn runQueueWorker(state: *GatewayState) void {
+    const log = std.log.scoped(.cron_queue);
+
+    while (true) {
+        // Wait for a job or stop signal.
+        const id: []const u8 = blk: {
+            state.run_queue_mutex.lock();
+            defer state.run_queue_mutex.unlock();
+            while (state.run_queue.items.len == 0 and !state.run_queue_stop) {
+                state.run_queue_cond.wait(&state.run_queue_mutex);
             }
-            _ = cron_mod.saveJobs(sched) catch {};
-            ctx.response_status = "200 OK";
-            ctx.response_body = "{\"status\":\"ok\"}";
-        },
-        .agent => {
-            const prompt = job.prompt orelse job.command;
-            const agent_result = cron_mod.runAgentJob(ctx.req_allocator, run_cwd, prompt, job.model, sched.agent_timeout_secs) catch |err| {
-                job.last_run_secs = now;
-                job.last_status = "error";
-                _ = cron_mod.saveJobs(sched) catch {};
-                const msg = std.fmt.allocPrint(ctx.req_allocator, "{{\"error\":\"agent failed: {s}\"}}", .{@errorName(err)}) catch "{\"error\":\"agent failed\"}";
-                ctx.response_status = "500 Internal Server Error";
-                ctx.response_body = msg;
-                return;
+            if (state.run_queue_stop and state.run_queue.items.len == 0) return;
+            break :blk state.run_queue.orderedRemove(0);
+        };
+        defer state.allocator.free(id);
+
+        // Per-job arena: all per-iteration allocations go here and are freed when the job finishes.
+        var job_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer job_arena.deinit();
+        const allocator = job_arena.allocator();
+
+        log.info("running queued job '{s}'", .{id});
+
+        // Look up the job under the scheduler mutex.
+        const sched = s: {
+            state.scheduler_mutex.lock();
+            defer state.scheduler_mutex.unlock();
+            break :s state.scheduler orelse {
+                log.warn("scheduler not running, dropping job '{s}'", .{id});
+                continue;
             };
-            defer ctx.req_allocator.free(agent_result.output);
-            job.last_run_secs = now;
-            job.last_status = if (agent_result.success) "ok" else "error";
-            if (ctx.state.event_bus) |eb| {
-                _ = cron_mod.deliverResult(ctx.req_allocator, job.delivery, agent_result.output, agent_result.success, eb) catch {};
+        };
+
+        const job_type, const command, const prompt, const model, const delivery, const run_cwd = j: {
+            state.scheduler_mutex.lock();
+            defer state.scheduler_mutex.unlock();
+            const job = sched.getMutableJob(id) orelse {
+                log.warn("job '{s}' not found in scheduler", .{id});
+                continue;
+            };
+            const cwd: ?[]const u8 = if (sched.shell_cwd) |cwd| blk: {
+                std.fs.accessAbsolute(cwd, .{}) catch break :blk null;
+                break :blk cwd;
+            } else null;
+            // Dupe all strings into the worker's arena allocator so they remain
+            // valid after the mutex is released (scheduler may realloc its storage).
+            const owned_command = allocator.dupe(u8, job.command) catch job.command;
+            const owned_prompt = if (job.prompt) |p| allocator.dupe(u8, p) catch p else null;
+            const owned_model = if (job.model) |m| allocator.dupe(u8, m) catch m else null;
+            var owned_delivery = job.delivery;
+            owned_delivery.channel_owned = false;
+            owned_delivery.account_id_owned = false;
+            owned_delivery.to_owned = false;
+            if (job.delivery.channel) |ch| {
+                owned_delivery.channel = allocator.dupe(u8, ch) catch ch;
             }
-            _ = cron_mod.saveJobs(sched) catch {};
-            ctx.response_status = "200 OK";
-            ctx.response_body = "{\"status\":\"ok\"}";
-        },
+            if (job.delivery.account_id) |aid| {
+                owned_delivery.account_id = allocator.dupe(u8, aid) catch aid;
+            }
+            if (job.delivery.to) |t| {
+                owned_delivery.to = allocator.dupe(u8, t) catch t;
+            }
+            break :j .{ job.job_type, owned_command, owned_prompt, owned_model, owned_delivery, cwd };
+        };
+
+        const now = std.time.timestamp();
+        const job_timeout_secs, const is_agent = s2: {
+            state.scheduler_mutex.lock();
+            defer state.scheduler_mutex.unlock();
+            const jt = if (sched.getMutableJob(id)) |j| j.timeout_secs else null;
+            const is_ag = if (sched.getMutableJob(id)) |j| j.job_type == .agent else false;
+            break :s2 .{ jt, is_ag };
+        };
+        const timeout: u64 = if (job_timeout_secs) |t| t else if (is_agent) sched.agent_timeout_secs else 0;
+
+        switch (job_type) {
+            .shell => {
+                var shell_child = std.process.Child.init(
+                    &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), command },
+                    allocator,
+                );
+                shell_child.stdin_behavior = .Ignore;
+                shell_child.stdout_behavior = .Pipe;
+                shell_child.stderr_behavior = .Pipe;
+                shell_child.cwd = run_cwd;
+                shell_child.spawn() catch |err| {
+                    log.err("job '{s}' exec failed: {s}", .{ id, @errorName(err) });
+                    state.scheduler_mutex.lock();
+                    if (sched.getMutableJob(id)) |j| { j.last_run_secs = now; j.last_status = "error"; }
+                    state.scheduler_mutex.unlock();
+                    _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
+                    continue;
+                };
+                errdefer {
+                    _ = shell_child.kill() catch {};
+                    _ = shell_child.wait() catch {};
+                }
+                const shell_start_ns = std.time.nanoTimestamp();
+                var shell_stdout: std.ArrayList(u8) = .empty;
+                defer shell_stdout.deinit(allocator);
+                var shell_stderr: std.ArrayList(u8) = .empty;
+                defer shell_stderr.deinit(allocator);
+                const shell_timed_out = cron_mod.collectChildOutputWithTimeout(
+                    &shell_child,
+                    allocator,
+                    &shell_stdout,
+                    &shell_stderr,
+                    timeout,
+                    shell_start_ns,
+                ) catch |err| {
+                    log.err("job '{s}' collect failed: {s}", .{ id, @errorName(err) });
+                    state.scheduler_mutex.lock();
+                    if (sched.getMutableJob(id)) |j| { j.last_run_secs = now; j.last_status = "error"; }
+                    state.scheduler_mutex.unlock();
+                    _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
+                    continue;
+                };
+                const shell_term = shell_child.wait() catch |err| {
+                    log.err("job '{s}' wait failed: {s}", .{ id, @errorName(err) });
+                    state.scheduler_mutex.lock();
+                    if (sched.getMutableJob(id)) |j| { j.last_run_secs = now; j.last_status = "error"; }
+                    state.scheduler_mutex.unlock();
+                    _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
+                    continue;
+                };
+                if (shell_timed_out) log.warn("job '{s}' shell command timed out after {d}s", .{ id, timeout });
+                const exit_code: u8 = switch (shell_term) { .Exited => |c| c, else => 1 };
+                const success = !shell_timed_out and exit_code == 0;
+                const raw_output = if (shell_stdout.items.len > 0) shell_stdout.items else shell_stderr.items;
+                const output = std.fmt.allocPrint(allocator, "{s}\n\n`{s}`", .{ raw_output, id }) catch raw_output;
+                defer if (output.ptr != raw_output.ptr) allocator.free(output);
+                {
+                    state.scheduler_mutex.lock();
+                    if (sched.getMutableJob(id)) |j| {
+                        j.last_run_secs = now;
+                        j.last_status = if (success) "ok" else "error";
+                        if (j.last_output) |old| sched.allocator.free(old);
+                        j.last_output = if (raw_output.len > 0) sched.allocator.dupe(u8, raw_output) catch null else null;
+                    }
+                    state.scheduler_mutex.unlock();
+                }
+                if (state.event_bus) |eb| {
+                    const delivered = cron_mod.deliverResult(allocator, delivery, output, success, eb) catch |err| blk: {
+                        log.err("[{s}] delivery failed: {s}", .{ id, @errorName(err) });
+                        break :blk false;
+                    };
+                    if (!delivered and delivery.mode != .none and delivery.channel != null) {
+                        log.warn("[{s}] output not delivered (len={d}): {s}...", .{ id, output.len, output[0..@min(200, output.len)] });
+                    }
+                }
+                _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch |err|
+                    log.err("[{s}] db persist failed: {s}", .{ id, @errorName(err) });
+                log.info("[{s}] completed ({s})", .{ id, if (success) "ok" else "error" });
+            },
+            .agent => {
+                const p = prompt orelse command;
+                const agent_result = cron_mod.runAgentJob(allocator, run_cwd, p, model, timeout) catch |err| {
+                    log.err("[{s}] agent failed: {s}", .{ id, @errorName(err) });
+                    state.scheduler_mutex.lock();
+                    if (sched.getMutableJob(id)) |j| { j.last_run_secs = now; j.last_status = "error"; }
+                    state.scheduler_mutex.unlock();
+                    _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
+                    continue;
+                };
+                defer allocator.free(agent_result.output);
+                const raw_agent = agent_result.output;
+                const agent_output = std.fmt.allocPrint(allocator, "{s}\n\n`{s}`", .{ raw_agent, id }) catch raw_agent;
+                defer if (agent_output.ptr != raw_agent.ptr) allocator.free(agent_output);
+                {
+                    state.scheduler_mutex.lock();
+                    if (sched.getMutableJob(id)) |j| {
+                        j.last_run_secs = now;
+                        j.last_status = if (agent_result.success) "ok" else "error";
+                        if (j.last_output) |old| sched.allocator.free(old);
+                        j.last_output = if (raw_agent.len > 0) sched.allocator.dupe(u8, raw_agent) catch null else null;
+                    }
+                    state.scheduler_mutex.unlock();
+                }
+                if (state.event_bus) |eb| {
+                    const delivered = cron_mod.deliverResult(allocator, delivery, agent_output, agent_result.success, eb) catch |err| blk: {
+                        log.err("[{s}] delivery failed: {s}", .{ id, @errorName(err) });
+                        break :blk false;
+                    };
+                    if (!delivered and delivery.mode != .none and delivery.channel != null) {
+                        log.warn("[{s}] output not delivered (len={d}): {s}...", .{ id, agent_output.len, agent_output[0..@min(200, agent_output.len)] });
+                    }
+                }
+                _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch |err|
+                    log.err("[{s}] db persist failed: {s}", .{ id, @errorName(err) });
+                log.info("[{s}] completed ({s})", .{ id, if (agent_result.success) "ok" else "error" });
+            },
+        }
     }
 }
 
@@ -4241,6 +4589,23 @@ pub fn clearSharedScheduler() void {
     }
 }
 
+/// Acquire the gateway's scheduler_mutex so the daemon's scheduler thread
+/// can safely reload/tick/save without racing the HTTP handlers and queue worker.
+/// Must be paired with unlockSharedSchedulerMutex. No-op if no gateway is running.
+pub fn lockSharedSchedulerMutex() void {
+    g_state_mutex.lock();
+    defer g_state_mutex.unlock();
+    if (g_state_ptr) |gs| gs.scheduler_mutex.lock();
+}
+
+/// Release the gateway's scheduler_mutex acquired by lockSharedSchedulerMutex.
+/// No-op if no gateway is running.
+pub fn unlockSharedSchedulerMutex() void {
+    g_state_mutex.lock();
+    defer g_state_mutex.unlock();
+    if (g_state_ptr) |gs| gs.scheduler_mutex.unlock();
+}
+
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
 /// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, POST /qq, POST /max
 /// If config_ptr is null, loads config internally (for backward compatibility).
@@ -4250,6 +4615,11 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var state = GatewayState.init(allocator);
     defer state.deinit();
     state.event_bus = event_bus;
+
+    // Start the sequential job run queue worker thread.
+    state.startRunQueue() catch |err| {
+        std.log.scoped(.gateway).warn("failed to start run queue worker: {s}", .{@errorName(err)});
+    };
 
     // Register this GatewayState as the active state so the scheduler thread
     // can set its scheduler pointer via setSharedScheduler/clearSharedScheduler.

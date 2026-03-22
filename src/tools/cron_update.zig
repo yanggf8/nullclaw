@@ -5,7 +5,9 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
-const loadScheduler = @import("cron_add.zig").loadScheduler;
+const cron_add = @import("cron_add.zig");
+const loadScheduler = cron_add.loadScheduler;
+const persistSchedulerOrFail = cron_add.persistSchedulerOrFail;
 
 /// CronUpdate tool — update a cron job's expression, command, or enabled state.
 pub const CronUpdateTool = struct {
@@ -58,7 +60,7 @@ pub const CronUpdateTool = struct {
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         }
 
-        cron.saveJobs(&scheduler) catch {};
+        if (try persistSchedulerOrFail(allocator, &scheduler)) |result| return result;
 
         // Build summary of what changed
         var buf: std.ArrayList(u8) = .empty;

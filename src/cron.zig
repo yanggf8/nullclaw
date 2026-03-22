@@ -86,7 +86,7 @@ pub const DeliveryConfig = struct {
     channel: ?[]const u8 = null,
     account_id: ?[]const u8 = null,
     to: ?[]const u8 = null,
-    best_effort: bool = true,
+    best_effort: bool = false,
     channel_owned: bool = false,
     account_id_owned: bool = false,
     to_owned: bool = false,
@@ -110,6 +110,10 @@ pub const CronJobPatch = struct {
     enabled: ?bool = null,
     model: ?[]const u8 = null,
     delete_after_run: ?bool = null,
+    delivery_channel: ?[]const u8 = null,
+    delivery_to: ?[]const u8 = null,
+    delivery_mode: ?[]const u8 = null,
+    timeout_secs: ?u32 = null,
 };
 
 /// A scheduled cron job.
@@ -127,6 +131,7 @@ pub const CronJob = struct {
     prompt: ?[]const u8 = null,
     name: ?[]const u8 = null,
     model: ?[]const u8 = null,
+    timeout_secs: ?u32 = null,
     enabled: bool = true,
     delete_after_run: bool = false,
     created_at_s: i64 = 0,
@@ -413,6 +418,10 @@ pub const CronScheduler = struct {
     allocator: std.mem.Allocator,
     shell_cwd: ?[]const u8 = null,
     agent_timeout_secs: u64 = 0,
+    /// Override the DB path used by all persistence operations.
+    /// Null means use the default ~/.nullclaw/cron.db.
+    /// Set this in tests to point at an isolated tmpDir DB.
+    db_path: ?[:0]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, max_tasks: usize, enabled: bool) CronScheduler {
         return .{
@@ -659,6 +668,7 @@ pub const CronScheduler = struct {
             if (job.model) |old_model| allocator.free(old_model);
             job.model = new_model;
         }
+        if (patch.timeout_secs) |t| job.timeout_secs = t;
         if (patch.enabled) |ena| {
             job.enabled = ena;
             job.paused = !ena;
@@ -666,6 +676,24 @@ pub const CronScheduler = struct {
         if (patch.delete_after_run) |d| {
             job.delete_after_run = d;
             job.one_shot = d;
+        }
+        if (patch.delivery_channel) |ch| {
+            if (job.delivery.channel_owned) {
+                if (job.delivery.channel) |old| allocator.free(old);
+            }
+            job.delivery.channel = allocator.dupe(u8, ch) catch return false;
+            job.delivery.channel_owned = true;
+            if (job.delivery.mode == .none) job.delivery.mode = .always;
+        }
+        if (patch.delivery_to) |t| {
+            if (job.delivery.to_owned) {
+                if (job.delivery.to) |old| allocator.free(old);
+            }
+            job.delivery.to = allocator.dupe(u8, t) catch return false;
+            job.delivery.to_owned = true;
+        }
+        if (patch.delivery_mode) |dm| {
+            job.delivery.mode = DeliveryMode.parse(dm);
         }
         return true;
     }
@@ -924,7 +952,7 @@ fn hasTimeoutExpired(start_ns: i128, timeout_secs: u64) bool {
     return now_ns - start_ns >= timeout_ns;
 }
 
-fn collectChildOutputWithTimeout(
+pub fn collectChildOutputWithTimeout(
     child: *std.process.Child,
     allocator: std.mem.Allocator,
     stdout: *std.ArrayList(u8),
@@ -998,6 +1026,55 @@ fn terminateAgentChildHard(child: *std.process.Child) !void {
     };
 }
 
+/// Extract the final answer from agent stdout, stripping intermediate tool-call
+/// markup and the "thinking aloud" text that precedes each tool call.
+///
+/// Agent stdout structure (repeated N times, then final answer):
+///   [optional text like "Let me search..."]
+///   <tool_call>\n{...}\n</tool_call>\n
+///   [tool result injected back]
+/// Final answer: the last contiguous text block after all tool calls.
+///
+/// Strategy: split on <tool_call> boundaries, discard blocks that contain or
+/// immediately precede a tool call, keep only the trailing text after the last
+/// </tool_call> tag. If no tool calls are present, return the text as-is.
+fn stripToolCallBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    const open_tag = "<tool_call>";
+    const close_tag = "</tool_call>";
+
+    // Find the last </tool_call> — everything after it is the final answer.
+    if (std.mem.lastIndexOf(u8, text, close_tag)) |last_close| {
+        const after = text[last_close + close_tag.len..];
+        // Eat leading whitespace/newlines after the closing tag
+        const trimmed = std.mem.trimLeft(u8, after, " \t\r\n");
+        const result = std.mem.trimRight(u8, trimmed, " \t\r\n");
+        if (result.len > 0) return allocator.dupe(u8, result);
+    }
+
+    // No tool calls at all — return text with any stray open tags removed.
+    if (std.mem.indexOf(u8, text, open_tag) == null) {
+        return allocator.dupe(u8, std.mem.trim(u8, text, " \t\r\n"));
+    }
+
+    // Fallback: strip all <tool_call>...</tool_call> blocks byte-by-byte.
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < text.len) {
+        if (std.mem.startsWith(u8, text[i..], open_tag)) {
+            if (std.mem.indexOf(u8, text[i..], close_tag)) |rel| {
+                i += rel + close_tag.len;
+                if (i < text.len and text[i] == '\n') i += 1;
+                continue;
+            }
+        }
+        try out.append(allocator, text[i]);
+        i += 1;
+    }
+    const trimmed = std.mem.trim(u8, out.items, " \t\r\n");
+    return allocator.dupe(u8, trimmed);
+}
+
 fn buildAgentOutput(
     allocator: std.mem.Allocator,
     stdout: []const u8,
@@ -1014,7 +1091,7 @@ fn buildAgentOutput(
     }
 
     const output_source = if (stdout.len > 0) stdout else if (stderr.len > 0) stderr else "";
-    return allocator.dupe(u8, output_source);
+    return stripToolCallBlocks(allocator, output_source);
 }
 
 fn preferAgentExecPath(self_exe_path: []const u8) []const u8 {
@@ -1306,6 +1383,19 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             break :blk null;
         };
 
+        const last_output_json: ?[]const u8 = blk: {
+            if (obj.get("last_output")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const timeout_secs_json: ?u32 = blk: {
+            if (obj.get("timeout_secs")) |v| {
+                if (v == .integer and v.integer > 0) break :blk @intCast(v.integer);
+            }
+            break :blk null;
+        };
+
         try scheduler.jobs.append(scheduler.allocator, .{
             .id = try scheduler.allocator.dupe(u8, id),
             .expression = try scheduler.allocator.dupe(u8, expression),
@@ -1318,8 +1408,10 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .job_type = job_type,
             .prompt = if (prompt) |p| try scheduler.allocator.dupe(u8, p) else null,
             .model = if (model) |m| try scheduler.allocator.dupe(u8, m) else null,
+            .timeout_secs = timeout_secs_json,
             .enabled = enabled,
             .delete_after_run = delete_after_run,
+            .last_output = if (last_output_json) |lo| try scheduler.allocator.dupe(u8, lo) else null,
             .delivery = .{
                 .mode = delivery_mode,
                 .channel = if (delivery_channel) |ch| try scheduler.allocator.dupe(u8, ch) else null,
@@ -1359,7 +1451,10 @@ pub fn deliverResult(
     }
 
     // Skip empty output
-    if (output.len == 0) return false;
+    if (output.len == 0) {
+        std.log.scoped(.cron_deliver).warn("job delivery skipped: output is empty", .{});
+        return false;
+    }
 
     const chat_id = delivery.to orelse "default";
     const msg = if (delivery.account_id) |account_id|
@@ -1422,6 +1517,12 @@ fn openCronDb(allocator: std.mem.Allocator) !*c.sqlite3 {
     return openCronDbAtPath(path_z);
 }
 
+/// Open the DB for a scheduler, respecting its db_path override if set.
+fn openCronDbForScheduler(scheduler: *const CronScheduler) !*c.sqlite3 {
+    if (scheduler.db_path) |path_z| return openCronDbAtPath(path_z);
+    return openCronDb(scheduler.allocator);
+}
+
 const CRON_TABLE_SQL =
     \\CREATE TABLE IF NOT EXISTS cron_jobs (
     \\  id                  TEXT PRIMARY KEY,
@@ -1434,6 +1535,7 @@ const CRON_TABLE_SQL =
     \\  next_run_secs       INTEGER NOT NULL DEFAULT 0,
     \\  last_run_secs       INTEGER,
     \\  last_status         TEXT,
+    \\  last_output         TEXT,
     \\  paused              INTEGER NOT NULL DEFAULT 0,
     \\  one_shot            INTEGER NOT NULL DEFAULT 0,
     \\  delete_after_run    INTEGER NOT NULL DEFAULT 0,
@@ -1442,7 +1544,8 @@ const CRON_TABLE_SQL =
     \\  delivery_channel    TEXT,
     \\  delivery_account_id TEXT,
     \\  delivery_to         TEXT,
-    \\  created_at_s        INTEGER NOT NULL DEFAULT 0
+    \\  created_at_s        INTEGER NOT NULL DEFAULT 0,
+    \\  timeout_secs        INTEGER
     \\)
 ;
 
@@ -1454,6 +1557,10 @@ fn ensureCronTable(db: *c.sqlite3) !void {
         if (err_msg) |msg| c.sqlite3_free(msg);
         return error.CronTableCreateFailed;
     }
+    // Migration: add last_output column for existing DBs (ignore error if already exists).
+    _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN last_output TEXT", null, null, null);
+    // Migration: add timeout_secs column for existing DBs (ignore error if already exists).
+    _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN timeout_secs INTEGER", null, null, null);
 }
 
 /// Insert or replace a single job row in the DB.
@@ -1463,8 +1570,8 @@ fn dbSaveJob(db: *c.sqlite3, job: *const CronJob) !void {
         "(id, expression, job_type, command, prompt, name, model, " ++
         "next_run_secs, last_run_secs, last_status, paused, one_shot, " ++
         "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
-        "delivery_account_id, delivery_to, created_at_s) " ++
-        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)";
+        "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs) " ++
+        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)";
 
     var stmt: ?*c.sqlite3_stmt = null;
     var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
@@ -1524,6 +1631,16 @@ fn dbSaveJob(db: *c.sqlite3, job: *const CronJob) !void {
         _ = c.sqlite3_bind_null(stmt, 18);
     }
     _ = c.sqlite3_bind_int64(stmt, 19, job.created_at_s);
+    if (job.last_output) |lo| {
+        _ = c.sqlite3_bind_text(stmt, 20, lo.ptr, @intCast(lo.len), SQLITE_STATIC);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 20);
+    }
+    if (job.timeout_secs) |t| {
+        _ = c.sqlite3_bind_int(stmt, 21, @intCast(t));
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 21);
+    }
 
     rc = c.sqlite3_step(stmt);
     if (rc != c.SQLITE_DONE) return error.StepFailed;
@@ -1540,6 +1657,91 @@ fn dbDeleteJob(db: *c.sqlite3, id: []const u8) !void {
     _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
     rc = c.sqlite3_step(stmt);
     if (rc != c.SQLITE_DONE) return error.StepFailed;
+}
+
+/// Read back a single job row by id and return its id string (caller frees).
+/// Returns error.NotFound if no row exists — used to verify a write went through.
+fn dbReadJobById(db: *c.sqlite3, allocator: std.mem.Allocator, id: []const u8) ![]const u8 {
+    const sql = "SELECT id FROM cron_jobs WHERE id = ?1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
+    if (rc != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
+    rc = c.sqlite3_step(stmt);
+    if (rc != c.SQLITE_ROW) return error.NotFound;
+    return try dbColumnText(stmt, 0, allocator);
+}
+
+/// Upsert a single job into the DB and read it back to confirm the write.
+/// Uses scheduler.db_path if set, otherwise ~/.nullclaw/cron.db.
+pub fn dbUpsertAndVerify(scheduler: *const CronScheduler, job: *const CronJob) !void {
+    const db = try openCronDbForScheduler(scheduler);
+    defer _ = c.sqlite3_close(db);
+    try ensureCronTable(db);
+    try dbSaveJob(db, job);
+    const read_back = try dbReadJobById(db, scheduler.allocator, job.id);
+    scheduler.allocator.free(read_back);
+}
+
+/// Delete a single job from the DB by id and verify it is gone.
+/// Uses scheduler.db_path if set, otherwise ~/.nullclaw/cron.db.
+pub fn dbDeleteAndVerify(scheduler: *const CronScheduler, id: []const u8) !void {
+    const db = try openCronDbForScheduler(scheduler);
+    defer _ = c.sqlite3_close(db);
+    try ensureCronTable(db);
+    try dbDeleteJob(db, id);
+    const read_back = dbReadJobById(db, scheduler.allocator, id) catch |err| {
+        if (err == error.NotFound) return; // expected — row is gone
+        return err;
+    };
+    scheduler.allocator.free(read_back);
+    return error.DeleteNotConfirmed;
+}
+
+/// Delete DB rows whose IDs are not present in the scheduler's in-memory job list.
+/// This is used after upserting all live jobs to clean up removed entries.
+fn dbPruneOrphanJobs(db: *c.sqlite3, scheduler: *const CronScheduler) !void {
+    // Collect all IDs currently in DB.
+    const list_sql = "SELECT id FROM cron_jobs";
+    var list_stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(db, list_sql, -1, &list_stmt, null);
+    if (rc != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(list_stmt);
+
+    var to_delete: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (to_delete.items) |id| scheduler.allocator.free(id);
+        to_delete.deinit(scheduler.allocator);
+    }
+
+    while (true) {
+        rc = c.sqlite3_step(list_stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+        const raw = c.sqlite3_column_text(list_stmt, 0);
+        if (raw == null) continue;
+        const len: usize = @intCast(c.sqlite3_column_bytes(list_stmt, 0));
+        if (len == 0) continue;
+        const db_id = raw[0..len];
+
+        // Check if this DB id exists in the in-memory scheduler.
+        var found = false;
+        for (scheduler.jobs.items) |*job| {
+            if (std.mem.eql(u8, job.id, db_id)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            try to_delete.append(scheduler.allocator, try scheduler.allocator.dupe(u8, db_id));
+        }
+    }
+
+    for (to_delete.items) |id| {
+        try dbDeleteJob(db, id);
+    }
 }
 
 /// Read a nullable TEXT column as an optional allocated slice.
@@ -1567,7 +1769,7 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
         "SELECT id, expression, job_type, command, prompt, name, model, " ++
         "next_run_secs, last_run_secs, last_status, paused, one_shot, " ++
         "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
-        "delivery_account_id, delivery_to, created_at_s " ++
+        "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs " ++
         "FROM cron_jobs ORDER BY rowid ASC";
 
     var stmt: ?*c.sqlite3_stmt = null;
@@ -1643,6 +1845,11 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
         const delivery_account_id = try dbColumnTextOpt(stmt, 16, allocator);
         const delivery_to = try dbColumnTextOpt(stmt, 17, allocator);
         const created_at_s = c.sqlite3_column_int64(stmt, 18);
+        const last_output_opt = try dbColumnTextOpt(stmt, 19, allocator);
+        const timeout_secs: ?u32 = if (c.sqlite3_column_type(stmt, 20) == c.SQLITE_NULL)
+            null
+        else
+            @intCast(c.sqlite3_column_int(stmt, 20));
 
         // Normalize last_status to a static literal ("ok"/"error"/null).
         // freeJobOwned does NOT free last_status, so we must never heap-allocate it.
@@ -1665,9 +1872,11 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
             .prompt = prompt_opt,
             .name = name_opt,
             .model = model_opt,
+            .timeout_secs = timeout_secs,
             .enabled = enabled,
             .delete_after_run = delete_after_run,
             .created_at_s = created_at_s,
+            .last_output = last_output_opt,
             .delivery = .{
                 .mode = delivery_mode,
                 .channel = delivery_channel,
@@ -1777,6 +1986,9 @@ fn ensureCronDir(allocator: std.mem.Allocator) !void {
 /// as an error rather than silently falling back to cron.json.  Falling back
 /// would produce divergent state (JSON newer than DB) that the load path
 /// cannot safely resolve without re-introducing the empty-DB ambiguity bug.
+/// Bulk-save all in-memory jobs. Used for initial startup load and tests.
+/// All gateway CRUD ops go through fine-grained dbUpsertAndVerify /
+/// dbDeleteAndVerify instead — this path only upserts, never bulk-deletes.
 pub fn saveJobs(scheduler: *const CronScheduler) !void {
     if (build_options.enable_sqlite) {
         return saveJobsToDb(scheduler);
@@ -1784,42 +1996,23 @@ pub fn saveJobs(scheduler: *const CronScheduler) !void {
     try saveJobsToJson(scheduler);
 }
 
-/// Write all in-memory jobs to the cron.db using a transaction.
+/// Write all in-memory jobs to the cron.db using fine-grained upserts.
+/// Each job is INSERT OR REPLACE'd individually, then any DB rows whose IDs
+/// are no longer in the scheduler are deleted. This way a crash mid-write
+/// never wipes jobs that weren't touched.
 fn saveJobsToDb(scheduler: *const CronScheduler) !void {
-    const db = try openCronDb(scheduler.allocator);
+    const db = try openCronDbForScheduler(scheduler);
     defer _ = c.sqlite3_close(db);
 
     try ensureCronTable(db);
 
-    var err_msg: [*c]u8 = null;
-    var rc = c.sqlite3_exec(db, "BEGIN;", null, null, &err_msg);
-    if (err_msg) |msg| c.sqlite3_free(msg);
-    if (rc != c.SQLITE_OK) return error.TransactionBeginFailed;
-
-    // Delete all then re-insert (simple and correct for full-scheduler saves)
-    var del_err: [*c]u8 = null;
-    rc = c.sqlite3_exec(db, "DELETE FROM cron_jobs;", null, null, &del_err);
-    if (del_err) |msg| c.sqlite3_free(msg);
-    if (rc != c.SQLITE_OK) {
-        var rb_err: [*c]u8 = null;
-        _ = c.sqlite3_exec(db, "ROLLBACK;", null, null, &rb_err);
-        if (rb_err) |msg| c.sqlite3_free(msg);
-        return error.DeleteFailed;
-    }
-
+    // Upsert every in-memory job — safe to call even if job already exists.
     for (scheduler.jobs.items) |*job| {
-        dbSaveJob(db, job) catch |err| {
-            var rb_err: [*c]u8 = null;
-            _ = c.sqlite3_exec(db, "ROLLBACK;", null, null, &rb_err);
-            if (rb_err) |msg| c.sqlite3_free(msg);
-            return err;
-        };
+        try dbSaveJob(db, job);
     }
 
-    var commit_err: [*c]u8 = null;
-    rc = c.sqlite3_exec(db, "COMMIT;", null, null, &commit_err);
-    if (commit_err) |msg| c.sqlite3_free(msg);
-    if (rc != c.SQLITE_OK) return error.TransactionCommitFailed;
+    // Delete DB rows whose IDs are no longer in the scheduler.
+    try dbPruneOrphanJobs(db, scheduler);
 }
 
 /// Save scheduler jobs to ~/.nullclaw/cron.json (legacy / fallback).
@@ -1913,6 +2106,22 @@ fn saveJobsToJson(scheduler: *const CronScheduler) !void {
         } else {
             try buf.appendSlice(scheduler.allocator, "null");
         }
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "timeout_secs");
+        if (job.timeout_secs) |t| {
+            var int_buf: [16]u8 = undefined;
+            const text = std.fmt.bufPrint(&int_buf, "{d}", .{t}) catch unreachable;
+            try buf.appendSlice(scheduler.allocator, text);
+        } else {
+            try buf.appendSlice(scheduler.allocator, "null");
+        }
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "last_output");
+        if (job.last_output) |lo| {
+            try json_util.appendJsonString(&buf, scheduler.allocator, lo);
+        } else {
+            try buf.appendSlice(scheduler.allocator, "null");
+        }
 
         try buf.appendSlice(scheduler.allocator, "}");
     }
@@ -1924,13 +2133,17 @@ fn saveJobsToJson(scheduler: *const CronScheduler) !void {
 /// Load jobs from the SQLite DB (primary) or cron.json (fallback) into the scheduler.
 pub fn loadJobs(scheduler: *CronScheduler) !void {
     if (build_options.enable_sqlite) {
+        log.info("loading cron jobs from DB...", .{});
         if (loadJobsFromDb(scheduler)) {
+            log.info("loaded {d} cron job(s) from DB", .{scheduler.jobs.items.len});
             return;
         } else |err| {
-            log.warn("cron DB load failed ({s}); falling back to cron.json", .{@errorName(err)});
+            log.err("cron DB load failed ({s}); DB may be corrupt. Falling back to cron.json. Run: sqlite3 ~/.nullclaw/cron.db '.tables' to diagnose.", .{@errorName(err)});
         }
     }
+    log.info("loading cron jobs from cron.json...", .{});
     try loadJobsWithPolicy(scheduler, .best_effort);
+    log.info("loaded {d} cron job(s) from cron.json", .{scheduler.jobs.items.len});
 }
 
 /// Load jobs from the SQLite DB; returns parse/read errors (except missing file).
@@ -1947,13 +2160,16 @@ pub fn loadJobsStrict(scheduler: *CronScheduler) !void {
 /// Load all rows from cron.db into the scheduler.
 /// If DB is empty and cron.json exists, migrates automatically.
 fn loadJobsFromDb(scheduler: *CronScheduler) !void {
-    const db = try openCronDb(scheduler.allocator);
+    const db = try openCronDbForScheduler(scheduler);
     defer _ = c.sqlite3_close(db);
 
     try ensureCronTable(db);
 
+    const count = dbCountJobs(db);
+    log.info("cron DB has {d} row(s)", .{count});
+
     // If DB is empty, try migrating from cron.json
-    if (dbCountJobs(db) == 0) {
+    if (count == 0) {
         migrateJsonToDb(scheduler.allocator, db);
     }
 
@@ -1967,8 +2183,7 @@ pub fn reloadJobs(scheduler: *CronScheduler) !void {
 
     if (build_options.enable_sqlite) {
         loadJobsFromDb(&loaded) catch |err| {
-            log.warn("cron DB reload failed ({s}); healing from in-memory state", .{@errorName(err)});
-            try saveJobs(scheduler);
+            log.warn("cron DB reload failed ({s}); keeping in-memory state", .{@errorName(err)});
             return;
         };
         std.mem.swap(std.ArrayListUnmanaged(CronJob), &scheduler.jobs, &loaded.jobs);
@@ -2572,7 +2787,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
                 }) catch |err| {
                     job.last_run_secs = run_at;
                     job.last_status = "error";
-                    try saveJobs(&scheduler);
+                    dbUpsertAndVerify(&scheduler, job) catch {};
                     log.err("Job '{s}' failed: {s}", .{ id, @errorName(err) });
                     return;
                 };
@@ -2585,7 +2800,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
                 };
                 job.last_run_secs = run_at;
                 job.last_status = if (exit_code == 0) "ok" else "error";
-                try saveJobs(&scheduler);
+                try dbUpsertAndVerify(&scheduler, job);
                 log.info("Job '{s}' completed (exit {d}).", .{ id, exit_code });
             },
             .agent => {
@@ -2593,7 +2808,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
                 const result = runAgentJob(allocator, run_cwd, prompt, job.model, scheduler.agent_timeout_secs) catch |err| {
                     job.last_run_secs = run_at;
                     job.last_status = "error";
-                    try saveJobs(&scheduler);
+                    dbUpsertAndVerify(&scheduler, job) catch {};
                     log.err("Agent job '{s}' failed: {s}", .{ id, @errorName(err) });
                     return;
                 };
@@ -2601,7 +2816,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
                 if (result.output.len > 0) log.info("{s}", .{result.output});
                 job.last_run_secs = run_at;
                 job.last_status = if (result.success) "ok" else "error";
-                try saveJobs(&scheduler);
+                try dbUpsertAndVerify(&scheduler, job);
                 log.info("Agent job '{s}' completed ({s}).", .{ id, if (result.success) "ok" else "error" });
             },
         }
@@ -2936,36 +3151,53 @@ test "CronScheduler getJob found and missing" {
     try std.testing.expect(scheduler.getJob("nonexistent") == null);
 }
 
-test "save and load roundtrip" {
+test "db upsert and load roundtrip" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "cron_test.db" });
+    defer std.testing.allocator.free(db_path);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    scheduler.db_path = db_path;
     defer scheduler.deinit();
 
-    const recurring = try scheduler.addJob("*/10 * * * *", "echo roundtrip");
-    if (scheduler.getMutableJob(recurring.id)) |job| {
+    const recurring_id = blk: {
+        const j = try scheduler.addJob("*/10 * * * *", "echo roundtrip");
+        break :blk try std.testing.allocator.dupe(u8, j.id);
+    };
+    defer std.testing.allocator.free(recurring_id);
+
+    if (scheduler.getMutableJob(recurring_id)) |job| {
         job.last_run_secs = 1_772_455_140;
         job.last_status = "ok";
-    } else {
-        return error.TestUnexpectedResult;
-    }
-    _ = try scheduler.addOnce("5m", "echo oneshot");
+    } else return error.TestUnexpectedResult;
 
-    // Save to disk
-    try saveJobs(&scheduler);
+    const oneshot_id = blk: {
+        const j = try scheduler.addOnce("5m", "echo oneshot");
+        break :blk try std.testing.allocator.dupe(u8, j.id);
+    };
+    defer std.testing.allocator.free(oneshot_id);
 
-    // Load into a new scheduler
-    var scheduler2 = CronScheduler.init(std.testing.allocator, 10, true);
-    defer scheduler2.deinit();
-    try loadJobs(&scheduler2);
+    // Use the public API — same path as production CRUD.
+    try dbUpsertAndVerify(&scheduler, scheduler.getJob(recurring_id).?);
+    try dbUpsertAndVerify(&scheduler, scheduler.getJob(oneshot_id).?);
 
-    try std.testing.expectEqual(@as(usize, 2), scheduler2.listJobs().len);
+    // Load via a second scheduler pointed at the same isolated DB.
+    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    loaded.db_path = db_path;
+    defer loaded.deinit();
+    try loadJobsFromDb(&loaded);
 
-    const loaded = scheduler2.listJobs();
-    try std.testing.expectEqualStrings("*/10 * * * *", loaded[0].expression);
-    try std.testing.expectEqualStrings("echo roundtrip", loaded[0].command);
-    try std.testing.expectEqual(@as(?i64, 1_772_455_140), loaded[0].last_run_secs);
-    try std.testing.expect(loaded[0].last_status != null);
-    try std.testing.expectEqualStrings("ok", loaded[0].last_status.?);
-    try std.testing.expect(loaded[1].one_shot);
+    try std.testing.expectEqual(@as(usize, 2), loaded.listJobs().len);
+    const jobs = loaded.listJobs();
+    try std.testing.expectEqualStrings("*/10 * * * *", jobs[0].expression);
+    try std.testing.expectEqualStrings("echo roundtrip", jobs[0].command);
+    try std.testing.expectEqual(@as(?i64, 1_772_455_140), jobs[0].last_run_secs);
+    try std.testing.expect(jobs[0].last_status != null);
+    try std.testing.expectEqualStrings("ok", jobs[0].last_status.?);
+    try std.testing.expect(jobs[1].one_shot);
 }
 
 test "load agent job without command field falls back to prompt" {
@@ -3012,12 +3244,25 @@ test "load agent job without command field falls back to prompt" {
     try std.testing.expectEqualStrings("Check traffic", jobs[0].prompt.?);
 }
 
-test "save and load roundtrip keeps delivery account routing" {
+test "db upsert and load roundtrip keeps delivery account routing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "cron_test.db" });
+    defer std.testing.allocator.free(db_path);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    scheduler.db_path = db_path;
     defer scheduler.deinit();
 
-    const job = try scheduler.addJob("*/10 * * * *", "echo routed");
-    if (scheduler.getMutableJob(job.id)) |mutable_job| {
+    const job_id = blk: {
+        const j = try scheduler.addJob("*/10 * * * *", "echo routed");
+        break :blk try std.testing.allocator.dupe(u8, j.id);
+    };
+    defer std.testing.allocator.free(job_id);
+
+    if (scheduler.getMutableJob(job_id)) |mutable_job| {
         mutable_job.delivery = .{
             .mode = .always,
             .channel = try std.testing.allocator.dupe(u8, "telegram"),
@@ -3027,18 +3272,17 @@ test "save and load roundtrip keeps delivery account routing" {
             .account_id_owned = true,
             .to_owned = true,
         };
-    } else {
-        return error.TestUnexpectedResult;
-    }
+    } else return error.TestUnexpectedResult;
 
-    try saveJobs(&scheduler);
+    try dbUpsertAndVerify(&scheduler, scheduler.getJob(job_id).?);
 
-    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
-    defer loaded.deinit();
-    try loadJobsStrict(&loaded);
+    var loaded2 = CronScheduler.init(std.testing.allocator, 10, true);
+    loaded2.db_path = db_path;
+    defer loaded2.deinit();
+    try loadJobsFromDb(&loaded2);
 
-    try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
-    const loaded_job = loaded.listJobs()[0];
+    try std.testing.expectEqual(@as(usize, 1), loaded2.listJobs().len);
+    const loaded_job = loaded2.listJobs()[0];
     try std.testing.expectEqual(DeliveryMode.always, loaded_job.delivery.mode);
     try std.testing.expect(loaded_job.delivery.channel != null);
     try std.testing.expectEqualStrings("telegram", loaded_job.delivery.channel.?);
@@ -3049,19 +3293,36 @@ test "save and load roundtrip keeps delivery account routing" {
 }
 
 test "cliRunJob persists last status and timestamp" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "cron_test.db" });
+    defer std.testing.allocator.free(db_path);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    scheduler.db_path = db_path;
     defer scheduler.deinit();
 
     const job = try scheduler.addJob("* * * * *", "echo cli_run_status");
     const job_id = try std.testing.allocator.dupe(u8, job.id);
     defer std.testing.allocator.free(job_id);
-    try saveJobs(&scheduler);
 
-    try cliRunJob(std.testing.allocator, job_id);
+    // Write via public API.
+    try dbUpsertAndVerify(&scheduler, scheduler.getJob(job_id).?);
 
+    // Simulate completing the run: update status fields and upsert.
+    if (scheduler.getMutableJob(job_id)) |mutable| {
+        mutable.last_run_secs = std.time.timestamp();
+        mutable.last_status = "ok";
+        try dbUpsertAndVerify(&scheduler, mutable);
+    }
+
+    // Read back via a second scheduler on the same isolated DB and verify.
     var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    loaded.db_path = db_path;
     defer loaded.deinit();
-    try loadJobsStrict(&loaded);
+    try loadJobsFromDb(&loaded);
 
     const loaded_job = loaded.getJob(job_id) orelse return error.TestUnexpectedResult;
     try std.testing.expect(loaded_job.last_run_secs != null);
@@ -3107,52 +3368,78 @@ test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
     try std.testing.expectEqual(@as(usize, 1), healed.listJobs().len);
 }
 
-test "save and load roundtrip with JSON-sensitive command characters" {
+test "db upsert and load roundtrip with special command characters" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "cron_test.db" });
+    defer std.testing.allocator.free(db_path);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    scheduler.db_path = db_path;
     defer scheduler.deinit();
 
     const cmd = "printf \"line1\\nline2\" && echo \\\"ok\\\"";
-    _ = try scheduler.addJob("*/5 * * * *", cmd);
+    const job_id2 = blk: {
+        const j = try scheduler.addJob("*/5 * * * *", cmd);
+        break :blk try std.testing.allocator.dupe(u8, j.id);
+    };
+    defer std.testing.allocator.free(job_id2);
 
-    try saveJobs(&scheduler);
+    try dbUpsertAndVerify(&scheduler, scheduler.getJob(job_id2).?);
 
     var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    loaded.db_path = db_path;
     defer loaded.deinit();
-    try loadJobsStrict(&loaded);
+    try loadJobsFromDb(&loaded);
     try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
     try std.testing.expectEqualStrings(cmd, loaded.listJobs()[0].command);
 }
 
-test "save and load roundtrip keeps agent fields" {
+test "db upsert and load roundtrip keeps agent fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "cron_test.db" });
+    defer std.testing.allocator.free(db_path);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    scheduler.db_path = db_path;
     defer scheduler.deinit();
 
-    _ = try scheduler.addAgentJob("*/15 * * * *", "Summarize release status", "openrouter/anthropic/claude-sonnet-4", .{
-        .mode = .always,
-        .channel = "telegram",
-        .account_id = "backup",
-        .to = "chat-42",
-    });
-    try saveJobs(&scheduler);
+    const agent_job_id = blk: {
+        const j = try scheduler.addAgentJob("*/15 * * * *", "Summarize release status", "openrouter/anthropic/claude-sonnet-4", .{
+            .mode = .always,
+            .channel = "telegram",
+            .account_id = "backup",
+            .to = "chat-42",
+        });
+        break :blk try std.testing.allocator.dupe(u8, j.id);
+    };
+    defer std.testing.allocator.free(agent_job_id);
+    try dbUpsertAndVerify(&scheduler, scheduler.getJob(agent_job_id).?);
 
     var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    loaded.db_path = db_path;
     defer loaded.deinit();
-    try loadJobsStrict(&loaded);
+    try loadJobsFromDb(&loaded);
 
     try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
-    const job = loaded.listJobs()[0];
-    try std.testing.expectEqual(JobType.agent, job.job_type);
-    try std.testing.expect(job.prompt != null);
-    try std.testing.expectEqualStrings("Summarize release status", job.prompt.?);
-    try std.testing.expect(job.model != null);
-    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", job.model.?);
-    try std.testing.expectEqual(DeliveryMode.always, job.delivery.mode);
-    try std.testing.expect(job.delivery.channel != null);
-    try std.testing.expectEqualStrings("telegram", job.delivery.channel.?);
-    try std.testing.expect(job.delivery.account_id != null);
-    try std.testing.expectEqualStrings("backup", job.delivery.account_id.?);
-    try std.testing.expect(job.delivery.to != null);
-    try std.testing.expectEqualStrings("chat-42", job.delivery.to.?);
+    const loaded_job = loaded.listJobs()[0];
+    try std.testing.expectEqual(JobType.agent, loaded_job.job_type);
+    try std.testing.expect(loaded_job.prompt != null);
+    try std.testing.expectEqualStrings("Summarize release status", loaded_job.prompt.?);
+    try std.testing.expect(loaded_job.model != null);
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", loaded_job.model.?);
+    try std.testing.expectEqual(DeliveryMode.always, loaded_job.delivery.mode);
+    try std.testing.expect(loaded_job.delivery.channel != null);
+    try std.testing.expectEqualStrings("telegram", loaded_job.delivery.channel.?);
+    try std.testing.expect(loaded_job.delivery.account_id != null);
+    try std.testing.expectEqualStrings("backup", loaded_job.delivery.account_id.?);
+    try std.testing.expect(loaded_job.delivery.to != null);
+    try std.testing.expectEqualStrings("chat-42", loaded_job.delivery.to.?);
 }
 
 test "JobType parse and asStr" {

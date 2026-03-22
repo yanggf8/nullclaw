@@ -5,7 +5,9 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
-const loadScheduler = @import("cron_add.zig").loadScheduler;
+const cron_add = @import("cron_add.zig");
+const loadScheduler = cron_add.loadScheduler;
+const persistSchedulerOrFail = cron_add.persistSchedulerOrFail;
 
 threadlocal var tls_schedule_channel: ?[]const u8 = null;
 threadlocal var tls_schedule_account_id: ?[]const u8 = null;
@@ -157,7 +159,7 @@ pub const ScheduleTool = struct {
                 };
             }
 
-            cron.saveJobs(&scheduler) catch {};
+            if (try persistSchedulerOrFail(allocator, &scheduler)) |result| return result;
 
             const msg = try std.fmt.allocPrint(allocator, "Created job {s} | {s} | cmd: {s}", .{
                 job.id,
@@ -196,7 +198,7 @@ pub const ScheduleTool = struct {
                 };
             }
 
-            cron.saveJobs(&scheduler) catch {};
+            if (try persistSchedulerOrFail(allocator, &scheduler)) |result| return result;
 
             const msg = try std.fmt.allocPrint(allocator, "Created one-shot task {s} | runs at {d} | cmd: {s}", .{
                 job.id,
@@ -216,7 +218,7 @@ pub const ScheduleTool = struct {
             defer scheduler.deinit();
 
             if (scheduler.removeJob(id)) {
-                cron.saveJobs(&scheduler) catch {};
+                if (try persistSchedulerOrFail(allocator, &scheduler)) |result| return result;
                 const msg = try std.fmt.allocPrint(allocator, "Cancelled job {s}", .{id});
                 return ToolResult{ .success = true, .output = msg };
             }
@@ -237,7 +239,7 @@ pub const ScheduleTool = struct {
             const found = if (is_pause) scheduler.pauseJob(id) else scheduler.resumeJob(id);
 
             if (found) {
-                cron.saveJobs(&scheduler) catch {};
+                if (try persistSchedulerOrFail(allocator, &scheduler)) |result| return result;
                 const verb: []const u8 = if (is_pause) "Paused" else "Resumed";
                 const msg = try std.fmt.allocPrint(allocator, "{s} job {s}", .{ verb, id });
                 return ToolResult{ .success = true, .output = msg };

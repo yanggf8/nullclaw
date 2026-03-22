@@ -1214,12 +1214,19 @@ pub fn runTelegramLoop(
     };
 
     // Restore persisted Telegram offset (OpenClaw parity).
+    // If no saved offset exists, skip pending updates that accumulated while
+    // the bot was offline — processing stale messages can trigger heap corruption
+    // when the pending-text debounce buffer interacts with a fresh arena.
     if (loadTelegramUpdateOffset(allocator, config, tg_ptr.account_id, tg_ptr.bot_token)) |saved_update_id| {
         tg_ptr.last_update_id = saved_update_id;
+        // Ensure polling mode is active without dropping queued updates.
+        tg_ptr.deleteWebhookKeepPending();
+    } else {
+        // No saved offset: drop pending updates to avoid processing stale messages
+        // that may have arrived during downtime.
+        tg_ptr.deleteWebhookKeepPending();
+        tg_ptr.dropPendingUpdates();
     }
-
-    // Ensure polling mode is active without dropping queued updates.
-    tg_ptr.deleteWebhookKeepPending();
 
     // Register bot commands
     tg_ptr.syncCommandsMenu();
