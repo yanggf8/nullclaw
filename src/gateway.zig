@@ -2487,9 +2487,13 @@ fn cronObjectBoolField(obj: std.json.ObjectMap, key: []const u8) ?bool {
     return null;
 }
 
-fn lockSharedSchedulerForRequest() ?*cron_mod.CronScheduler {
-    g_shared_scheduler_mutex.lock();
-    return g_shared_scheduler;
+fn lockRequestScheduler(ctx: *WebhookHandlerContext) ?*cron_mod.CronScheduler {
+    ctx.state.scheduler_mutex.lock();
+    return ctx.state.scheduler;
+}
+
+fn unlockRequestScheduler(ctx: *WebhookHandlerContext) void {
+    ctx.state.scheduler_mutex.unlock();
 }
 
 /// Serialize a single CronJob to a JSON object appended to `buf`.
@@ -2581,13 +2585,13 @@ fn handleCronList(ctx: *WebhookHandlerContext) void {
         ctx.response_body = "{\"error\":\"method not allowed\"}";
         return;
     }
-    const sched = lockSharedSchedulerForRequest() orelse {
-        g_shared_scheduler_mutex.unlock();
+    const sched = lockRequestScheduler(ctx) orelse {
+        unlockRequestScheduler(ctx);
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
     };
-    defer g_shared_scheduler_mutex.unlock();
+    defer unlockRequestScheduler(ctx);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     buf.appendSlice(ctx.req_allocator, "[") catch {
@@ -2660,13 +2664,13 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
         break :blk @intCast(v);
     };
 
-    const sched = lockSharedSchedulerForRequest() orelse {
-        g_shared_scheduler_mutex.unlock();
+    const sched = lockRequestScheduler(ctx) orelse {
+        unlockRequestScheduler(ctx);
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
     };
-    defer g_shared_scheduler_mutex.unlock();
+    defer unlockRequestScheduler(ctx);
 
     const delivery = cron_mod.DeliveryConfig{
         .mode = if (delivery_mode_opt) |raw|
@@ -2788,13 +2792,13 @@ fn handleCronRemove(ctx: *WebhookHandlerContext) void {
         return;
     };
 
-    const sched = lockSharedSchedulerForRequest() orelse {
-        g_shared_scheduler_mutex.unlock();
+    const sched = lockRequestScheduler(ctx) orelse {
+        unlockRequestScheduler(ctx);
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
     };
-    defer g_shared_scheduler_mutex.unlock();
+    defer unlockRequestScheduler(ctx);
 
     if (!sched.removeJob(id)) {
         ctx.response_status = "404 Not Found";
@@ -2838,13 +2842,13 @@ fn handleCronPause(ctx: *WebhookHandlerContext) void {
         return;
     };
 
-    const sched = lockSharedSchedulerForRequest() orelse {
-        g_shared_scheduler_mutex.unlock();
+    const sched = lockRequestScheduler(ctx) orelse {
+        unlockRequestScheduler(ctx);
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
     };
-    defer g_shared_scheduler_mutex.unlock();
+    defer unlockRequestScheduler(ctx);
 
     if (!sched.pauseJob(id)) {
         ctx.response_status = "404 Not Found";
@@ -2888,13 +2892,13 @@ fn handleCronResume(ctx: *WebhookHandlerContext) void {
         return;
     };
 
-    const sched = lockSharedSchedulerForRequest() orelse {
-        g_shared_scheduler_mutex.unlock();
+    const sched = lockRequestScheduler(ctx) orelse {
+        unlockRequestScheduler(ctx);
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
     };
-    defer g_shared_scheduler_mutex.unlock();
+    defer unlockRequestScheduler(ctx);
 
     if (!sched.resumeJob(id)) {
         ctx.response_status = "404 Not Found";
@@ -2957,13 +2961,13 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
         break :blk @intCast(v);
     };
 
-    const sched = lockSharedSchedulerForRequest() orelse {
-        g_shared_scheduler_mutex.unlock();
+    const sched = lockRequestScheduler(ctx) orelse {
+        unlockRequestScheduler(ctx);
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
     };
-    defer g_shared_scheduler_mutex.unlock();
+    defer unlockRequestScheduler(ctx);
 
     const patch = cron_mod.CronJobPatch{
         .expression = expression,
@@ -3125,7 +3129,10 @@ fn handleCronSyncSeed(ctx: *WebhookHandlerContext) void {
     };
     defer ctx.req_allocator.free(result.stdout);
     defer ctx.req_allocator.free(result.stderr);
-    const success = switch (result.term) { .Exited => |c| c == 0, else => false };
+    const success = switch (result.term) {
+        .Exited => |c| c == 0,
+        else => false,
+    };
     if (!success) {
         std.log.scoped(.gateway).err("sync-seed script exited with error: {s}", .{result.stderr});
         ctx.response_status = "500 Internal Server Error";
@@ -3224,7 +3231,10 @@ fn runQueueWorker(state: *GatewayState) void {
                 shell_child.spawn() catch |err| {
                     log.err("job '{s}' exec failed: {s}", .{ id, @errorName(err) });
                     state.scheduler_mutex.lock();
-                    if (sched.getMutableJob(id)) |j| { j.last_run_secs = now; j.last_status = "error"; }
+                    if (sched.getMutableJob(id)) |j| {
+                        j.last_run_secs = now;
+                        j.last_status = "error";
+                    }
                     state.scheduler_mutex.unlock();
                     _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
                     continue;
@@ -3248,7 +3258,10 @@ fn runQueueWorker(state: *GatewayState) void {
                 ) catch |err| {
                     log.err("job '{s}' collect failed: {s}", .{ id, @errorName(err) });
                     state.scheduler_mutex.lock();
-                    if (sched.getMutableJob(id)) |j| { j.last_run_secs = now; j.last_status = "error"; }
+                    if (sched.getMutableJob(id)) |j| {
+                        j.last_run_secs = now;
+                        j.last_status = "error";
+                    }
                     state.scheduler_mutex.unlock();
                     _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
                     continue;
@@ -3256,13 +3269,19 @@ fn runQueueWorker(state: *GatewayState) void {
                 const shell_term = shell_child.wait() catch |err| {
                     log.err("job '{s}' wait failed: {s}", .{ id, @errorName(err) });
                     state.scheduler_mutex.lock();
-                    if (sched.getMutableJob(id)) |j| { j.last_run_secs = now; j.last_status = "error"; }
+                    if (sched.getMutableJob(id)) |j| {
+                        j.last_run_secs = now;
+                        j.last_status = "error";
+                    }
                     state.scheduler_mutex.unlock();
                     _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
                     continue;
                 };
                 if (shell_timed_out) log.warn("job '{s}' shell command timed out after {d}s", .{ id, timeout });
-                const exit_code: u8 = switch (shell_term) { .Exited => |c| c, else => 1 };
+                const exit_code: u8 = switch (shell_term) {
+                    .Exited => |c| c,
+                    else => 1,
+                };
                 const success = !shell_timed_out and exit_code == 0;
                 const raw_output = if (shell_stdout.items.len > 0) shell_stdout.items else shell_stderr.items;
                 const output = std.fmt.allocPrint(allocator, "{s}\n\n`{s}`", .{ raw_output, id }) catch raw_output;
@@ -3278,13 +3297,12 @@ fn runQueueWorker(state: *GatewayState) void {
                     state.scheduler_mutex.unlock();
                 }
                 if (state.event_bus) |eb| {
-                    const delivered = cron_mod.deliverResult(allocator, delivery, output, success, eb) catch |err| blk: {
+                    // Use state.allocator (long-lived) not the job-arena allocator so the
+                    // bus message strings outlive the arena and don't dangle in async dispatch.
+                    const delivered = cron_mod.deliverResult(state.allocator, delivery, output, success, eb) catch |err| blk: {
                         log.err("[{s}] delivery failed: {s}", .{ id, @errorName(err) });
                         break :blk false;
                     };
-                    // Only warn when delivery was silently skipped with non-empty output;
-                    // error and empty-output cases are already logged by the catch block
-                    // and deliverResult respectively.
                     if (!delivered and raw_output.len > 0 and delivery.mode != .none and delivery.channel != null) {
                         log.warn("[{s}] output not delivered (len={d}): {s}...", .{ id, output.len, output[0..@min(200, output.len)] });
                     }
@@ -3298,7 +3316,10 @@ fn runQueueWorker(state: *GatewayState) void {
                 const agent_result = cron_mod.runAgentJob(allocator, run_cwd, p, model, timeout) catch |err| {
                     log.err("[{s}] agent failed: {s}", .{ id, @errorName(err) });
                     state.scheduler_mutex.lock();
-                    if (sched.getMutableJob(id)) |j| { j.last_run_secs = now; j.last_status = "error"; }
+                    if (sched.getMutableJob(id)) |j| {
+                        j.last_run_secs = now;
+                        j.last_status = "error";
+                    }
                     state.scheduler_mutex.unlock();
                     _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
                     continue;
@@ -3318,7 +3339,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     state.scheduler_mutex.unlock();
                 }
                 if (state.event_bus) |eb| {
-                    const delivered = cron_mod.deliverResult(allocator, delivery, agent_output, agent_result.success, eb) catch |err| blk: {
+                    const delivered = cron_mod.deliverResult(state.allocator, delivery, agent_output, agent_result.success, eb) catch |err| blk: {
                         log.err("[{s}] delivery failed: {s}", .{ id, @errorName(err) });
                         break :blk false;
                     };
@@ -5261,6 +5282,8 @@ fn spawnA2aStreamingWorker(
 // ── Shared scheduler state for cross-thread access ───────────────
 
 var g_shared_scheduler: ?*cron_mod.CronScheduler = null;
+// Protects install/remove of the global scheduler pointer only.
+// Live request/daemon access must use GatewayState.scheduler_mutex.
 var g_shared_scheduler_mutex: std.Thread.Mutex = .{};
 var g_state_mutex: std.Thread.Mutex = .{};
 var g_state_ptr: ?*GatewayState = null;
@@ -5383,7 +5406,6 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         if (g_state_ptr == &state) g_state_ptr = null;
         g_state_mutex.unlock();
     }
-
 
     var owned_config: ?Config = null;
     var config_opt: ?*const Config = null;
@@ -6014,8 +6036,88 @@ test "shared scheduler registration sets and clears global pointer" {
     unlockSharedScheduler();
 }
 
+test "cron handlers use GatewayState scheduler instead of global pointer" {
+    // Regression: restore/bounce updates must mutate the daemon-owned scheduler
+    // guarded by GatewayState.scheduler_mutex, not whichever scheduler pointer is
+    // still parked in g_shared_scheduler.
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var tmp_a = std.testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    const base_a = try tmp_a.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base_a);
+    const db_path_a_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/cron_a.db", .{base_a});
+    defer std.testing.allocator.free(db_path_a_str);
+    const db_path_a = try std.testing.allocator.dupeZ(u8, db_path_a_str);
+    defer std.testing.allocator.free(db_path_a);
+
+    var tmp_b = std.testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+    const base_b = try tmp_b.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base_b);
+    const db_path_b_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/cron_b.db", .{base_b});
+    defer std.testing.allocator.free(db_path_b_str);
+    const db_path_b = try std.testing.allocator.dupeZ(u8, db_path_b_str);
+    defer std.testing.allocator.free(db_path_b);
+
+    var request_scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    request_scheduler.db_path = db_path_a;
+    defer request_scheduler.deinit();
+
+    var global_scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    global_scheduler.db_path = db_path_b;
+    defer global_scheduler.deinit();
+
+    setSharedScheduler(&global_scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.scheduler_mutex.lock();
+    state.scheduler = &request_scheduler;
+    state.scheduler_mutex.unlock();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"expression\":\"*/10 * * * *\",\"command\":\"echo request-scheduler\"}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    try std.testing.expectEqual(@as(usize, 1), request_scheduler.listJobs().len);
+    try std.testing.expectEqual(@as(usize, 0), global_scheduler.listJobs().len);
+}
+
 test "handleCronAdd preserves delivery routing fields" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/cron_delivery.db", .{base});
+    defer std.testing.allocator.free(db_path_str);
+    const db_path = try std.testing.allocator.dupeZ(u8, db_path_str);
+    defer std.testing.allocator.free(db_path);
+
     var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    scheduler.db_path = db_path;
     defer scheduler.deinit();
     setSharedScheduler(&scheduler);
     defer clearSharedScheduler();
@@ -6026,6 +6128,9 @@ test "handleCronAdd preserves delivery routing fields" {
 
     var state = GatewayState.init(std.testing.allocator);
     defer state.deinit();
+    state.scheduler_mutex.lock();
+    state.scheduler = &scheduler;
+    state.scheduler_mutex.unlock();
 
     const raw =
         "POST /cron/add HTTP/1.1\r\n" ++
@@ -6058,7 +6163,19 @@ test "handleCronAdd preserves delivery routing fields" {
 }
 
 test "handleCronAdd supports one-shot delay payloads" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/cron_once.db", .{base});
+    defer std.testing.allocator.free(db_path_str);
+    const db_path = try std.testing.allocator.dupeZ(u8, db_path_str);
+    defer std.testing.allocator.free(db_path);
+
     var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    scheduler.db_path = db_path;
     defer scheduler.deinit();
     setSharedScheduler(&scheduler);
     defer clearSharedScheduler();
@@ -6069,6 +6186,9 @@ test "handleCronAdd supports one-shot delay payloads" {
 
     var state = GatewayState.init(std.testing.allocator);
     defer state.deinit();
+    state.scheduler_mutex.lock();
+    state.scheduler = &scheduler;
+    state.scheduler_mutex.unlock();
 
     const raw =
         "POST /cron/add HTTP/1.1\r\n" ++

@@ -7,6 +7,7 @@
 //!   - Ctrl+C graceful shutdown
 
 const std = @import("std");
+const build_options = @import("build_options");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
 const CronScheduler = @import("cron.zig").CronScheduler;
@@ -373,6 +374,7 @@ fn mergeSchedulerTickChangesAndSave(
     before_tick: *const std.StringHashMapUnmanaged(SchedulerJobSnapshot),
 ) !void {
     var latest = CronScheduler.init(allocator, runtime.max_tasks, runtime.enabled);
+    latest.db_path = runtime.db_path;
     defer latest.deinit();
     try cron.loadJobsStrict(&latest);
 
@@ -2393,17 +2395,30 @@ test "scheduler backoff progression" {
 }
 
 test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
     const cmd_runtime = "echo merge_runtime_keep_7d1c";
     const cmd_external = "echo merge_external_add_9a42";
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/daemon_merge.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path);
+
     var runtime = CronScheduler.init(allocator, 32, true);
+    runtime.db_path = db_path;
     defer runtime.deinit();
     _ = try runtime.addJob("* * * * *", cmd_runtime);
     runtime.jobs.items[runtime.jobs.items.len - 1].next_run_secs = 0;
     try cron.saveJobs(&runtime);
 
     var loaded = CronScheduler.init(allocator, 32, true);
+    loaded.db_path = db_path;
     defer loaded.deinit();
     try cron.loadJobs(&loaded);
 
@@ -2416,6 +2431,7 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
 
     // Simulate concurrent writer adding a new job after scheduler reload.
     var external = CronScheduler.init(allocator, 32, true);
+    external.db_path = db_path;
     defer external.deinit();
     try cron.loadJobs(&external);
     _ = try external.addJob("*/5 * * * *", cmd_external);
@@ -2425,6 +2441,7 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
     try mergeSchedulerTickChangesAndSave(allocator, &loaded, &before_tick);
 
     var merged = CronScheduler.init(allocator, 64, true);
+    merged.db_path = db_path;
     defer merged.deinit();
     try cron.loadJobs(&merged);
 
@@ -2443,15 +2460,28 @@ test "daemon heartbeat thread stack matches session turn budget" {
 }
 
 test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/daemon_agent_merge.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path);
+
     var runtime = CronScheduler.init(allocator, 32, true);
+    runtime.db_path = db_path;
     defer runtime.deinit();
     _ = try runtime.addAgentJob("* * * * *", "summarize merge state", "openrouter/anthropic/claude-sonnet-4", .{});
     runtime.jobs.items[runtime.jobs.items.len - 1].next_run_secs = 0;
     try cron.saveJobs(&runtime);
 
     var loaded = CronScheduler.init(allocator, 32, true);
+    loaded.db_path = db_path;
     defer loaded.deinit();
     try cron.loadJobs(&loaded);
 
@@ -2465,6 +2495,7 @@ test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
     // Simulate concurrent rewrite removing jobs from disk; merge should restore
     // runtime job with all agent fields.
     var external = CronScheduler.init(allocator, 32, true);
+    external.db_path = db_path;
     defer external.deinit();
     try cron.saveJobs(&external);
 
@@ -2472,6 +2503,7 @@ test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
     try mergeSchedulerTickChangesAndSave(allocator, &loaded, &before_tick);
 
     var merged = CronScheduler.init(allocator, 32, true);
+    merged.db_path = db_path;
     defer merged.deinit();
     try cron.loadJobsStrict(&merged);
     try std.testing.expectEqual(@as(usize, 1), merged.listJobs().len);
