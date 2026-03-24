@@ -473,6 +473,7 @@ fn parseCronAddAgentOptions(sub_args: []const []const u8) CronAddAgentOptions {
             i += 1;
         } else if (std.mem.eql(u8, sub_args[i], "--announce")) {
             options.delivery.mode = .always;
+            options.delivery.best_effort = true; // match /cron/add default: transient failures don't mark run as error
         } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--channel")) {
             options.delivery.channel = sub_args[i + 1];
             i += 1;

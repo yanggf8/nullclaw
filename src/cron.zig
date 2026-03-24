@@ -929,6 +929,51 @@ pub const CronScheduler = struct {
 
         return changed;
     }
+
+    /// Non-blocking variant of tick: finds all due jobs, advances their next_run_secs,
+    /// marks one-shots for removal, and returns the collected IDs — without executing anything.
+    /// The caller is responsible for executing the returned jobs (e.g. by enqueuing them to
+    /// the gateway run queue so they run off the scheduler thread).
+    /// Caller must free each returned slice and the outer slice itself via the allocator.
+    pub fn collectDueJobs(self: *CronScheduler, now: i64, allocator: std.mem.Allocator) ![][]const u8 {
+        var due: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (due.items) |id| allocator.free(id);
+            due.deinit(allocator);
+        }
+        var remove_indices: std.ArrayListUnmanaged(usize) = .empty;
+        defer remove_indices.deinit(self.allocator);
+
+        for (self.jobs.items, 0..) |*job, idx| {
+            if (job.paused or job.next_run_secs > now) continue;
+
+            try due.append(allocator, try allocator.dupe(u8, job.id));
+
+            if (job.one_shot or job.delete_after_run) {
+                remove_indices.append(self.allocator, idx) catch {
+                    job.paused = true;
+                };
+            } else {
+                job.next_run_secs = nextRunForCronExpression(job.expression, now) catch |err| blk: {
+                    log.warn("cron job '{s}' schedule parse failed ({s}); fallback to +60s", .{ job.id, @errorName(err) });
+                    break :blk now + 60;
+                };
+            }
+        }
+
+        if (remove_indices.items.len > 0) {
+            var i: usize = remove_indices.items.len;
+            while (i > 0) {
+                i -= 1;
+                const rm_idx = remove_indices.items[i];
+                const job = self.jobs.items[rm_idx];
+                self.freeJobOwned(job);
+                _ = self.jobs.orderedRemove(rm_idx);
+            }
+        }
+
+        return due.toOwnedSlice(allocator);
+    }
 };
 
 const AgentRunResult = struct {
@@ -2878,7 +2923,8 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
             },
             .agent => {
                 const prompt = job.prompt orelse job.command;
-                const result = runAgentJob(allocator, run_cwd, prompt, job.model, scheduler.agent_timeout_secs) catch |err| {
+                const effective_timeout: u64 = if (job.timeout_secs) |t| t else scheduler.agent_timeout_secs;
+                const result = runAgentJob(allocator, run_cwd, prompt, job.model, effective_timeout) catch |err| {
                     job.last_run_secs = run_at;
                     job.last_status = "error";
                     dbUpsertAndVerify(&scheduler, job) catch {};

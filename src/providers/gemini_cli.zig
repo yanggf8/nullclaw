@@ -20,11 +20,11 @@ pub const GeminiCliProvider = struct {
     allocator: std.mem.Allocator,
     model: []const u8,
     
-    /// Persistent state
+    /// Persistent process state (session_id is NOT persisted — a fresh session is
+    /// created per sendPrompt call to prevent cross-invocation context bleed).
     child: ?*std.process.Child = null,
     child_argv: ?[][]const u8 = null,
     mutex: std.Thread.Mutex = .{},
-    session_id: ?[]const u8 = null,
     next_id: u32 = 1,
     read_buffer: std.ArrayListUnmanaged(u8) = .empty,
     read_offset: usize = 0,
@@ -89,7 +89,9 @@ pub const GeminiCliProvider = struct {
         const self: *GeminiCliProvider = @ptrCast(@alignCast(ptr));
         const effective_model = if (model.len > 0) model else self.model;
 
-        const prompt = extractLastUserMessage(request.messages) orelse return error.NoUserMessage;
+        // Serialize the full message history so the model sees all prior turns.
+        const prompt = try serializeMessages(allocator, request.messages);
+        defer allocator.free(prompt);
         const content = try self.sendPrompt(allocator, prompt, effective_model);
         return ChatResponse{ .content = content, .model = try allocator.dupe(u8, effective_model) };
     }
@@ -127,17 +129,14 @@ pub const GeminiCliProvider = struct {
             self.allocator.free(argv);
             self.child_argv = null;
         }
-        if (self.session_id) |sid| {
-            self.allocator.free(sid);
-            self.session_id = null;
-        }
         self.read_buffer.clearRetainingCapacity();
         self.read_offset = 0;
     }
 
-    /// Ensure the gemini agent process is running and a session is created.
-    fn ensureStarted(self: *GeminiCliProvider) !void {
-        if (self.child != null and self.session_id != null) return;
+    /// Ensure the gemini agent process is alive (but do NOT create a session — sessions
+    /// are created fresh per sendPrompt call to prevent cross-invocation context bleed).
+    fn ensureProcess(self: *GeminiCliProvider) !void {
+        if (self.child != null) return;
         log.debug("starting process...", .{});
 
         // Clean up any stale state
@@ -157,7 +156,7 @@ pub const GeminiCliProvider = struct {
         // Higher-level security is enforced by nullclaw's own tool approval logic.
         try argv_list.append(self.allocator, try self.allocator.dupe(u8, "yolo"));
         self.child_argv = try argv_list.toOwnedSlice(self.allocator);
-        
+
         const child = try self.allocator.create(std.process.Child);
         errdefer self.allocator.destroy(child);
         child.* = std.process.Child.init(self.child_argv.?, self.allocator);
@@ -169,8 +168,11 @@ pub const GeminiCliProvider = struct {
         self.child = child;
         const pid: i64 = if (builtin.os.tag == .windows) @intCast(@intFromPtr(self.child.?.id)) else self.child.?.id;
         log.debug("process spawned (pid={d})", .{pid});
+    }
 
-        // Step 2: session/new
+    /// Create a fresh ACP session and return the sessionId (caller must free).
+    /// A new session is created for every prompt to prevent cross-invocation context bleed.
+    fn createSession(self: *GeminiCliProvider) ![]const u8 {
         const id = self.next_id;
         self.next_id += 1;
 
@@ -185,11 +187,10 @@ pub const GeminiCliProvider = struct {
         }, .{});
         defer self.allocator.free(req);
 
-        log.debug("sending session/new handshake...", .{});
+        log.debug("sending session/new...", .{});
         try self.child.?.stdin.?.writeAll(req);
         try self.child.?.stdin.?.writeAll("\n");
 
-        // Read responses until we get the result for our ID
         while (true) {
             const line = try self.readLine(self.allocator);
             defer self.allocator.free(line);
@@ -199,9 +200,7 @@ pub const GeminiCliProvider = struct {
             };
             defer parsed.deinit();
 
-            if (parsed.value != .object) {
-                continue;
-            }
+            if (parsed.value != .object) continue;
             const obj = parsed.value.object;
 
             if (obj.get("id")) |resp_id| {
@@ -231,10 +230,9 @@ pub const GeminiCliProvider = struct {
                         log.err("Gemini ACP session/new failed: sessionId is not a string. Response: {s}", .{line});
                         return error.InvalidHandshake;
                     }
-
-                    self.session_id = try self.allocator.dupe(u8, sid.string);
-                    log.debug("handshake complete, sessionId={s}", .{self.session_id.?});
-                    break;
+                    const session_id = try self.allocator.dupe(u8, sid.string);
+                    log.debug("session created: {s}", .{session_id});
+                    return session_id;
                 }
             }
         }
@@ -244,7 +242,12 @@ pub const GeminiCliProvider = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        try self.ensureStarted();
+        // Ensure the process is alive, then create a fresh session for this invocation.
+        // A new session per call prevents conversation history from prior runs bleeding
+        // into subsequent ones (session isolation).
+        try self.ensureProcess();
+        const session_id = try self.createSession();
+        defer self.allocator.free(session_id);
 
         const id = self.next_id;
         self.next_id += 1;
@@ -254,7 +257,7 @@ pub const GeminiCliProvider = struct {
             .id = id,
             .method = "session/prompt",
             .params = .{
-                .sessionId = self.session_id.?,
+                .sessionId = session_id,
                 .model = model,
                 .prompt = &[_]struct { type: []const u8, text: []const u8 }{
                     .{ .type = "text", .text = prompt },
@@ -494,6 +497,29 @@ fn extractLastUserMessage(messages: []const ChatMessage) ?[]const u8 {
     return null;
 }
 
+/// Serialize the full message history into a single prompt string.
+/// Format: "[ROLE]: content\n\n..." — preserves all prior context so the
+/// model sees the complete conversation rather than just the last user turn.
+fn serializeMessages(allocator: std.mem.Allocator, messages: []const ChatMessage) ![]const u8 {
+    if (messages.len == 0) return error.NoUserMessage;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (messages, 0..) |msg, i| {
+        const role_label: []const u8 = switch (msg.role) {
+            .system => "SYSTEM",
+            .user => "USER",
+            .assistant => "ASSISTANT",
+            .tool => "TOOL",
+        };
+        try buf.appendSlice(allocator, "[");
+        try buf.appendSlice(allocator, role_label);
+        try buf.appendSlice(allocator, "]: ");
+        try buf.appendSlice(allocator, msg.content);
+        if (i + 1 < messages.len) try buf.appendSlice(allocator, "\n\n");
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
@@ -541,6 +567,26 @@ test "extractLastUserMessage returns null for no user" {
 test "extractLastUserMessage empty messages" {
     const msgs = [_]ChatMessage{};
     try std.testing.expect(extractLastUserMessage(&msgs) == null);
+}
+
+test "serializeMessages produces labeled multi-turn prompt" {
+    const msgs = [_]ChatMessage{
+        ChatMessage.system("Be helpful"),
+        ChatMessage.user("hello"),
+        ChatMessage.assistant("hi there"),
+        ChatMessage.user("what time is it"),
+    };
+    const result = try serializeMessages(std.testing.allocator, &msgs);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "[SYSTEM]: Be helpful\n\n[USER]: hello\n\n[ASSISTANT]: hi there\n\n[USER]: what time is it",
+        result,
+    );
+}
+
+test "serializeMessages empty returns error" {
+    const result = serializeMessages(std.testing.allocator, &.{});
+    try std.testing.expectError(error.NoUserMessage, result);
 }
 
 test "checkCliVersion returns CliNotFound for missing binary" {

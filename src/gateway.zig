@@ -2465,7 +2465,7 @@ const cron_route_descriptors = [_]CronRouteDescriptor{
     .{ .path = "/cron/update", .method = "POST", .handler = handleCronUpdate },
     .{ .path = "/cron/run", .method = "POST", .handler = handleCronRun },
     .{ .path = "/cron/output", .method = "POST", .handler = handleCronOutput },
-    .{ .path = "/cron/sync-seed", .method = "POST", .handler = handleCronSyncSeed },
+    .{ .path = "/cron/load-from-seed", .method = "POST", .handler = handleCronLoadFromSeed },
 };
 
 fn findCronRouteDescriptor(path: []const u8) ?*const CronRouteDescriptor {
@@ -3100,8 +3100,9 @@ fn handleCronOutput(ctx: *WebhookHandlerContext) void {
     ctx.response_body = buf.items;
 }
 
-/// POST /cron/sync-seed — export current DB state to ~/.nullclaw/cron-seed.json immediately.
-fn handleCronSyncSeed(ctx: *WebhookHandlerContext) void {
+/// POST /cron/load-from-seed — restore jobs from ~/.nullclaw/cron-seed.json into the DB.
+/// Seed is the source of truth; this is a one-way restore (seed → DB), never the reverse.
+fn handleCronLoadFromSeed(ctx: *WebhookHandlerContext) void {
     if (!std.mem.eql(u8, ctx.method, "POST")) {
         ctx.response_status = "405 Method Not Allowed";
         ctx.response_body = "{\"error\":\"method not allowed\"}";
@@ -3112,7 +3113,7 @@ fn handleCronSyncSeed(ctx: *WebhookHandlerContext) void {
         ctx.response_body = "{\"error\":\"could not determine home dir\"}";
         return;
     };
-    const script = std.fs.path.join(ctx.req_allocator, &.{ home, ".nullclaw", "sync-cron-seed.sh" }) catch {
+    const script = std.fs.path.join(ctx.req_allocator, &.{ home, ".nullclaw", "restore-seed.sh" }) catch {
         ctx.response_status = "500 Internal Server Error";
         ctx.response_body = "{\"error\":\"out of memory\"}";
         return;
@@ -3122,9 +3123,9 @@ fn handleCronSyncSeed(ctx: *WebhookHandlerContext) void {
         .argv = &.{ "/bin/bash", script },
         .max_output_bytes = 4096,
     }) catch |err| {
-        std.log.scoped(.gateway).err("sync-seed failed: {s}", .{@errorName(err)});
+        std.log.scoped(.gateway).err("load-from-seed failed: {s}", .{@errorName(err)});
         ctx.response_status = "500 Internal Server Error";
-        ctx.response_body = "{\"error\":\"sync script failed to run\"}";
+        ctx.response_body = "{\"error\":\"restore script failed to run\"}";
         return;
     };
     defer ctx.req_allocator.free(result.stdout);
@@ -3134,12 +3135,12 @@ fn handleCronSyncSeed(ctx: *WebhookHandlerContext) void {
         else => false,
     };
     if (!success) {
-        std.log.scoped(.gateway).err("sync-seed script exited with error: {s}", .{result.stderr});
+        std.log.scoped(.gateway).err("load-from-seed script exited with error: {s}", .{result.stderr});
         ctx.response_status = "500 Internal Server Error";
-        ctx.response_body = "{\"error\":\"sync script exited with error\"}";
+        ctx.response_body = "{\"error\":\"restore script exited with error\"}";
         return;
     }
-    ctx.response_body = "{\"status\":\"synced\"}";
+    ctx.response_body = "{\"status\":\"restored\"}";
 }
 
 /// Worker thread: pops job IDs from the run queue and executes them one at a time.
@@ -5321,6 +5322,16 @@ pub fn clearSharedScheduler() void {
         defer gs.scheduler_mutex.unlock();
         gs.scheduler = null;
     }
+}
+
+/// Route a scheduled job ID to the run queue worker.
+/// Called by the daemon scheduler thread after collectDueJobs().
+/// Takes ownership of id_owned — frees it on error.
+pub fn enqueueScheduledJob(id_owned: []const u8) !void {
+    g_state_mutex.lock();
+    defer g_state_mutex.unlock();
+    const gs = g_state_ptr orelse return error.NoGatewayState;
+    try gs.enqueueRunJob(id_owned);
 }
 
 /// RAII guard that holds GatewayState.scheduler_mutex for the duration of a

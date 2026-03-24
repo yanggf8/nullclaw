@@ -403,6 +403,7 @@ fn mergeSchedulerTickChangesAndSave(
 /// Scheduler thread — executes due cron jobs and periodically reloads cron.json
 /// so tasks created/updated after daemon startup are picked up without restart.
 fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
+    _ = event_bus; // scheduled jobs route through the run queue worker, not the event bus
     const gateway_mod = @import("gateway.zig");
     var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
     scheduler.setShellCwd(config.workspace_dir);
@@ -452,7 +453,15 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
         };
 
         if (snapshot_ok) {
-            const changed = scheduler.tick(std.time.timestamp(), event_bus);
+            // Collect due jobs non-blocking: advance next_run_secs and get IDs.
+            // Then enqueue each ID to the gateway's run queue so they execute on
+            // the dedicated worker thread — not inline on the scheduler thread.
+            // This prevents a slow/hung job from blocking all future scheduled execution.
+            const due_ids = scheduler.collectDueJobs(std.time.timestamp(), allocator) catch |err| blk: {
+                log.warn("scheduler collectDueJobs failed: {}", .{err});
+                break :blk &[_][]const u8{};
+            };
+            const changed = due_ids.len > 0;
             if (changed) {
                 mergeSchedulerTickChangesAndSave(allocator, &scheduler, &before_tick) catch |err| {
                     log.warn("scheduler merge-save failed: {}", .{err});
@@ -460,6 +469,16 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
                     health.markComponentError("scheduler", @errorName(err));
                 };
             }
+            sched_guard.release(); // release mutex before enqueuing — jobs run outside the lock
+            for (due_ids) |id| {
+                gateway_mod.enqueueScheduledJob(id) catch |err| {
+                    log.warn("scheduler failed to enqueue job '{s}': {}", .{ id, err });
+                    allocator.free(id);
+                };
+            }
+            allocator.free(due_ids);
+            if (!snapshot_ok) {} // suppress unreachable warning — snapshot_ok checked above
+            continue; // sched_guard already released above
         }
 
         sched_guard.release(); // no-op if already released in the snapshot error path
