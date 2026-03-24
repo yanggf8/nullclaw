@@ -2498,7 +2498,10 @@ fn cronObjectBoolField(obj: std.json.ObjectMap, key: []const u8) ?bool {
 }
 
 fn lockRequestScheduler(ctx: *WebhookHandlerContext) ?*cron_mod.CronScheduler {
-    ctx.state.scheduler_mutex.lock();
+    // Use tryLock to avoid blocking HTTP worker threads indefinitely.
+    // Returns null (→ 503) if the scheduler is momentarily busy rather than
+    // saturating the thread pool and hanging the entire gateway.
+    if (!ctx.state.scheduler_mutex.tryLock()) return null;
     return ctx.state.scheduler;
 }
 
@@ -3619,8 +3622,11 @@ fn runQueueWorker(state: *GatewayState) void {
 
             switch (spec.job_type) {
                 .shell => {
+                    const resolved_cmd = cron_mod.resolveSkillCommand(arena, spec.command) catch null;
+                    defer if (resolved_cmd) |rc| arena.free(rc);
+                    const shell_cmd = resolved_cmd orelse spec.command;
                     var shell_child = std.process.Child.init(
-                        &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), spec.command },
+                        &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), shell_cmd },
                         arena,
                     );
                     shell_child.stdin_behavior = .Ignore;
@@ -3676,7 +3682,10 @@ fn runQueueWorker(state: *GatewayState) void {
                     log.info("[{s}] completed ({s})", .{ spec.id, status });
                 },
                 .agent => {
-                    const p = spec.prompt orelse spec.command;
+                    const raw_p = spec.prompt orelse spec.command;
+                    const resolved_p = cron_mod.resolveSkillPrompt(arena, raw_p) catch null;
+                    defer if (resolved_p) |rp| arena.free(rp);
+                    const p = resolved_p orelse raw_p;
                     const agent_result = cron_mod.runAgentJob(arena, null, p, spec.model, timeout) catch |err| {
                         log.err("[{s}] agent failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false);
@@ -5853,6 +5862,54 @@ pub fn enqueueScheduledJob(id_owned: []const u8) !void {
     defer g_state_mutex.unlock();
     const gs = g_state_ptr orelse return error.NoGatewayState;
     try gs.enqueueRunJob(id_owned);
+}
+
+/// Tick the DB-direct scheduler: find due jobs, insert into cron_run_queue,
+/// advance next_run_secs. Returns number of jobs enqueued, or 0 if no backend.
+/// The daemon scheduler thread calls this instead of collectDueJobs when
+/// cron_db_backend is initialized.
+///
+/// IMPORTANT: g_state_mutex is held only to read the backend pointer, then
+/// released before the DB operation. This prevents the mutex from blocking
+/// HTTP request handlers during the (potentially slow) SQLite transaction.
+pub fn tickDbScheduler(now: i64) usize {
+    // Snapshot the backend pointer under the lock, then release immediately.
+    const be_ptr: ?*cron_db_mod.DbCronBackend = blk: {
+        g_state_mutex.lock();
+        defer g_state_mutex.unlock();
+        const gs = g_state_ptr orelse break :blk null;
+        if (gs.cron_db_backend) |*be| break :blk be;
+        break :blk null;
+    };
+    const be = be_ptr orelse return 0;
+
+    // DB tick runs outside the g_state_mutex — safe because DbCronBackend
+    // opens its own connection per call (WAL mode, multi-reader safe).
+    const n = be.backend().tick(now) catch |err| {
+        std.log.scoped(.scheduler).warn("DbCronBackend.tick failed: {s}", .{@errorName(err)});
+        return 0;
+    };
+
+    if (n > 0) {
+        g_state_mutex.lock();
+        defer g_state_mutex.unlock();
+        if (g_state_ptr) |gs| {
+            gs.run_queue_mutex.lock();
+            defer gs.run_queue_mutex.unlock();
+            gs.run_queue_cond.signal();
+        }
+    }
+    return n;
+}
+
+/// Returns true if a DB-backed CronBackend is active in the gateway state.
+/// The daemon scheduler thread uses this to decide whether to use tickDbScheduler
+/// or the legacy in-memory collectDueJobs path.
+pub fn hasDbScheduler() bool {
+    g_state_mutex.lock();
+    defer g_state_mutex.unlock();
+    const gs = g_state_ptr orelse return false;
+    return gs.cron_db_backend != null;
 }
 
 /// Wake the run queue worker without pushing to the in-memory ArrayList.

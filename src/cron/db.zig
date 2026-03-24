@@ -151,6 +151,15 @@ pub const DbCronBackend = struct {
         const self: *DbCronBackend = @ptrCast(@alignCast(ptr));
         const db = try self.openDb();
         defer cron.closeCronDb(db);
+        // Delete pending/in_progress queue rows first so the worker never
+        // dequeues a job_id that no longer has a cron_jobs row.
+        const del_queue_sql = "DELETE FROM cron_run_queue WHERE job_id=?1";
+        var qstmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, del_queue_sql, -1, &qstmt, null) == c.SQLITE_OK) {
+            _ = c.sqlite3_bind_text(qstmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
+            _ = c.sqlite3_step(qstmt);
+            _ = c.sqlite3_finalize(qstmt);
+        }
         return dbSetField(db, id, null, null, null);
     }
 

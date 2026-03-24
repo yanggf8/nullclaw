@@ -841,9 +841,15 @@ pub const CronScheduler = struct {
             switch (job.job_type) {
                 .shell => {
                     // Execute shell command via child process
+                    const resolved_shell_cmd = if (!builtin.is_test)
+                        resolveSkillCommand(self.allocator, job.command) catch null
+                    else
+                        null;
+                    defer if (resolved_shell_cmd) |rc| self.allocator.free(rc);
+                    const effective_shell_cmd = resolved_shell_cmd orelse job.command;
                     const result = std.process.Child.run(.{
                         .allocator = self.allocator,
-                        .argv = &.{ platform.getShell(), platform.getShellFlag(), job.command },
+                        .argv = &.{ platform.getShell(), platform.getShellFlag(), effective_shell_cmd },
                         .cwd = self.shell_cwd,
                     }) catch |err| {
                         log.err("cron job '{s}' failed to start: {}", .{ job.id, err });
@@ -878,7 +884,13 @@ pub const CronScheduler = struct {
                     }
                 },
                 .agent => {
-                    const agent_output = job.prompt orelse job.command;
+                    const raw_agent_prompt = job.prompt orelse job.command;
+                    const resolved_agent_prompt = if (!builtin.is_test)
+                        resolveSkillPrompt(self.allocator, raw_agent_prompt) catch null
+                    else
+                        null;
+                    defer if (resolved_agent_prompt) |rp| self.allocator.free(rp);
+                    const agent_output = resolved_agent_prompt orelse raw_agent_prompt;
                     if (builtin.is_test) {
                         // Keep unit tests deterministic: no subprocess or network side effects.
                         job.last_run_secs = now;
@@ -1162,6 +1174,88 @@ fn preferAgentExecPath(self_exe_path: []const u8) []const u8 {
         }
     }
     return self_exe_path;
+}
+
+/// If `prompt` starts with "skill:<name>", resolves to the skill's ## Prompt section
+/// from ~/.claude/skills/<name>/SKILL.md. Returns a heap-allocated string that the
+/// caller must free, or null if prompt is not a skill reference or resolution fails.
+pub fn resolveSkillPrompt(allocator: std.mem.Allocator, prompt: []const u8) !?[]const u8 {
+    const prefix = "skill:";
+    if (!std.mem.startsWith(u8, prompt, prefix)) return null;
+    const skill_name = std.mem.trim(u8, prompt[prefix.len..], " \t");
+    if (skill_name.len == 0) return null;
+
+    const home = std.posix.getenv("HOME") orelse return null;
+    const skill_md_path = try std.fmt.allocPrint(allocator, "{s}/.claude/skills/{s}/SKILL.md", .{ home, skill_name });
+    defer allocator.free(skill_md_path);
+
+    const content = std.fs.cwd().readFileAlloc(allocator, skill_md_path, 256 * 1024) catch return null;
+    defer allocator.free(content);
+
+    // Extract content between "## Prompt\n" and the next "## " heading (or EOF).
+    const prompt_header = "\n## Prompt\n";
+    const header_pos = std.mem.indexOf(u8, content, prompt_header) orelse return null;
+    const body_start = header_pos + prompt_header.len;
+    const body = content[body_start..];
+
+    // Find the next "## " heading to determine where the Prompt section ends.
+    const next_section = std.mem.indexOf(u8, body, "\n## ");
+    const section = if (next_section) |n| body[0..n] else body;
+    const trimmed = std.mem.trim(u8, section, " \t\n\r");
+    if (trimmed.len == 0) return null;
+    return try allocator.dupe(u8, trimmed);
+}
+
+/// If `command` starts with "skill:<name> [extra args]", resolves to
+/// "python3 <script_path> <extra_args>" using the skill's ## Script section.
+/// Returns heap-allocated command string or null if not a skill reference / no script.
+pub fn resolveSkillCommand(allocator: std.mem.Allocator, command: []const u8) !?[]const u8 {
+    const prefix = "skill:";
+    if (!std.mem.startsWith(u8, command, prefix)) return null;
+    const rest = command[prefix.len..];
+    // Split skill name from extra args (first whitespace-delimited token)
+    const space = std.mem.indexOfAny(u8, rest, " \t");
+    const skill_name = if (space) |s| rest[0..s] else rest;
+    const extra_args = if (space) |s| std.mem.trim(u8, rest[s..], " \t") else "";
+    if (skill_name.len == 0) return null;
+
+    const home = std.posix.getenv("HOME") orelse return null;
+    const skill_md_path = try std.fmt.allocPrint(allocator, "{s}/.claude/skills/{s}/SKILL.md", .{ home, skill_name });
+    defer allocator.free(skill_md_path);
+
+    const content = std.fs.cwd().readFileAlloc(allocator, skill_md_path, 256 * 1024) catch return null;
+    defer allocator.free(content);
+
+    // Extract first non-empty line from ## Script section.
+    const script_header = "\n## Script\n";
+    const header_pos = std.mem.indexOf(u8, content, script_header) orelse return null;
+    const body_start = header_pos + script_header.len;
+    const body = content[body_start..];
+    const next_section = std.mem.indexOf(u8, body, "\n## ");
+    const section = if (next_section) |n| body[0..n] else body;
+
+    // Find the script path — first non-empty, non-``` line in the section.
+    var line_iter = std.mem.splitScalar(u8, section, '\n');
+    var script_path: ?[]const u8 = null;
+    while (line_iter.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r`");
+        if (trimmed.len == 0) continue;
+        script_path = trimmed;
+        break;
+    }
+    const raw_path = script_path orelse return null;
+
+    // Expand leading ~ to HOME.
+    const expanded = if (std.mem.startsWith(u8, raw_path, "~/"))
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, raw_path[2..] })
+    else
+        try allocator.dupe(u8, raw_path);
+    defer allocator.free(expanded);
+
+    if (extra_args.len > 0) {
+        return try std.fmt.allocPrint(allocator, "python3 {s} {s}", .{ expanded, extra_args });
+    }
+    return try std.fmt.allocPrint(allocator, "python3 {s}", .{expanded});
 }
 
 pub fn runAgentJob(
@@ -2959,9 +3053,12 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
         const run_at = std.time.timestamp();
         switch (job.job_type) {
             .shell => {
+                const resolved_cli_cmd = resolveSkillCommand(allocator, job.command) catch null;
+                defer if (resolved_cli_cmd) |rc| allocator.free(rc);
+                const effective_cli_cmd = resolved_cli_cmd orelse job.command;
                 const result = std.process.Child.run(.{
                     .allocator = allocator,
-                    .argv = &.{ platform.getShell(), platform.getShellFlag(), job.command },
+                    .argv = &.{ platform.getShell(), platform.getShellFlag(), effective_cli_cmd },
                     .cwd = run_cwd,
                 }) catch |err| {
                     job.last_run_secs = run_at;
@@ -2983,7 +3080,10 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
                 log.info("Job '{s}' completed (exit {d}).", .{ id, exit_code });
             },
             .agent => {
-                const prompt = job.prompt orelse job.command;
+                const raw_prompt = job.prompt orelse job.command;
+                const resolved_prompt = resolveSkillPrompt(allocator, raw_prompt) catch null;
+                defer if (resolved_prompt) |rp| allocator.free(rp);
+                const prompt = resolved_prompt orelse raw_prompt;
                 const effective_timeout: u64 = if (job.timeout_secs) |t| t else scheduler.agent_timeout_secs;
                 const result = runAgentJob(allocator, run_cwd, prompt, job.model, effective_timeout) catch |err| {
                     job.last_run_secs = run_at;
@@ -3451,11 +3551,12 @@ pub fn dbListJobsJson(db: *c.sqlite3, buf: *std.ArrayListUnmanaged(u8), allocato
     // 17  delivery_to
     // 18  created_at_s
     // 19  timeout_secs
+    // 20  delivery_best_effort
     const sql =
         "SELECT id, expression, command, next_run_secs, last_run_secs, last_status, " ++
         "last_output, paused, one_shot, job_type, enabled, delete_after_run, " ++
         "prompt, model, delivery_mode, delivery_channel, delivery_account_id, " ++
-        "delivery_to, created_at_s, timeout_secs " ++
+        "delivery_to, created_at_s, timeout_secs, delivery_best_effort " ++
         "FROM cron_jobs ORDER BY rowid ASC";
 
     var stmt: ?*c.sqlite3_stmt = null;
@@ -3601,8 +3702,9 @@ pub fn dbListJobsJson(db: *c.sqlite3, buf: *std.ArrayListUnmanaged(u8), allocato
             try appendJsonStr(buf, allocator, dt_ptr[0..dt_len]);
         }
 
-        // delivery_best_effort — not stored in DB; hardcode false
-        try buf.appendSlice(allocator, ",\"delivery_best_effort\":false");
+        // delivery_best_effort (col 20) — INTEGER NOT NULL DEFAULT 0
+        try buf.appendSlice(allocator, ",\"delivery_best_effort\":");
+        try buf.appendSlice(allocator, if (c.sqlite3_column_int(stmt, 20) != 0) "true" else "false");
 
         // created_at_s (col 18) — INTEGER NOT NULL
         try buf.appendSlice(allocator, ",\"created_at_s\":");

@@ -210,6 +210,50 @@ Apply these naming rules consistently:
 - Add/update tests for failure modes and boundaries.
 - Keep observability useful but non-sensitive (no secrets in logs or errors).
 
+### 7.6 Cron Job Authoring and Skill Delivery
+
+#### Job types
+
+| `job_type` | Execution | Delivery |
+|------------|-----------|----------|
+| `shell`    | subprocess via `sh -c <command>` | script self-delivers via `--deliver-to`; set `delivery_mode: none` |
+| `agent`    | inline agent loop | cron delivers stdout; set `delivery_mode: always` + `delivery_channel` + `delivery_to` |
+
+#### `skill:` prefix — how it works
+
+The `skill:` prefix in `command` or `prompt` is resolved at execution time by `resolveSkillCommand()` / `resolveSkillPrompt()` in `src/cron.zig`. It is **not** the same as the CLI `/skill <name>` command (which spawns a background subagent and returns immediately — unusable in cron).
+
+- **Shell job**: set `command = "skill:<name> <extra-args>"`. `resolveSkillCommand` reads `## Script` from `~/.claude/skills/<name>/SKILL.md`, expands `~/`, builds `python3 <path> <extra-args>`.
+- **Agent job**: set `prompt = "skill:<name>"`. `resolveSkillPrompt` reads `## Prompt` from `~/.claude/skills/<name>/SKILL.md` and inlines the full prompt text. The agent runs it directly — no subagent spawn.
+
+Never use `/skill <name>` or `-m /skill <name>` as a cron prompt. It spawns a subagent and the output is lost.
+
+#### Delivery contract
+
+- **Shell skills** must accept `--deliver-to CHAT_ID` and call the Python telegram helper directly (`~/.claude/skills/lib/telegram.py`). Do not rely on nullclaw's delivery system.
+- **Agent skills** set `delivery_mode: always`. The agent's stdout is captured and sent by the cron runner. No `--deliver-to` needed.
+- The `## Script` section in `SKILL.md` must contain the script path as its first non-empty, non-backtick line, prefixed with `~/`.
+
+#### Source of truth
+
+`~/.nullclaw/cron-seed.json` is the canonical job definition. To reload jobs from seed into the live DB:
+
+```bash
+curl -s -X POST http://localhost:PORT/cron/load-from-seed
+```
+
+Never edit the live DB directly to apply config changes — update `cron-seed.json` and call `load-from-seed`.
+
+#### E2E verification
+
+After triggering a job, verify delivery via the log — do not poll `/cron/output`:
+
+```bash
+strings ~/.nullclaw/gateway.log | grep "JOB_ID\|delivery" | tail -20
+```
+
+Look for `captured delivery.to=...` to confirm Telegram delivery.
+
 ## 8) Validation Matrix
 
 Required before any code commit:

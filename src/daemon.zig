@@ -430,8 +430,26 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     health.markComponentOk("scheduler");
 
     while (!isShutdownRequested()) {
-        // Hold the gateway's scheduler_mutex for the entire reload/tick/save block.
-        // See SchedulerGuard in gateway.zig for the full concurrency contract.
+        const now = std.time.timestamp();
+
+        // DB-direct path: no in-memory scheduler needed — tick atomically in SQLite.
+        // Do NOT hold scheduler_mutex here; the DB backend uses its own connection.
+        if (gateway_mod.hasDbScheduler()) {
+            const n = gateway_mod.tickDbScheduler(now);
+            if (n > 0) {
+                log.info("scheduler: enqueued {d} job(s) via DbCronBackend", .{n});
+                state.markRunning("scheduler");
+                health.markComponentOk("scheduler");
+            }
+            var slept2: u64 = 0;
+            while (slept2 < poll_secs and !isShutdownRequested()) : (slept2 += 1) {
+                std.Thread.sleep(std.time.ns_per_s);
+            }
+            continue;
+        }
+
+        // Legacy in-memory path: hold scheduler_mutex only for the in-memory
+        // snapshot + collectDueJobs. Release before any disk I/O.
         var sched_guard = gateway_mod.acquireSchedulerGuard();
 
         // Refresh scheduler view from store so jobs created/updated after daemon startup are picked up.
@@ -452,36 +470,40 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
             break :blk true;
         };
 
+        var due_ids: [][]const u8 = &[_][]const u8{};
+        var changed = false;
         if (snapshot_ok) {
-            // Collect due jobs non-blocking: advance next_run_secs and get IDs.
-            // Then enqueue each ID to the gateway's run queue so they execute on
-            // the dedicated worker thread — not inline on the scheduler thread.
-            // This prevents a slow/hung job from blocking all future scheduled execution.
-            const due_ids = scheduler.collectDueJobs(std.time.timestamp(), allocator) catch |err| blk: {
+            due_ids = scheduler.collectDueJobs(now, allocator) catch |err| blk: {
                 log.warn("scheduler collectDueJobs failed: {}", .{err});
                 break :blk &[_][]const u8{};
             };
-            const changed = due_ids.len > 0;
-            if (changed) {
-                mergeSchedulerTickChangesAndSave(allocator, &scheduler, &before_tick) catch |err| {
-                    log.warn("scheduler merge-save failed: {}", .{err});
-                    state.markError("scheduler", @errorName(err));
-                    health.markComponentError("scheduler", @errorName(err));
-                };
+            changed = due_ids.len > 0;
+        }
+        // Release mutex before disk I/O — keeps scheduler_mutex hold time sub-millisecond.
+        sched_guard.release();
+
+        if (!snapshot_ok) {
+            var snapshot_sleep: u64 = 0;
+            while (snapshot_sleep < poll_secs and !isShutdownRequested()) : (snapshot_sleep += 1) {
+                std.Thread.sleep(std.time.ns_per_s);
             }
-            sched_guard.release(); // release mutex before enqueuing — jobs run outside the lock
-            for (due_ids) |id| {
-                gateway_mod.enqueueScheduledJob(id) catch |err| {
-                    log.warn("scheduler failed to enqueue job '{s}': {}", .{ id, err });
-                    allocator.free(id);
-                };
-            }
-            allocator.free(due_ids);
-            if (!snapshot_ok) {} // suppress unreachable warning — snapshot_ok checked above
-            continue; // sched_guard already released above
+            continue;
         }
 
-        sched_guard.release(); // no-op if already released in the snapshot error path
+        if (changed) {
+            mergeSchedulerTickChangesAndSave(allocator, &scheduler, &before_tick) catch |err| {
+                log.warn("scheduler merge-save failed: {}", .{err});
+                state.markError("scheduler", @errorName(err));
+                health.markComponentError("scheduler", @errorName(err));
+            };
+        }
+        for (due_ids) |id| {
+            gateway_mod.enqueueScheduledJob(id) catch |err| {
+                log.warn("scheduler failed to enqueue job '{s}': {}", .{ id, err });
+                allocator.free(id);
+            };
+        }
+        allocator.free(due_ids);
 
         if (!snapshot_ok) {
             var snapshot_sleep: u64 = 0;
