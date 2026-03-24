@@ -14,8 +14,21 @@ const std = @import("std");
 
 pub const types = @import("types.zig");
 
-// Re-export all domain types so callers can use @import("cron/root.zig").CronJob etc.
-pub usingnamespace types;
+// Re-export domain types so callers can use @import("cron/root.zig").CronJob etc.
+pub const JobType = types.JobType;
+pub const SessionTarget = types.SessionTarget;
+pub const ScheduleKind = types.ScheduleKind;
+pub const Schedule = types.Schedule;
+pub const DeliveryMode = types.DeliveryMode;
+pub const DeliveryConfig = types.DeliveryConfig;
+pub const CronRun = types.CronRun;
+pub const CronJobPatch = types.CronJobPatch;
+pub const CronJob = types.CronJob;
+pub const CronJobSpec = types.CronJobSpec;
+pub const DequeueResult = types.DequeueResult;
+pub const CronJobOutput = types.CronJobOutput;
+pub const CronJobSummary = types.CronJobSummary;
+pub const NewJobSpec = types.NewJobSpec;
 
 pub const CronBackend = struct {
     ptr: *anyopaque,

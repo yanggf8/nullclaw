@@ -398,7 +398,7 @@ fn alignToNextMinute(from_secs: i64) i64 {
     return start + (60 - rem);
 }
 
-fn nextRunForCronExpression(expression: []const u8, from_secs: i64) !i64 {
+pub fn nextRunForCronExpression(expression: []const u8, from_secs: i64) !i64 {
     const parsed = try parseCronExpression(expression);
     var candidate = alignToNextMinute(from_secs);
 
@@ -1654,7 +1654,7 @@ pub fn ensureRunQueueTable(db: *c.sqlite3) !void {
     }
 }
 
-fn ensureCronTable(db: *c.sqlite3) !void {
+pub fn ensureCronTable(db: *c.sqlite3) !void {
     var err_msg: [*c]u8 = null;
     const rc = c.sqlite3_exec(db, CRON_TABLE_SQL, null, null, &err_msg);
     if (rc != c.SQLITE_OK) {

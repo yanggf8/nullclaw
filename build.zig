@@ -608,5 +608,6 @@ pub fn build(b: *std.Build) void {
         const exe_tests = b.addTest(.{ .root_module = exe.root_module });
         test_step.dependOn(&b.addRunArtifact(lib_tests).step);
         test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+
     }
 }

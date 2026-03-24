@@ -192,4 +192,7 @@ pub const NewJobSpec = struct {
     delivery: DeliveryConfig = .{},
     session_target: SessionTarget = .isolated,
     created_at_s: i64 = 0,
+    /// When non-zero, use this as next_run_secs instead of computing from expression.
+    /// Required for @once: delay expressions where expression is not a valid cron pattern.
+    next_run_secs_override: i64 = 0,
 };
