@@ -151,6 +151,13 @@ pub const DbCronBackend = struct {
         const self: *DbCronBackend = @ptrCast(@alignCast(ptr));
         const db = try self.openDb();
         defer cron.closeCronDb(db);
+        if (c.sqlite3_exec(db, "BEGIN IMMEDIATE", null, null, null) != c.SQLITE_OK) {
+            return error.TransactionBeginFailed;
+        }
+        var tx_open = true;
+        errdefer {
+            if (tx_open) _ = c.sqlite3_exec(db, "ROLLBACK", null, null, null);
+        }
         // Delete pending/in_progress queue rows first so the worker never
         // dequeues a job_id that no longer has a cron_jobs row.
         const del_queue_sql = "DELETE FROM cron_run_queue WHERE job_id=?1";
@@ -160,7 +167,12 @@ pub const DbCronBackend = struct {
             _ = c.sqlite3_step(qstmt);
             _ = c.sqlite3_finalize(qstmt);
         }
-        return dbSetField(db, id, null, null, null);
+        const removed = try dbSetField(db, id, null, null, null);
+        if (c.sqlite3_exec(db, "COMMIT", null, null, null) != c.SQLITE_OK) {
+            return error.TransactionCommitFailed;
+        }
+        tx_open = false;
+        return removed;
     }
 
     fn vtablePause(ptr: *anyopaque, id: []const u8) anyerror!bool {
@@ -961,6 +973,47 @@ test "DbCronBackend dequeue preserves delivery_best_effort and session_target" {
     try std.testing.expect(result.?.spec.delivery.best_effort);
 }
 
+test "DbCronBackend remove clears queued head job" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/remove_queue.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    var backend = try DbCronBackend.init(allocator, db_path_z);
+    defer backend.deinit();
+    const be = backend.backend();
+
+    const first = try be.add(allocator, .{ .expression = "* * * * *", .command = "echo first" });
+    defer {
+        allocator.free(first.id);
+        allocator.free(first.expression);
+        allocator.free(first.command);
+    }
+    const second = try be.add(allocator, .{ .expression = "* * * * *", .command = "echo second" });
+    defer {
+        allocator.free(second.id);
+        allocator.free(second.expression);
+        allocator.free(second.command);
+    }
+
+    const now = std.time.timestamp();
+    try be.enqueue(first.id, now);
+    try be.enqueue(second.id, now + 1);
+    try std.testing.expect(try be.remove(first.id));
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const result = try be.dequeue(arena.allocator());
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings(second.id, result.?.spec.id);
+}
+
 test "DbCronBackend tick enqueues due jobs" {
     if (!build_options.enable_sqlite) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -1029,9 +1082,17 @@ test "DbCronBackend listRows visitor" {
     const be = backend.backend();
 
     const j1 = try be.add(allocator, .{ .expression = "* * * * *", .command = "a" });
-    defer { allocator.free(j1.id); allocator.free(j1.expression); allocator.free(j1.command); }
+    defer {
+        allocator.free(j1.id);
+        allocator.free(j1.expression);
+        allocator.free(j1.command);
+    }
     const j2 = try be.add(allocator, .{ .expression = "* * * * *", .command = "b" });
-    defer { allocator.free(j2.id); allocator.free(j2.expression); allocator.free(j2.command); }
+    defer {
+        allocator.free(j2.id);
+        allocator.free(j2.expression);
+        allocator.free(j2.command);
+    }
 
     var count: usize = 0;
     const visitor = root.CronBackend.RowVisitor{

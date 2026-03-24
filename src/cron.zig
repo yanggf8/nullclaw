@@ -1117,7 +1117,7 @@ fn stripToolCallBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const 
 
     // Find the last </tool_call> — everything after it is the final answer.
     if (std.mem.lastIndexOf(u8, text, close_tag)) |last_close| {
-        const after = text[last_close + close_tag.len..];
+        const after = text[last_close + close_tag.len ..];
         // Eat leading whitespace/newlines after the closing tag
         const trimmed = std.mem.trimLeft(u8, after, " \t\r\n");
         const result = std.mem.trimRight(u8, trimmed, " \t\r\n");
@@ -3291,6 +3291,16 @@ pub fn dbTickAndEnqueue(db_path: [:0]const u8, allocator: std.mem.Allocator, now
     // Enable WAL mode for concurrent access.
     _ = c.sqlite3_exec(db, "PRAGMA journal_mode=WAL", null, null, null);
 
+    // Serialize tick against concurrent job deletion so queue inserts and
+    // next_run updates are committed as one writer transaction.
+    if (c.sqlite3_exec(db, "BEGIN IMMEDIATE", null, null, null) != c.SQLITE_OK) {
+        return error.TransactionBeginFailed;
+    }
+    var tx_open = true;
+    errdefer {
+        if (tx_open) _ = c.sqlite3_exec(db, "ROLLBACK", null, null, null);
+    }
+
     // SELECT jobs that are due and enabled.
     const select_sql =
         "SELECT id, expression, one_shot FROM cron_jobs " ++
@@ -3355,6 +3365,10 @@ pub fn dbTickAndEnqueue(db_path: [:0]const u8, allocator: std.mem.Allocator, now
         }
     }
 
+    if (c.sqlite3_exec(db, "COMMIT", null, null, null) != c.SQLITE_OK) {
+        return error.TransactionCommitFailed;
+    }
+    tx_open = false;
     return enqueued;
 }
 
