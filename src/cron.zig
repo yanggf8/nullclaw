@@ -113,7 +113,9 @@ pub const CronJobPatch = struct {
     delivery_channel: ?[]const u8 = null,
     delivery_to: ?[]const u8 = null,
     delivery_mode: ?[]const u8 = null,
+    delivery_account_id: ?[]const u8 = null,
     timeout_secs: ?u32 = null,
+    next_run_secs: ?i64 = null,
 };
 
 /// A scheduled cron job.
@@ -694,6 +696,20 @@ pub const CronScheduler = struct {
         }
         if (patch.delivery_mode) |dm| {
             job.delivery.mode = DeliveryMode.parse(dm);
+        }
+        if (patch.delivery_account_id) |aid| {
+            if (job.delivery.account_id_owned) {
+                if (job.delivery.account_id) |old| allocator.free(old);
+            }
+            job.delivery.account_id = allocator.dupe(u8, aid) catch return false;
+            job.delivery.account_id_owned = true;
+        }
+        if (patch.name) |n| {
+            if (job.name) |old| allocator.free(old);
+            job.name = allocator.dupe(u8, n) catch return false;
+        }
+        if (patch.next_run_secs) |nrs| {
+            job.next_run_secs = nrs;
         }
         return true;
     }
@@ -1534,9 +1550,14 @@ fn cronDbPath(allocator: std.mem.Allocator) ![]const u8 {
     return std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron.db" });
 }
 
+/// Close a cron SQLite DB handle returned by openCronDbAtPath.
+pub fn closeCronDb(db: *c.sqlite3) void {
+    _ = c.sqlite3_close(db);
+}
+
 /// Open a SQLite DB at the given null-terminated path.
-/// Caller must call c.sqlite3_close on the returned handle.
-fn openCronDbAtPath(path_z: [*:0]const u8) !*c.sqlite3 {
+/// Caller must call closeCronDb (or c.sqlite3_close) on the returned handle.
+pub fn openCronDbAtPath(path_z: [*:0]const u8) !*c.sqlite3 {
     if (!build_options.enable_sqlite) return error.SqliteDisabled;
 
     var db: ?*c.sqlite3 = null;
@@ -1552,6 +1573,15 @@ fn openCronDbAtPath(path_z: [*:0]const u8) !*c.sqlite3 {
         if (err_msg) |msg| c.sqlite3_free(msg);
     }
     return db.?;
+}
+
+/// Return the null-terminated path to the cron DB (~/.nullclaw/cron.db).
+/// Caller must free the returned slice with allocator.free().
+pub fn getCronDbPathZ(allocator: std.mem.Allocator) ![:0]u8 {
+    try ensureCronDir(allocator);
+    const path = try cronDbPath(allocator);
+    defer allocator.free(path);
+    return allocator.dupeZ(u8, path);
 }
 
 /// Open (and create if needed) the cron SQLite DB.
@@ -1597,11 +1627,33 @@ const CRON_TABLE_SQL =
     \\  delivery_account_id TEXT,
     \\  delivery_to         TEXT,
     \\  created_at_s        INTEGER NOT NULL DEFAULT 0,
-    \\  timeout_secs        INTEGER
+    \\  timeout_secs        INTEGER,
+    \\  delivery_best_effort INTEGER NOT NULL DEFAULT 0,
+    \\  session_target      TEXT NOT NULL DEFAULT 'isolated'
     \\)
 ;
 
-/// Ensure the cron_jobs table exists in the given DB.
+const CRON_RUN_QUEUE_SQL =
+    \\CREATE TABLE IF NOT EXISTS cron_run_queue (
+    \\  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\  job_id       TEXT NOT NULL,
+    \\  enqueued_at  INTEGER NOT NULL DEFAULT 0,
+    \\  status       TEXT NOT NULL DEFAULT 'pending',
+    \\  started_at   INTEGER
+    \\);
+    \\CREATE INDEX IF NOT EXISTS idx_run_queue_status ON cron_run_queue(status, enqueued_at);
+;
+
+/// Ensure the cron_run_queue table exists in the given DB.
+pub fn ensureRunQueueTable(db: *c.sqlite3) !void {
+    var err_msg: [*c]u8 = null;
+    const rc = c.sqlite3_exec(db, CRON_RUN_QUEUE_SQL, null, null, &err_msg);
+    if (rc != c.SQLITE_OK) {
+        if (err_msg) |msg| c.sqlite3_free(msg);
+        return error.RunQueueTableCreateFailed;
+    }
+}
+
 fn ensureCronTable(db: *c.sqlite3) !void {
     var err_msg: [*c]u8 = null;
     const rc = c.sqlite3_exec(db, CRON_TABLE_SQL, null, null, &err_msg);
@@ -1613,6 +1665,11 @@ fn ensureCronTable(db: *c.sqlite3) !void {
     _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN last_output TEXT", null, null, null);
     // Migration: add timeout_secs column for existing DBs (ignore error if already exists).
     _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN timeout_secs INTEGER", null, null, null);
+    // Migration: add delivery_best_effort column for existing DBs (ignore error if already exists).
+    _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN delivery_best_effort INTEGER NOT NULL DEFAULT 0", null, null, null);
+    // Migration: add session_target column for existing DBs (ignore error if already exists).
+    _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN session_target TEXT NOT NULL DEFAULT 'isolated'", null, null, null);
+    try ensureRunQueueTable(db);
 }
 
 /// Insert or replace a single job row in the DB.
@@ -1622,8 +1679,9 @@ fn dbSaveJob(db: *c.sqlite3, job: *const CronJob) !void {
         "(id, expression, job_type, command, prompt, name, model, " ++
         "next_run_secs, last_run_secs, last_status, paused, one_shot, " ++
         "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
-        "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs) " ++
-        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)";
+        "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs, " ++
+        "delivery_best_effort, session_target) " ++
+        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)";
 
     var stmt: ?*c.sqlite3_stmt = null;
     var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
@@ -1693,6 +1751,9 @@ fn dbSaveJob(db: *c.sqlite3, job: *const CronJob) !void {
     } else {
         _ = c.sqlite3_bind_null(stmt, 21);
     }
+    _ = c.sqlite3_bind_int(stmt, 22, if (job.delivery.best_effort) 1 else 0);
+    const st_str = job.session_target.asStr();
+    _ = c.sqlite3_bind_text(stmt, 23, st_str.ptr, @intCast(st_str.len), SQLITE_STATIC);
 
     rc = c.sqlite3_step(stmt);
     if (rc != c.SQLITE_DONE) return error.StepFailed;
@@ -3078,6 +3139,545 @@ fn formatUnixTimestamp(secs: i64, buf: []u8) []const u8 {
 // ── Backwards-compatible type alias ──────────────────────────────────
 
 pub const Task = CronJob;
+
+// ── DB-direct run queue functions (Phase 2) ──────────────────────────
+
+/// Arena-owned snapshot of a cron job, used by the worker thread.
+/// All slices point into the arena and are freed together.
+pub const CronJobSpec = struct {
+    id: []const u8,
+    job_type: JobType,
+    command: []const u8,
+    prompt: ?[]const u8,
+    model: ?[]const u8,
+    one_shot: bool,
+    delete_after_run: bool,
+    timeout_secs: ?u32,
+    delivery: DeliveryConfig,
+    session_target: SessionTarget,
+};
+
+/// Return true if a job with the given id exists in cron_jobs.
+pub fn dbJobExists(db: *c.sqlite3, job_id: []const u8) !bool {
+    const sql = "SELECT 1 FROM cron_jobs WHERE id=?1 LIMIT 1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+/// Insert a job into cron_run_queue with 'pending' status.
+pub fn dbEnqueueJob(db: *c.sqlite3, job_id: []const u8, enqueued_at: i64) !void {
+    const sql = "INSERT INTO cron_run_queue (job_id, enqueued_at, status) VALUES (?1, ?2, 'pending')";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_int64(stmt, 2, enqueued_at);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
+}
+
+/// Scan cron_jobs for due jobs, INSERT them into cron_run_queue, and
+/// UPDATE their next_run_secs. Returns the number of jobs enqueued.
+/// Opens its own DB connection — safe to call from any thread.
+pub fn dbTickAndEnqueue(db_path: [:0]const u8, allocator: std.mem.Allocator, now: i64) !usize {
+    _ = allocator;
+    const db = try openCronDbAtPath(db_path);
+    defer _ = c.sqlite3_close(db);
+
+    try ensureCronTable(db);
+
+    // Enable WAL mode for concurrent access.
+    _ = c.sqlite3_exec(db, "PRAGMA journal_mode=WAL", null, null, null);
+
+    // SELECT jobs that are due and enabled.
+    const select_sql =
+        "SELECT id, expression, one_shot FROM cron_jobs " ++
+        "WHERE enabled=1 AND paused=0 AND next_run_secs <= ?1";
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(db, select_sql, -1, &stmt, null);
+    if (rc != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+
+    rc = c.sqlite3_bind_int64(stmt, 1, now);
+    if (rc != c.SQLITE_OK) return error.BindFailed;
+
+    var enqueued: usize = 0;
+
+    while (true) {
+        rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+        const id_ptr = c.sqlite3_column_text(stmt, 0);
+        const expr_ptr = c.sqlite3_column_text(stmt, 1);
+        const one_shot_val = c.sqlite3_column_int(stmt, 2);
+
+        if (id_ptr == null or expr_ptr == null) continue;
+
+        const id_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        const id_str = id_ptr[0..id_len];
+        const expr_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+        const expr_str = expr_ptr[0..expr_len];
+
+        // INSERT into run queue.
+        const ins_sql = "INSERT INTO cron_run_queue (job_id, enqueued_at, status) VALUES (?1, ?2, 'pending')";
+        var ins_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, ins_sql, -1, &ins_stmt, null) == c.SQLITE_OK) {
+            _ = c.sqlite3_bind_text(ins_stmt, 1, id_str.ptr, @intCast(id_str.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_int64(ins_stmt, 2, now);
+            _ = c.sqlite3_step(ins_stmt);
+            _ = c.sqlite3_finalize(ins_stmt);
+            enqueued += 1;
+        }
+
+        // Update next_run_secs (or set to 0 for one-shot jobs so they don't re-fire).
+        if (one_shot_val != 0) {
+            const upd_sql = "UPDATE cron_jobs SET next_run_secs=0, paused=1 WHERE id=?1";
+            var upd_stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(db, upd_sql, -1, &upd_stmt, null) == c.SQLITE_OK) {
+                _ = c.sqlite3_bind_text(upd_stmt, 1, id_str.ptr, @intCast(id_str.len), SQLITE_STATIC);
+                _ = c.sqlite3_step(upd_stmt);
+                _ = c.sqlite3_finalize(upd_stmt);
+            }
+        } else {
+            const next_run = nextRunForCronExpression(expr_str, now) catch now + 60;
+            const upd_sql = "UPDATE cron_jobs SET next_run_secs=?1 WHERE id=?2";
+            var upd_stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(db, upd_sql, -1, &upd_stmt, null) == c.SQLITE_OK) {
+                _ = c.sqlite3_bind_int64(upd_stmt, 1, next_run);
+                _ = c.sqlite3_bind_text(upd_stmt, 2, id_str.ptr, @intCast(id_str.len), SQLITE_STATIC);
+                _ = c.sqlite3_step(upd_stmt);
+                _ = c.sqlite3_finalize(upd_stmt);
+            }
+        }
+    }
+
+    return enqueued;
+}
+
+/// Dequeue the next pending job from cron_run_queue, marking it in_progress.
+/// Returns null if the queue is empty.
+/// Caller owns the returned strings (duped into allocator).
+pub fn dbDequeueNextJob(db: *c.sqlite3, allocator: std.mem.Allocator) !?struct { queue_row_id: i64, job_id: []const u8 } {
+    _ = c.sqlite3_exec(db, "PRAGMA journal_mode=WAL", null, null, null);
+
+    const sql =
+        "SELECT id, job_id FROM cron_run_queue WHERE status='pending' " ++
+        "ORDER BY enqueued_at ASC LIMIT 1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
+    if (rc != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+
+    rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_DONE) return null;
+    if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+    const queue_row_id = c.sqlite3_column_int64(stmt, 0);
+    const job_id_ptr = c.sqlite3_column_text(stmt, 1);
+    if (job_id_ptr == null) return null;
+
+    const job_id_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+    const job_id = try allocator.dupe(u8, job_id_ptr[0..job_id_len]);
+    errdefer allocator.free(job_id);
+
+    // Mark as in_progress.
+    const upd_sql = "UPDATE cron_run_queue SET status='in_progress', started_at=?1 WHERE id=?2";
+    var upd_stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, upd_sql, -1, &upd_stmt, null) == c.SQLITE_OK) {
+        _ = c.sqlite3_bind_int64(upd_stmt, 1, std.time.timestamp());
+        _ = c.sqlite3_bind_int64(upd_stmt, 2, queue_row_id);
+        _ = c.sqlite3_step(upd_stmt);
+        _ = c.sqlite3_finalize(upd_stmt);
+    }
+
+    return .{ .queue_row_id = queue_row_id, .job_id = job_id };
+}
+
+/// Load a job spec from cron_jobs by ID into arena-allocated memory.
+/// Returns null if job not found.
+pub fn dbLoadJobSpec(db: *c.sqlite3, arena: std.mem.Allocator, job_id: []const u8) !?CronJobSpec {
+    const sql =
+        "SELECT job_type, command, prompt, model, one_shot, delete_after_run, " ++
+        "timeout_secs, delivery_mode, delivery_channel, delivery_account_id, delivery_to, " ++
+        "delivery_best_effort, session_target " ++
+        "FROM cron_jobs WHERE id=?1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
+    if (rc != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+
+    rc = c.sqlite3_bind_text(stmt, 1, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
+    if (rc != c.SQLITE_OK) return error.BindFailed;
+
+    rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_DONE) return null;
+    if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+    const job_type_raw = try dbColumnTextOpt(stmt, 0, arena);
+    const command_raw = try dbColumnTextOpt(stmt, 1, arena);
+    const delivery_mode_raw = try dbColumnTextOpt(stmt, 7, arena);
+
+    return CronJobSpec{
+        .id = try arena.dupe(u8, job_id),
+        .job_type = if (job_type_raw) |s| JobType.parse(s) else .shell,
+        .command = command_raw orelse "",
+        .prompt = try dbColumnTextOpt(stmt, 2, arena),
+        .model = try dbColumnTextOpt(stmt, 3, arena),
+        .one_shot = c.sqlite3_column_int(stmt, 4) != 0,
+        .delete_after_run = c.sqlite3_column_int(stmt, 5) != 0,
+        .timeout_secs = blk: {
+            if (c.sqlite3_column_type(stmt, 6) == c.SQLITE_NULL) break :blk null;
+            const v = c.sqlite3_column_int(stmt, 6);
+            if (v <= 0) break :blk null;
+            break :blk @intCast(v);
+        },
+        .delivery = .{
+            .mode = if (delivery_mode_raw) |s| DeliveryMode.parse(s) else .none,
+            .channel = try dbColumnTextOpt(stmt, 8, arena),
+            .account_id = try dbColumnTextOpt(stmt, 9, arena),
+            .to = try dbColumnTextOpt(stmt, 10, arena),
+            .best_effort = c.sqlite3_column_int(stmt, 11) != 0,
+            .channel_owned = false,
+            .account_id_owned = false,
+            .to_owned = false,
+        },
+        .session_target = blk: {
+            const raw = try dbColumnTextOpt(stmt, 12, arena);
+            break :blk if (raw) |s| SessionTarget.parse(s) else .isolated;
+        },
+    };
+}
+
+/// Write job completion back to cron_jobs and remove the run queue row.
+pub fn dbCompleteJob(
+    db: *c.sqlite3,
+    job_id: []const u8,
+    queue_row_id: i64,
+    last_run_secs: i64,
+    status: []const u8,
+    last_output: ?[]const u8,
+    delete_after_run: bool,
+) !void {
+    if (delete_after_run) {
+        const del_sql = "DELETE FROM cron_jobs WHERE id=?1";
+        var del_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, del_sql, -1, &del_stmt, null) == c.SQLITE_OK) {
+            _ = c.sqlite3_bind_text(del_stmt, 1, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
+            _ = c.sqlite3_step(del_stmt);
+            _ = c.sqlite3_finalize(del_stmt);
+        }
+    } else {
+        const upd_sql =
+            "UPDATE cron_jobs SET last_run_secs=?1, last_status=?2, last_output=?3 WHERE id=?4";
+        var upd_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, upd_sql, -1, &upd_stmt, null) == c.SQLITE_OK) {
+            _ = c.sqlite3_bind_int64(upd_stmt, 1, last_run_secs);
+            _ = c.sqlite3_bind_text(upd_stmt, 2, status.ptr, @intCast(status.len), SQLITE_STATIC);
+            if (last_output) |o| {
+                _ = c.sqlite3_bind_text(upd_stmt, 3, o.ptr, @intCast(o.len), SQLITE_STATIC);
+            } else {
+                _ = c.sqlite3_bind_null(upd_stmt, 3);
+            }
+            _ = c.sqlite3_bind_text(upd_stmt, 4, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
+            _ = c.sqlite3_step(upd_stmt);
+            _ = c.sqlite3_finalize(upd_stmt);
+        }
+    }
+
+    // Remove the run queue row regardless.
+    const del_q_sql = "DELETE FROM cron_run_queue WHERE id=?1";
+    var del_q_stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, del_q_sql, -1, &del_q_stmt, null) == c.SQLITE_OK) {
+        _ = c.sqlite3_bind_int64(del_q_stmt, 1, queue_row_id);
+        _ = c.sqlite3_step(del_q_stmt);
+        _ = c.sqlite3_finalize(del_q_stmt);
+    }
+}
+
+/// Reset any in_progress rows back to pending on worker startup (crash recovery).
+pub fn dbResetInProgressJobs(db: *c.sqlite3) !void {
+    const sql = "UPDATE cron_run_queue SET status='pending', started_at=NULL WHERE status='in_progress'";
+    var err_msg: [*c]u8 = null;
+    const rc = c.sqlite3_exec(db, sql, null, null, &err_msg);
+    if (rc != c.SQLITE_OK) {
+        if (err_msg) |msg| c.sqlite3_free(msg);
+        return error.ResetInProgressFailed;
+    }
+}
+
+/// JSON-escape a string and append it with surrounding quotes into buf.
+/// Used by dbListJobsJson / dbGetJobOutputJson (mirrors appendJsonStringBuf in gateway.zig).
+fn appendJsonStr(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, s: []const u8) !void {
+    try buf.append(alloc, '"');
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try buf.appendSlice(alloc, "\\\""),
+            '\\' => try buf.appendSlice(alloc, "\\\\"),
+            '\n' => try buf.appendSlice(alloc, "\\n"),
+            '\r' => try buf.appendSlice(alloc, "\\r"),
+            '\t' => try buf.appendSlice(alloc, "\\t"),
+            else => try buf.append(alloc, ch),
+        }
+    }
+    try buf.append(alloc, '"');
+}
+
+/// Query all rows from cron_jobs and write a JSON array into buf.
+/// Column order in the SELECT matches the field order documented in the function body.
+/// Caller owns the buf contents (allocated with allocator).
+pub fn dbListJobsJson(db: *c.sqlite3, buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator) !void {
+    // SELECT column indices:
+    //  0  id
+    //  1  expression
+    //  2  command
+    //  3  next_run_secs
+    //  4  last_run_secs
+    //  5  last_status
+    //  6  last_output
+    //  7  paused
+    //  8  one_shot
+    //  9  job_type
+    // 10  enabled
+    // 11  delete_after_run
+    // 12  prompt
+    // 13  model
+    // 14  delivery_mode
+    // 15  delivery_channel
+    // 16  delivery_account_id
+    // 17  delivery_to
+    // 18  created_at_s
+    // 19  timeout_secs
+    const sql =
+        "SELECT id, expression, command, next_run_secs, last_run_secs, last_status, " ++
+        "last_output, paused, one_shot, job_type, enabled, delete_after_run, " ++
+        "prompt, model, delivery_mode, delivery_channel, delivery_account_id, " ++
+        "delivery_to, created_at_s, timeout_secs " ++
+        "FROM cron_jobs ORDER BY rowid ASC";
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+
+    var int_buf: [32]u8 = undefined;
+    var first = true;
+    try buf.append(allocator, '[');
+
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        try buf.appendSlice(allocator, "{");
+
+        // id (col 0) — TEXT NOT NULL
+        try buf.appendSlice(allocator, "\"id\":");
+        const id_ptr = c.sqlite3_column_text(stmt, 0);
+        const id_len: usize = if (id_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 0)) else 0;
+        try appendJsonStr(buf, allocator, if (id_ptr != null) id_ptr[0..id_len] else "");
+
+        // expression (col 1) — TEXT NOT NULL
+        try buf.appendSlice(allocator, ",\"expression\":");
+        const expr_ptr = c.sqlite3_column_text(stmt, 1);
+        const expr_len: usize = if (expr_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 1)) else 0;
+        try appendJsonStr(buf, allocator, if (expr_ptr != null) expr_ptr[0..expr_len] else "");
+
+        // command (col 2) — TEXT (may be null for agent jobs; fall back to "")
+        try buf.appendSlice(allocator, ",\"command\":");
+        const cmd_ptr = c.sqlite3_column_text(stmt, 2);
+        const cmd_len: usize = if (cmd_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 2)) else 0;
+        try appendJsonStr(buf, allocator, if (cmd_ptr != null) cmd_ptr[0..cmd_len] else "");
+
+        // next_run_secs (col 3) — INTEGER NOT NULL
+        try buf.appendSlice(allocator, ",\"next_run_secs\":");
+        const next_run = c.sqlite3_column_int64(stmt, 3);
+        try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{next_run}) catch "0");
+
+        // last_run_secs (col 4) — INTEGER nullable
+        try buf.appendSlice(allocator, ",\"last_run_secs\":");
+        if (c.sqlite3_column_type(stmt, 4) == c.SQLITE_NULL) {
+            try buf.appendSlice(allocator, "null");
+        } else {
+            const lrs = c.sqlite3_column_int64(stmt, 4);
+            try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{lrs}) catch "0");
+        }
+
+        // last_status (col 5) — TEXT nullable
+        try buf.appendSlice(allocator, ",\"last_status\":");
+        const ls_ptr = c.sqlite3_column_text(stmt, 5);
+        if (c.sqlite3_column_type(stmt, 5) == c.SQLITE_NULL or ls_ptr == null) {
+            try buf.appendSlice(allocator, "null");
+        } else {
+            const ls_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 5));
+            try appendJsonStr(buf, allocator, ls_ptr[0..ls_len]);
+        }
+
+        // last_output (col 6) — TEXT nullable
+        try buf.appendSlice(allocator, ",\"last_output\":");
+        const lo_ptr = c.sqlite3_column_text(stmt, 6);
+        if (c.sqlite3_column_type(stmt, 6) == c.SQLITE_NULL or lo_ptr == null) {
+            try buf.appendSlice(allocator, "null");
+        } else {
+            const lo_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 6));
+            try appendJsonStr(buf, allocator, lo_ptr[0..lo_len]);
+        }
+
+        // paused (col 7) — INTEGER NOT NULL
+        try buf.appendSlice(allocator, ",\"paused\":");
+        try buf.appendSlice(allocator, if (c.sqlite3_column_int(stmt, 7) != 0) "true" else "false");
+
+        // one_shot (col 8) — INTEGER NOT NULL
+        try buf.appendSlice(allocator, ",\"one_shot\":");
+        try buf.appendSlice(allocator, if (c.sqlite3_column_int(stmt, 8) != 0) "true" else "false");
+
+        // job_type (col 9) — TEXT NOT NULL DEFAULT 'shell'
+        try buf.appendSlice(allocator, ",\"job_type\":");
+        const jt_ptr = c.sqlite3_column_text(stmt, 9);
+        const jt_len: usize = if (jt_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 9)) else 0;
+        try appendJsonStr(buf, allocator, if (jt_ptr != null) jt_ptr[0..jt_len] else "shell");
+
+        // enabled (col 10) — INTEGER NOT NULL
+        try buf.appendSlice(allocator, ",\"enabled\":");
+        try buf.appendSlice(allocator, if (c.sqlite3_column_int(stmt, 10) != 0) "true" else "false");
+
+        // delete_after_run (col 11) — INTEGER NOT NULL
+        try buf.appendSlice(allocator, ",\"delete_after_run\":");
+        try buf.appendSlice(allocator, if (c.sqlite3_column_int(stmt, 11) != 0) "true" else "false");
+
+        // prompt (col 12) — TEXT nullable
+        try buf.appendSlice(allocator, ",\"prompt\":");
+        const prompt_ptr = c.sqlite3_column_text(stmt, 12);
+        if (c.sqlite3_column_type(stmt, 12) == c.SQLITE_NULL or prompt_ptr == null) {
+            try buf.appendSlice(allocator, "null");
+        } else {
+            const prompt_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 12));
+            try appendJsonStr(buf, allocator, prompt_ptr[0..prompt_len]);
+        }
+
+        // model (col 13) — TEXT nullable
+        try buf.appendSlice(allocator, ",\"model\":");
+        const model_ptr = c.sqlite3_column_text(stmt, 13);
+        if (c.sqlite3_column_type(stmt, 13) == c.SQLITE_NULL or model_ptr == null) {
+            try buf.appendSlice(allocator, "null");
+        } else {
+            const model_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 13));
+            try appendJsonStr(buf, allocator, model_ptr[0..model_len]);
+        }
+
+        // delivery_mode (col 14) — TEXT NOT NULL DEFAULT 'none'
+        try buf.appendSlice(allocator, ",\"delivery_mode\":");
+        const dm_ptr = c.sqlite3_column_text(stmt, 14);
+        const dm_len: usize = if (dm_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 14)) else 0;
+        try appendJsonStr(buf, allocator, if (dm_ptr != null) dm_ptr[0..dm_len] else "none");
+
+        // delivery_channel (col 15) — TEXT nullable
+        try buf.appendSlice(allocator, ",\"delivery_channel\":");
+        const dc_ptr = c.sqlite3_column_text(stmt, 15);
+        if (c.sqlite3_column_type(stmt, 15) == c.SQLITE_NULL or dc_ptr == null) {
+            try buf.appendSlice(allocator, "null");
+        } else {
+            const dc_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 15));
+            try appendJsonStr(buf, allocator, dc_ptr[0..dc_len]);
+        }
+
+        // delivery_account_id (col 16) — TEXT nullable
+        try buf.appendSlice(allocator, ",\"delivery_account_id\":");
+        const dai_ptr = c.sqlite3_column_text(stmt, 16);
+        if (c.sqlite3_column_type(stmt, 16) == c.SQLITE_NULL or dai_ptr == null) {
+            try buf.appendSlice(allocator, "null");
+        } else {
+            const dai_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 16));
+            try appendJsonStr(buf, allocator, dai_ptr[0..dai_len]);
+        }
+
+        // delivery_to (col 17) — TEXT nullable
+        try buf.appendSlice(allocator, ",\"delivery_to\":");
+        const dt_ptr = c.sqlite3_column_text(stmt, 17);
+        if (c.sqlite3_column_type(stmt, 17) == c.SQLITE_NULL or dt_ptr == null) {
+            try buf.appendSlice(allocator, "null");
+        } else {
+            const dt_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 17));
+            try appendJsonStr(buf, allocator, dt_ptr[0..dt_len]);
+        }
+
+        // delivery_best_effort — not stored in DB; hardcode false
+        try buf.appendSlice(allocator, ",\"delivery_best_effort\":false");
+
+        // created_at_s (col 18) — INTEGER NOT NULL
+        try buf.appendSlice(allocator, ",\"created_at_s\":");
+        const cat = c.sqlite3_column_int64(stmt, 18);
+        try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{cat}) catch "0");
+
+        // timeout_secs (col 19) — INTEGER nullable
+        try buf.appendSlice(allocator, ",\"timeout_secs\":");
+        if (c.sqlite3_column_type(stmt, 19) == c.SQLITE_NULL) {
+            try buf.appendSlice(allocator, "null");
+        } else {
+            const ts = c.sqlite3_column_int64(stmt, 19);
+            try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{ts}) catch "null");
+        }
+
+        try buf.append(allocator, '}');
+    }
+
+    try buf.append(allocator, ']');
+}
+
+/// Query cron_jobs WHERE id=job_id and write a compact output JSON object into buf.
+/// Returns true if the job was found, false if not found.
+pub fn dbGetJobOutputJson(db: *c.sqlite3, job_id: []const u8, buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator) !bool {
+    const sql =
+        "SELECT id, last_output, last_run_secs, last_status " ++
+        "FROM cron_jobs WHERE id=?1 LIMIT 1";
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
+
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return false;
+
+    var int_buf: [32]u8 = undefined;
+    try buf.appendSlice(allocator, "{\"id\":");
+
+    // id (col 0)
+    const id_ptr = c.sqlite3_column_text(stmt, 0);
+    const id_len: usize = if (id_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 0)) else 0;
+    try appendJsonStr(buf, allocator, if (id_ptr != null) id_ptr[0..id_len] else "");
+
+    // last_output (col 1) — TEXT nullable
+    try buf.appendSlice(allocator, ",\"last_output\":");
+    const lo_ptr = c.sqlite3_column_text(stmt, 1);
+    if (c.sqlite3_column_type(stmt, 1) == c.SQLITE_NULL or lo_ptr == null) {
+        try buf.appendSlice(allocator, "null");
+    } else {
+        const lo_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+        try appendJsonStr(buf, allocator, lo_ptr[0..lo_len]);
+    }
+
+    // last_run_secs (col 2) — INTEGER nullable
+    try buf.appendSlice(allocator, ",\"last_run_secs\":");
+    if (c.sqlite3_column_type(stmt, 2) == c.SQLITE_NULL) {
+        try buf.appendSlice(allocator, "null");
+    } else {
+        const lrs = c.sqlite3_column_int64(stmt, 2);
+        try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{lrs}) catch "0");
+    }
+
+    // last_status (col 3) — TEXT nullable
+    try buf.appendSlice(allocator, ",\"last_status\":");
+    const ls_ptr = c.sqlite3_column_text(stmt, 3);
+    if (c.sqlite3_column_type(stmt, 3) == c.SQLITE_NULL or ls_ptr == null) {
+        try buf.appendSlice(allocator, "null");
+    } else {
+        const ls_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 3));
+        try appendJsonStr(buf, allocator, ls_ptr[0..ls_len]);
+    }
+
+    try buf.append(allocator, '}');
+    return true;
+}
 
 // ── Tests ────────────────────────────────────────────────────────────
 
@@ -4569,4 +5169,203 @@ test "DB round-trips timeout_secs and last_output" {
     try std.testing.expectEqual(@as(?u32, 42), jobs[0].timeout_secs);
     try std.testing.expect(jobs[0].last_output != null);
     try std.testing.expectEqualStrings("hello world", jobs[0].last_output.?);
+}
+test "ensureRunQueueTable creates table" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer _ = c.sqlite3_close(db);
+    try ensureCronTable(db); // calls ensureRunQueueTable internally
+
+    // Verify table exists by doing a simple query.
+    const sql = "SELECT COUNT(*) FROM cron_run_queue";
+    var stmt: ?*c.sqlite3_stmt = null;
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db, sql, -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 0));
+}
+
+test "dbTickAndEnqueue enqueues due jobs and updates next_run_secs" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const sched = &iso.scheduler;
+
+    // Add a job with next_run_secs in the past.
+    const j = try sched.addJob("* * * * *", "echo tick-test");
+    const jid = try std.testing.allocator.dupe(u8, j.id);
+    defer std.testing.allocator.free(jid);
+    if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1; // far in the past
+    try dbUpsertAndVerify(sched, sched.getJob(jid).?);
+
+    const now = std.time.timestamp();
+    const count = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
+    try std.testing.expectEqual(@as(usize, 1), count);
+
+    // Verify run queue has one row.
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer _ = c.sqlite3_close(db);
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "SELECT COUNT(*) FROM cron_run_queue WHERE status='pending'";
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db, sql, -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 0));
+}
+
+test "dbDequeueNextJob returns and marks in_progress" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const sched = &iso.scheduler;
+
+    const j = try sched.addJob("* * * * *", "echo dequeue-test");
+    const jid = try std.testing.allocator.dupe(u8, j.id);
+    defer std.testing.allocator.free(jid);
+    if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
+    try dbUpsertAndVerify(sched, sched.getJob(jid).?);
+
+    const now = std.time.timestamp();
+    _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
+
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer _ = c.sqlite3_close(db);
+    try ensureRunQueueTable(db);
+
+    const result = try dbDequeueNextJob(db, std.testing.allocator);
+    try std.testing.expect(result != null);
+    defer std.testing.allocator.free(result.?.job_id);
+    try std.testing.expectEqualStrings(jid, result.?.job_id);
+
+    // Second dequeue should return null (row is now in_progress).
+    const result2 = try dbDequeueNextJob(db, std.testing.allocator);
+    try std.testing.expect(result2 == null);
+}
+
+test "dbLoadJobSpec returns correct spec" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const sched = &iso.scheduler;
+
+    const j = try sched.addJob("0 8 * * *", "echo spec-test");
+    const jid = try std.testing.allocator.dupe(u8, j.id);
+    defer std.testing.allocator.free(jid);
+    if (sched.getMutableJob(jid)) |mj| mj.timeout_secs = 30;
+    try dbUpsertAndVerify(sched, sched.getJob(jid).?);
+
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer _ = c.sqlite3_close(db);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const spec = try dbLoadJobSpec(db, arena.allocator(), jid);
+    try std.testing.expect(spec != null);
+    try std.testing.expectEqualStrings("echo spec-test", spec.?.command);
+    try std.testing.expectEqual(JobType.shell, spec.?.job_type);
+    try std.testing.expectEqual(@as(?u32, 30), spec.?.timeout_secs);
+}
+
+test "dbCompleteJob writes result and removes queue row" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const sched = &iso.scheduler;
+
+    const j = try sched.addJob("* * * * *", "echo complete-test");
+    const jid = try std.testing.allocator.dupe(u8, j.id);
+    defer std.testing.allocator.free(jid);
+    if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
+    try dbUpsertAndVerify(sched, sched.getJob(jid).?);
+
+    const now = std.time.timestamp();
+    _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
+
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer _ = c.sqlite3_close(db);
+    try ensureRunQueueTable(db);
+
+    const dequeued = (try dbDequeueNextJob(db, std.testing.allocator)).?;
+    defer std.testing.allocator.free(dequeued.job_id);
+
+    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", "output text", false);
+
+    // Queue should be empty.
+    var stmt: ?*c.sqlite3_stmt = null;
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM cron_run_queue", -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 0));
+}
+
+test "dbResetInProgressJobs resets stale rows" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const sched = &iso.scheduler;
+
+    const j = try sched.addJob("* * * * *", "echo reset-test");
+    const jid = try std.testing.allocator.dupe(u8, j.id);
+    defer std.testing.allocator.free(jid);
+    if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
+    try dbUpsertAndVerify(sched, sched.getJob(jid).?);
+
+    const now = std.time.timestamp();
+    _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
+
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer _ = c.sqlite3_close(db);
+    try ensureRunQueueTable(db);
+
+    // Dequeue (sets in_progress), then reset.
+    const dequeued = (try dbDequeueNextJob(db, std.testing.allocator)).?;
+    defer std.testing.allocator.free(dequeued.job_id);
+    try dbResetInProgressJobs(db);
+
+    // Should be pending again.
+    var stmt: ?*c.sqlite3_stmt = null;
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db, "SELECT status FROM cron_run_queue", -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    const status_ptr = c.sqlite3_column_text(stmt, 0);
+    try std.testing.expect(status_ptr != null);
+    const status_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    try std.testing.expectEqualStrings("pending", status_ptr[0..status_len]);
+}
+
+test "dbLoadJobSpec persists and restores delivery_best_effort and session_target" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const sched = &iso.scheduler;
+
+    const job_ptr = try sched.addJob("* * * * *", "echo persist-test");
+    job_ptr.delivery.best_effort = true;
+    job_ptr.session_target = .main;
+    try saveJobs(sched);
+
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const jid = try std.testing.allocator.dupe(u8, job_ptr.id);
+    defer std.testing.allocator.free(jid);
+
+    const spec = try dbLoadJobSpec(db, arena.allocator(), jid);
+    try std.testing.expect(spec != null);
+    try std.testing.expect(spec.?.delivery.best_effort == true);
+    try std.testing.expectEqual(SessionTarget.main, spec.?.session_target);
 }
