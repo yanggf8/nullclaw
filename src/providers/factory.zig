@@ -340,18 +340,19 @@ pub const ProviderHolder = union(enum) {
     ) ProviderHolder {
         const kind = classifyProvider(provider_name);
         return switch (kind) {
-            .anthropic_provider => .{ .anthropic = anthropic.AnthropicProvider.init(
-                allocator,
-                api_key,
-                if (std.mem.startsWith(u8, provider_name, "anthropic-custom:")) blk: {
-                    // Prefer explicit base_url from config. Fall back to the suffix
-                    // only when it looks like a URL (starts with "http").
-                    if (base_url) |u| break :blk u;
-                    const suffix = provider_name["anthropic-custom:".len..];
-                    break :blk if (std.mem.startsWith(u8, suffix, "http")) suffix else null;
-                } else
-                    base_url,
-            ) },
+            .anthropic_provider => .{
+                .anthropic = anthropic.AnthropicProvider.init(
+                    allocator,
+                    api_key,
+                    if (std.mem.startsWith(u8, provider_name, "anthropic-custom:")) blk: {
+                        // Prefer explicit base_url from config. Fall back to the suffix
+                        // only when it looks like a URL (starts with "http").
+                        if (base_url) |u| break :blk u;
+                        const suffix = provider_name["anthropic-custom:".len..];
+                        break :blk if (std.mem.startsWith(u8, suffix, "http")) suffix else null;
+                    } else base_url,
+                ),
+            },
             .openai_provider => .{ .openai = openai.OpenAiProvider.init(allocator, api_key, user_agent) },
             .azure_openai_provider => blk: {
                 const azure_url = normalizeAzureBaseUrlOwned(allocator, base_url) catch null;

@@ -464,6 +464,43 @@ const CronAddAgentOptions = struct {
     delivery: yc.cron.DeliveryConfig = .{},
 };
 
+const CronAddSkillOptions = struct {
+    skill_args: ?[]const u8 = null,
+    deliver_to: ?[]const u8 = null,
+    timeout_secs: ?u32 = null,
+};
+
+fn parseCronAddSkillOptions(allocator: std.mem.Allocator, sub_args: []const []const u8) CronAddSkillOptions {
+    var options = CronAddSkillOptions{};
+    // Collect all remaining args after expression and skill_name.
+    // --deliver-to is extracted for the delivery config AND kept in skill_args
+    // so the Python script receives it. --timeout is extracted only.
+    var args_buf: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 3;
+    while (i < sub_args.len) : (i += 1) {
+        if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--deliver-to")) {
+            options.deliver_to = sub_args[i + 1];
+            // Keep --deliver-to in skill_args for the script
+            if (args_buf.items.len > 0) args_buf.appendSlice(allocator, " ") catch {};
+            args_buf.appendSlice(allocator, "--deliver-to ") catch {};
+            args_buf.appendSlice(allocator, sub_args[i + 1]) catch {};
+            i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--timeout")) {
+            options.timeout_secs = std.fmt.parseInt(u32, sub_args[i + 1], 10) catch null;
+            i += 1;
+        } else {
+            if (args_buf.items.len > 0) args_buf.appendSlice(allocator, " ") catch {};
+            args_buf.appendSlice(allocator, sub_args[i]) catch {};
+        }
+    }
+    if (args_buf.items.len > 0) {
+        options.skill_args = args_buf.items;
+    } else {
+        args_buf.deinit(allocator);
+    }
+    return options;
+}
+
 fn parseCronAddAgentOptions(sub_args: []const []const u8) CronAddAgentOptions {
     var options = CronAddAgentOptions{};
     var i: usize = 3;
@@ -499,6 +536,8 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  add <expression> <command>    Add a recurring cron job
             \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
             \\                                Add a recurring agent cron job
+            \\  add-skill <expression> <skill> [args...] [--deliver-to <id>] [--timeout <secs>]
+            \\                                Add a recurring skill cron job
             \\  once <delay> <command>        Add a one-shot delayed task
             \\  once-agent <delay> <prompt> [--model <model>]
             \\                                Add a one-shot delayed agent task
@@ -532,6 +571,19 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         }
         const options = parseCronAddAgentOptions(sub_args);
         try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], options.model, options.delivery);
+    } else if (std.mem.eql(u8, subcmd, "add-skill")) {
+        if (sub_args.len < 3) {
+            std.debug.print("Usage: nullclaw cron add-skill <expression> <skill> [args...] [--deliver-to <id>] [--timeout <secs>]\n", .{});
+            std.process.exit(1);
+        }
+        const options = parseCronAddSkillOptions(allocator, sub_args);
+        const delivery: yc.cron.DeliveryConfig = if (options.deliver_to) |dt| .{
+            .mode = .always,
+            .channel = "telegram",
+            .to = dt,
+            .best_effort = true,
+        } else .{};
+        try yc.cron.cliAddSkillJob(allocator, sub_args[1], sub_args[2], options.skill_args, delivery, options.timeout_secs orelse 120);
     } else if (std.mem.eql(u8, subcmd, "once")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron once <delay> <command>\n", .{});

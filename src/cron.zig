@@ -590,6 +590,41 @@ pub const CronScheduler = struct {
         return &self.jobs.items[self.jobs.items.len - 1];
     }
 
+    /// Add a recurring skill job (job_type=skill, resolved via SKILL.md at execution time).
+    pub fn addSkillJob(self: *CronScheduler, expression: []const u8, skill_name: []const u8, skill_args: ?[]const u8, delivery: DeliveryConfig, timeout_secs: ?u32) !*CronJob {
+        if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
+
+        _ = try normalizeExpression(expression);
+        const now = std.time.timestamp();
+        const next_run_secs = try nextRunForCronExpression(expression, now);
+
+        const id = try self.allocateJobId("skill");
+        errdefer self.allocator.free(id);
+
+        try self.jobs.append(self.allocator, .{
+            .id = id,
+            .expression = try self.allocator.dupe(u8, expression),
+            .command = try self.allocator.dupe(u8, ""),
+            .next_run_secs = next_run_secs,
+            .job_type = .skill,
+            .skill_name = try self.allocator.dupe(u8, skill_name),
+            .skill_args = if (skill_args) |sa| try self.allocator.dupe(u8, sa) else null,
+            .timeout_secs = timeout_secs,
+            .delivery = .{
+                .mode = delivery.mode,
+                .channel = if (delivery.channel) |ch| try self.allocator.dupe(u8, ch) else null,
+                .account_id = if (delivery.account_id) |aid| try self.allocator.dupe(u8, aid) else null,
+                .to = if (delivery.to) |t| try self.allocator.dupe(u8, t) else null,
+                .channel_owned = delivery.channel != null,
+                .account_id_owned = delivery.account_id != null,
+                .to_owned = delivery.to != null,
+                .best_effort = delivery.best_effort,
+            },
+        });
+
+        return &self.jobs.items[self.jobs.items.len - 1];
+    }
+
     /// Add a one-shot delayed agent task.
     pub fn addAgentOnce(self: *CronScheduler, delay: []const u8, prompt: []const u8, model: ?[]const u8) !*CronJob {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
@@ -2997,6 +3032,38 @@ pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prom
     log.info("  Expr : {s}", .{job.expression});
     log.info("  Type : {s}", .{job.job_type.asStr()});
     if (job.model) |m| log.info("  Model: {s}", .{m});
+}
+
+/// CLI: add a recurring skill job (job_type=skill).
+/// DB-direct — does not route through the gateway HTTP API.
+pub fn cliAddSkillJob(allocator: std.mem.Allocator, expression: []const u8, skill_name: []const u8, skill_args: ?[]const u8, delivery: DeliveryConfig, timeout_secs: ?u32) !void {
+    if (build_options.enable_sqlite) db_blk: {
+        var temp = CronScheduler.init(allocator, 65535, true);
+        defer temp.deinit();
+        const job = temp.addSkillJob(expression, skill_name, skill_args, delivery, timeout_secs) catch break :db_blk;
+        const db = openCronDb(allocator) catch break :db_blk;
+        defer _ = c.sqlite3_close(db);
+        ensureCronTable(db) catch break :db_blk;
+        if (dbCountJobs(db) == 0) migrateJsonToDb(allocator, db);
+        _ = dbSaveJob(db, job) catch break :db_blk;
+        log.info("Added skill cron job {s}", .{job.id});
+        log.info("  Expr : {s}", .{job.expression});
+        log.info("  Skill: {s}", .{skill_name});
+        if (skill_args) |sa| log.info("  Args : {s}", .{sa});
+        return;
+    }
+
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    const job = try scheduler.addSkillJob(expression, skill_name, skill_args, delivery, timeout_secs);
+    try saveJobs(&scheduler);
+
+    log.info("Added skill cron job {s}", .{job.id});
+    log.info("  Expr : {s}", .{job.expression});
+    log.info("  Skill: {s}", .{skill_name});
+    if (skill_args) |sa| log.info("  Args : {s}", .{sa});
 }
 
 /// CLI: add a one-shot delayed task.

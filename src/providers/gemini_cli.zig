@@ -19,7 +19,7 @@ const log = std.log.scoped(.gemini_cli);
 pub const GeminiCliProvider = struct {
     allocator: std.mem.Allocator,
     model: []const u8,
-    
+
     /// Persistent process state (session_id is NOT persisted — a fresh session is
     /// created per sendPrompt call to prevent cross-invocation context bleed).
     child: ?*std.process.Child = null,
@@ -313,18 +313,18 @@ pub const GeminiCliProvider = struct {
                     // This is our response
                     if (obj.get("result")) |res| {
                         if (res == .object) {
-                             if (res.object.get("content")) |c| {
-                                 if (c == .string) {
-                                     if (c.string.len > 0) {
-                                         result_buf.clearRetainingCapacity();
-                                         try result_buf.appendSlice(allocator, c.string);
-                                     }
-                                 }
-                             }
+                            if (res.object.get("content")) |c| {
+                                if (c == .string) {
+                                    if (c.string.len > 0) {
+                                        result_buf.clearRetainingCapacity();
+                                        try result_buf.appendSlice(allocator, c.string);
+                                    }
+                                }
+                            }
                         }
                     } else if (obj.get("error")) |err_val| {
                         log.err("Gemini ACP prompt failed with error: {any}", .{err_val});
-                        
+
                         // Record detailed error message if available
                         if (err_val == .object) {
                             if (err_val.object.get("message")) |err_msg_val| {
@@ -333,7 +333,7 @@ pub const GeminiCliProvider = struct {
                                 }
                             }
                         }
-                        
+
                         return error.ApiError;
                     }
                     break;
@@ -355,7 +355,7 @@ pub const GeminiCliProvider = struct {
                 const line_end = self.read_offset + pos;
                 const line = try allocator.dupe(u8, self.read_buffer.items[self.read_offset..line_end]);
                 errdefer allocator.free(line);
-                
+
                 self.read_offset = line_end + 1;
 
                 // Strip non-JSON prefixes
@@ -443,13 +443,15 @@ fn parseModelsJson(allocator: std.mem.Allocator, out: []const u8) ![][]const u8 
         const obj = parsed.value.object;
         const type_val = obj.get("type") orelse continue;
         if (type_val != .string) continue;
-        
+
         var text: ?[]const u8 = null;
         if (std.mem.eql(u8, type_val.string, "message") or
             std.mem.eql(u8, type_val.string, "output") or
             std.mem.eql(u8, type_val.string, "content"))
         {
-             if (obj.get("content")) |c| if (c == .string) { text = c.string; };
+            if (obj.get("content")) |c| if (c == .string) {
+                text = c.string;
+            };
         }
         if (text) |t| {
             var token_iter = std.mem.tokenizeScalar(u8, t, ' ');
