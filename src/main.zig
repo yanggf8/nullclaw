@@ -39,7 +39,7 @@ const Command = enum {
 };
 
 const SERVICE_SUBCOMMANDS = "install|start|stop|restart|status|uninstall";
-const CRON_SUBCOMMANDS = "list|status|add|add-agent|once|once-agent|remove|pause|resume|run|update|runs";
+const CRON_SUBCOMMANDS = "list|status|add|add-agent|add-skill|once|once-agent|remove|pause|resume|run|update|runs|backup|restore|export-seed|load-seed";
 const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
@@ -547,6 +547,10 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  run <id>                      Run a scheduled task immediately
             \\  update <id> [options]         Update a cron job
             \\  runs <id>                     List recent run history for a job
+            \\  backup                        Backup cron.db to ~/.nullclaw/backup/
+            \\  restore [file]                Restore cron.db from latest backup or specified file
+            \\  export-seed                   Export enabled jobs to ~/.nullclaw/cron-seed.json
+            \\  load-seed                     Load jobs from ~/.nullclaw/cron-seed.json into DB
             \\
         , .{CRON_SUBCOMMANDS}), .{});
         std.process.exit(1);
@@ -666,6 +670,15 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.process.exit(1);
         }
         try yc.cron.cliListRuns(allocator, sub_args[1]);
+    } else if (std.mem.eql(u8, subcmd, "backup")) {
+        try yc.cron.cliBackup(allocator);
+    } else if (std.mem.eql(u8, subcmd, "restore")) {
+        const file = if (sub_args.len >= 2) sub_args[1] else null;
+        try yc.cron.cliRestore(allocator, file);
+    } else if (std.mem.eql(u8, subcmd, "export-seed")) {
+        try yc.cron.cliExportSeed(allocator);
+    } else if (std.mem.eql(u8, subcmd, "load-seed")) {
+        try yc.cron.cliLoadSeed(allocator);
     } else {
         std.debug.print("Unknown cron command: {s}\n", .{subcmd});
         std.process.exit(1);

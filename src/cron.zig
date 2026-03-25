@@ -2170,7 +2170,8 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
         "SELECT id, expression, job_type, command, prompt, name, model, " ++
         "next_run_secs, last_run_secs, last_status, paused, one_shot, " ++
         "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
-        "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs " ++
+        "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs, " ++
+        "skill_name, skill_args, delivery_best_effort " ++
         "FROM cron_jobs ORDER BY rowid ASC";
 
     var stmt: ?*c.sqlite3_stmt = null;
@@ -2204,6 +2205,7 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
             if (job_type == .agent) {
                 if (prompt_opt) |p| break :blk try allocator.dupe(u8, p) else break :blk try allocator.dupe(u8, "");
             }
+            if (job_type == .skill) break :blk try allocator.dupe(u8, "");
             allocator.free(id);
             allocator.free(expression);
             if (prompt_opt) |p| allocator.free(p);
@@ -2251,6 +2253,9 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
             null
         else
             @intCast(c.sqlite3_column_int(stmt, 20));
+        const skill_name_opt = try dbColumnTextOpt(stmt, 21, allocator);
+        const skill_args_opt = try dbColumnTextOpt(stmt, 22, allocator);
+        const delivery_best_effort = c.sqlite3_column_int(stmt, 23) != 0;
 
         // Normalize last_status to a static literal ("ok"/"error"/null).
         // freeJobOwned does NOT free last_status, so we must never heap-allocate it.
@@ -2278,6 +2283,8 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
             .delete_after_run = delete_after_run,
             .created_at_s = created_at_s,
             .last_output = last_output_opt,
+            .skill_name = skill_name_opt,
+            .skill_args = skill_args_opt,
             .delivery = .{
                 .mode = delivery_mode,
                 .channel = delivery_channel,
@@ -2286,6 +2293,7 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
                 .channel_owned = delivery_channel != null,
                 .account_id_owned = delivery_account_id != null,
                 .to_owned = delivery_to != null,
+                .best_effort = delivery_best_effort,
             },
         });
     }
@@ -3451,6 +3459,244 @@ pub fn cliListRuns(allocator: std.mem.Allocator, id: []const u8) !void {
     } else {
         log.warn("Cron job '{s}' not found", .{id});
     }
+}
+
+/// CLI: backup cron.db to ~/.nullclaw/backup/cron.db.<timestamp>
+pub fn cliBackup(allocator: std.mem.Allocator) !void {
+    const home = try platform.getHomeDir(allocator);
+    defer allocator.free(home);
+    const db_path = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron.db" });
+    defer allocator.free(db_path);
+    const backup_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "backup" });
+    defer allocator.free(backup_dir);
+
+    std.fs.cwd().makePath(backup_dir) catch {};
+
+    // Generate timestamp suffix
+    const now = std.time.timestamp();
+    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(now) };
+    const day = epoch.getEpochDay();
+    const yd = day.calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = epoch.getDaySeconds();
+    var ts_buf: [32]u8 = undefined;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
+        yd.year,
+        md.month.numeric(),
+        md.day_index + 1,
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+        ds.getSecondsIntoMinute(),
+    }) catch "unknown";
+
+    const backup_name = try std.fmt.allocPrint(allocator, "cron.db.{s}", .{ts});
+    defer allocator.free(backup_name);
+    const backup_path = try std.fs.path.join(allocator, &.{ backup_dir, backup_name });
+    defer allocator.free(backup_path);
+
+    std.fs.cwd().copyFile(db_path, std.fs.cwd(), backup_path, .{}) catch |err| {
+        log.err("Backup failed: {s}", .{@errorName(err)});
+        return err;
+    };
+    log.info("Backed up to {s}", .{backup_path});
+}
+
+/// CLI: restore cron.db from a backup file. If no file specified, uses the latest backup.
+pub fn cliRestore(allocator: std.mem.Allocator, file_arg: ?[]const u8) !void {
+    const home = try platform.getHomeDir(allocator);
+    defer allocator.free(home);
+    const db_path = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron.db" });
+    defer allocator.free(db_path);
+
+    if (file_arg) |file| {
+        // Restore from specified file
+        std.fs.cwd().copyFile(file, std.fs.cwd(), db_path, .{}) catch |err| {
+            log.err("Restore failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        log.info("Restored cron.db from {s}", .{file});
+        return;
+    }
+
+    // Find latest backup
+    const backup_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "backup" });
+    defer allocator.free(backup_dir);
+    var dir = std.fs.cwd().openDir(backup_dir, .{ .iterate = true }) catch |err| {
+        log.err("Cannot open backup dir: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer dir.close();
+
+    var latest: ?[]const u8 = null;
+    defer if (latest) |l| allocator.free(l);
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "cron.db.")) {
+            if (latest == null or std.mem.order(u8, entry.name, latest.?).compare(.gt)) {
+                if (latest) |l| allocator.free(l);
+                latest = try allocator.dupe(u8, entry.name);
+            }
+        }
+    }
+
+    if (latest) |name| {
+        const src_path = try std.fs.path.join(allocator, &.{ backup_dir, name });
+        defer allocator.free(src_path);
+        std.fs.cwd().copyFile(src_path, std.fs.cwd(), db_path, .{}) catch |err| {
+            log.err("Restore failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        log.info("Restored cron.db from {s}", .{src_path});
+    } else {
+        log.err("No backups found in {s}", .{backup_dir});
+    }
+}
+
+/// CLI: export all enabled DB jobs to ~/.nullclaw/cron-seed.json
+pub fn cliExportSeed(allocator: std.mem.Allocator) !void {
+    const home = try platform.getHomeDir(allocator);
+    defer allocator.free(home);
+    const seed_path = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron-seed.json" });
+    defer allocator.free(seed_path);
+
+    // Load all jobs from DB
+    var scheduler = CronScheduler.init(allocator, 65535, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    // Build JSON array of enabled jobs (seed format: definition only, no runtime state)
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("[\n");
+    var count: usize = 0;
+    for (scheduler.jobs.items) |job| {
+        if (!job.enabled) continue;
+        if (count > 0) try w.writeAll(",\n");
+        try w.writeAll("  {");
+        try w.print("\"expression\":\"{s}\"", .{job.expression});
+        try w.print(",\"job_type\":\"{s}\"", .{job.job_type.asStr()});
+        if (job.command.len > 0 and job.job_type != .skill) {
+            try w.print(",\"command\":{f}", .{std.json.fmt(job.command, .{})});
+        }
+        if (job.prompt) |p| {
+            try w.print(",\"prompt\":{f}", .{std.json.fmt(p, .{})});
+        }
+        if (job.model) |m| {
+            try w.print(",\"model\":\"{s}\"", .{m});
+        }
+        if (job.skill_name) |sn| {
+            try w.print(",\"skill_name\":\"{s}\"", .{sn});
+        }
+        if (job.skill_args) |sa| {
+            try w.print(",\"skill_args\":{f}", .{std.json.fmt(sa, .{})});
+        }
+        if (job.timeout_secs) |t| {
+            try w.print(",\"timeout_secs\":{d}", .{t});
+        }
+        if (job.one_shot) try w.writeAll(",\"one_shot\":true");
+        if (job.delete_after_run) try w.writeAll(",\"delete_after_run\":true");
+        try w.print(",\"delivery_mode\":\"{s}\"", .{job.delivery.mode.asStr()});
+        if (job.delivery.channel) |ch| try w.print(",\"delivery_channel\":\"{s}\"", .{ch});
+        if (job.delivery.to) |t| try w.print(",\"delivery_to\":\"{s}\"", .{t});
+        if (job.delivery.account_id) |a| try w.print(",\"delivery_account_id\":\"{s}\"", .{a});
+        if (job.delivery.best_effort) try w.writeAll(",\"delivery_best_effort\":true");
+        if (job.session_target != .isolated) try w.print(",\"session_target\":\"{s}\"", .{job.session_target.asStr()});
+        try w.writeAll("}");
+        count += 1;
+    }
+    try w.writeAll("\n]\n");
+
+    const file = try std.fs.cwd().createFile(seed_path, .{});
+    defer file.close();
+    try file.writeAll(buf.items);
+    log.info("Exported {d} jobs to {s}", .{ count, seed_path });
+}
+
+/// CLI: load jobs from ~/.nullclaw/cron-seed.json into DB (DB-direct, no gateway).
+pub fn cliLoadSeed(allocator: std.mem.Allocator) !void {
+    const home = try platform.getHomeDir(allocator);
+    defer allocator.free(home);
+    const seed_path = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron-seed.json" });
+    defer allocator.free(seed_path);
+
+    const content = std.fs.cwd().readFileAlloc(allocator, seed_path, 1024 * 1024) catch |err| {
+        log.err("Cannot read {s}: {s}", .{ seed_path, @errorName(err) });
+        return err;
+    };
+    defer allocator.free(content);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch |err| {
+        log.err("Invalid JSON in {s}: {s}", .{ seed_path, @errorName(err) });
+        return err;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .array) {
+        log.err("Seed must be a JSON array", .{});
+        return error.InvalidSeedFormat;
+    }
+
+    const db = try openCronDb(allocator);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    var count: usize = 0;
+    for (parsed.value.array.items) |item| {
+        if (item != .object) continue;
+        const obj = item.object;
+
+        const expression = jsonStr(obj, "expression") orelse continue;
+        const job_type_str = jsonStr(obj, "job_type") orelse "shell";
+        const jtype = JobType.parse(job_type_str);
+
+        var temp = CronScheduler.init(allocator, 65535, true);
+        defer temp.deinit();
+
+        const delivery = DeliveryConfig{
+            .mode = if (jsonStr(obj, "delivery_mode")) |m| DeliveryMode.parse(m) else .none,
+            .channel = jsonStr(obj, "delivery_channel"),
+            .account_id = jsonStr(obj, "delivery_account_id"),
+            .to = jsonStr(obj, "delivery_to"),
+            .best_effort = if (obj.get("delivery_best_effort")) |v| (v == .bool and v.bool) else false,
+        };
+
+        const timeout: ?u32 = if (obj.get("timeout_secs")) |v| switch (v) {
+            .integer => |i| if (i > 0) @intCast(i) else null,
+            else => null,
+        } else null;
+
+        const job = switch (jtype) {
+            .skill => temp.addSkillJob(
+                expression,
+                jsonStr(obj, "skill_name") orelse continue,
+                jsonStr(obj, "skill_args"),
+                delivery,
+                timeout,
+            ) catch continue,
+            .agent => temp.addAgentJob(
+                expression,
+                jsonStr(obj, "prompt") orelse jsonStr(obj, "command") orelse continue,
+                jsonStr(obj, "model"),
+                delivery,
+            ) catch continue,
+            .shell => temp.addJob(
+                expression,
+                jsonStr(obj, "command") orelse continue,
+            ) catch continue,
+        };
+
+        _ = dbSaveJob(db, job) catch continue;
+        count += 1;
+    }
+    log.info("Loaded {d} jobs from {s}", .{ count, seed_path });
+}
+
+fn jsonStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    if (obj.get(key)) |v| {
+        if (v == .string) return v.string;
+    }
+    return null;
 }
 
 /// Format a Unix timestamp (seconds since epoch) into a human-readable string.
