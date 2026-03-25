@@ -3641,6 +3641,12 @@ pub fn cliLoadSeed(allocator: std.mem.Allocator) !void {
     defer closeCronDb(db);
     try ensureCronTable(db);
 
+    // Clear existing jobs — load-seed is a full replacement
+    _ = c.sqlite3_exec(db, "DELETE FROM cron_jobs", null, null, null);
+    // Also clear the run queue so stale references don't linger
+    _ = c.sqlite3_exec(db, "DELETE FROM cron_queue", null, null, null);
+    log.info("Cleared existing jobs before seeding", .{});
+
     var count: usize = 0;
     for (parsed.value.array.items) |item| {
         if (item != .object) continue;
