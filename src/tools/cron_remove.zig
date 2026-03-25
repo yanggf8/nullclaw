@@ -88,25 +88,36 @@ test "cron_remove_not_found" {
 }
 
 test "cron_remove_success" {
-    // First, create a job via the scheduler directly
-    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
-    defer scheduler.deinit();
-    const job = try scheduler.addJob("*/5 * * * *", "echo test");
-    const job_id = try std.testing.allocator.dupe(u8, job.id);
-    defer std.testing.allocator.free(job_id);
-    cron.saveJobs(&scheduler) catch {};
+    // Test removeJob on an isolated in-memory scheduler with tmpDir persistence.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/remove.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
 
-    // Now remove it via the tool
-    var t = CronRemoveTool{};
-    const tool_iface = t.tool();
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"job_id\": \"{s}\"}}", .{job_id});
-    defer std.testing.allocator.free(args);
-    const parsed = try root.parseTestArgs(args);
-    defer parsed.deinit();
-    const result = try tool_iface.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-    try std.testing.expect(result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "Removed") != null);
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    scheduler.db_path = db_path_z;
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/5 * * * *", "echo hi");
+    const job_id = try allocator.dupe(u8, job.id);
+    defer allocator.free(job_id);
+    try cron.saveJobs(&scheduler);
+
+    // Remove
+    try std.testing.expect(scheduler.removeJob(job_id));
+    try cron.saveJobs(&scheduler);
+
+    // Verify removed from persisted state
+    var loaded = CronScheduler.init(allocator, 10, true);
+    loaded.db_path = db_path_z;
+    defer loaded.deinit();
+    try cron.loadJobsStrict(&loaded);
+    try std.testing.expect(loaded.getJob(job_id) == null);
 }
 
 test "cron_remove tool name" {

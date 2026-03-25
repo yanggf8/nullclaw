@@ -1327,9 +1327,23 @@ pub fn resolveSkillCommand(allocator: std.mem.Allocator, command: []const u8) !?
 /// Returns heap-allocated "python3 <expanded_path> <args>" or error.
 /// The caller must free the returned slice.
 pub fn resolveSkillExec(allocator: std.mem.Allocator, skill_name: ?[]const u8, skill_args: ?[]const u8) ![]const u8 {
-    const name = skill_name orelse return error.MissingSkillName;
     const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
-    const skill_md_path = try std.fmt.allocPrint(allocator, "{s}/.claude/skills/{s}/SKILL.md", .{ home, name });
+    const skills_dir = try std.fmt.allocPrint(allocator, "{s}/.claude/skills", .{home});
+    defer allocator.free(skills_dir);
+    return resolveSkillExecFrom(allocator, skill_name, skill_args, skills_dir, home);
+}
+
+/// Testable inner: reads SKILL.md from `skills_dir/<name>/SKILL.md` and builds
+/// `python3 <script_path> [args]`. `tilde_home` is used for `~/` expansion.
+pub fn resolveSkillExecFrom(
+    allocator: std.mem.Allocator,
+    skill_name: ?[]const u8,
+    skill_args: ?[]const u8,
+    skills_dir: []const u8,
+    tilde_home: []const u8,
+) ![]const u8 {
+    const name = skill_name orelse return error.MissingSkillName;
+    const skill_md_path = try std.fmt.allocPrint(allocator, "{s}/{s}/SKILL.md", .{ skills_dir, name });
     defer allocator.free(skill_md_path);
 
     const content = std.fs.cwd().readFileAlloc(allocator, skill_md_path, 256 * 1024) catch return error.SkillNotFound;
@@ -1353,9 +1367,9 @@ pub fn resolveSkillExec(allocator: std.mem.Allocator, skill_name: ?[]const u8, s
     }
     const raw_path = script_path orelse return error.NoScriptPath;
 
-    // Expand leading ~ to HOME.
+    // Expand leading ~ to tilde_home.
     const expanded = if (std.mem.startsWith(u8, raw_path, "~/"))
-        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, raw_path[2..] })
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tilde_home, raw_path[2..] })
     else
         try allocator.dupe(u8, raw_path);
     defer allocator.free(expanded);
@@ -1818,8 +1832,12 @@ fn openCronDb(allocator: std.mem.Allocator) !*c.sqlite3 {
 }
 
 /// Open the DB for a scheduler, respecting its db_path override if set.
+/// Under builtin.is_test, refuses to open the real default DB to prevent
+/// tests from contaminating ~/.nullclaw/cron.db. Tests that need DB
+/// persistence must set scheduler.db_path to a tmpDir-based path.
 fn openCronDbForScheduler(scheduler: *const CronScheduler) !*c.sqlite3 {
     if (scheduler.db_path) |path_z| return openCronDbAtPath(path_z);
+    if (builtin.is_test) return error.TestDbIsolationRequired;
     return openCronDb(scheduler.allocator);
 }
 

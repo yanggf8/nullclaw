@@ -126,46 +126,73 @@ test "cron_update_requires_something" {
 }
 
 test "cron_update_expression" {
-    var ct = CronUpdateTool{};
-    const t = ct.tool();
-    // First create a job via CronScheduler so there's something to update
-    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
-    defer scheduler.deinit();
-    const job = try scheduler.addJob("*/5 * * * *", "echo test");
-    cron.saveJobs(&scheduler) catch {};
+    // Test updateJob on an isolated in-memory scheduler with tmpDir persistence.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/update_expr.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
 
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"job_id\": \"{s}\", \"expression\": \"*/10 * * * *\"}}", .{job.id});
-    defer std.testing.allocator.free(args);
-    const parsed = try root.parseTestArgs(args);
-    defer parsed.deinit();
-    const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-    defer if (result.error_msg) |e| std.testing.allocator.free(e);
-    if (result.success) {
-        try std.testing.expect(std.mem.indexOf(u8, result.output, "Updated job") != null);
-        try std.testing.expect(std.mem.indexOf(u8, result.output, "expression") != null);
-    }
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    scheduler.db_path = db_path_z;
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/5 * * * *", "echo hi");
+    const job_id = try allocator.dupe(u8, job.id);
+    defer allocator.free(job_id);
+    try cron.saveJobs(&scheduler);
+
+    // Update expression
+    const updated = scheduler.updateJob(allocator, job_id, .{ .expression = "*/10 * * * *" });
+    try std.testing.expect(updated);
+    try cron.saveJobs(&scheduler);
+
+    // Verify persisted change
+    var loaded = CronScheduler.init(allocator, 10, true);
+    loaded.db_path = db_path_z;
+    defer loaded.deinit();
+    try cron.loadJobsStrict(&loaded);
+    const loaded_job = loaded.getJob(job_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*/10 * * * *", loaded_job.expression);
 }
 
 test "cron_update_disable" {
-    var ct = CronUpdateTool{};
-    const t = ct.tool();
-    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
-    defer scheduler.deinit();
-    const job = try scheduler.addJob("*/5 * * * *", "echo test");
-    cron.saveJobs(&scheduler) catch {};
+    // Test disabling a job on an isolated scheduler with tmpDir persistence.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/update_disable.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
 
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"job_id\": \"{s}\", \"enabled\": false}}", .{job.id});
-    defer std.testing.allocator.free(args);
-    const parsed = try root.parseTestArgs(args);
-    defer parsed.deinit();
-    const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-    defer if (result.error_msg) |e| std.testing.allocator.free(e);
-    if (result.success) {
-        try std.testing.expect(std.mem.indexOf(u8, result.output, "Updated job") != null);
-        try std.testing.expect(std.mem.indexOf(u8, result.output, "enabled=false") != null);
-    }
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    scheduler.db_path = db_path_z;
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/5 * * * *", "echo hi");
+    const job_id = try allocator.dupe(u8, job.id);
+    defer allocator.free(job_id);
+    try cron.saveJobs(&scheduler);
+
+    // Disable
+    const updated = scheduler.updateJob(allocator, job_id, .{ .enabled = false });
+    try std.testing.expect(updated);
+    try cron.saveJobs(&scheduler);
+
+    // Verify persisted change
+    var loaded = CronScheduler.init(allocator, 10, true);
+    loaded.db_path = db_path_z;
+    defer loaded.deinit();
+    try cron.loadJobsStrict(&loaded);
+    const loaded_job = loaded.getJob(job_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!loaded_job.enabled);
 }
 
 test "cron_update_not_found" {

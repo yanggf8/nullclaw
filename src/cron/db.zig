@@ -122,7 +122,13 @@ pub const DbCronBackend = struct {
             .delete_after_run = spec.delete_after_run,
             .enabled = spec.enabled,
             .timeout_secs = spec.timeout_secs,
-            .delivery = spec.delivery,
+            .delivery = .{
+                .mode = spec.delivery.mode,
+                .channel = if (spec.delivery.channel) |ch| try allocator.dupe(u8, ch) else null,
+                .account_id = if (spec.delivery.account_id) |a| try allocator.dupe(u8, a) else null,
+                .to = if (spec.delivery.to) |t| try allocator.dupe(u8, t) else null,
+                .best_effort = spec.delivery.best_effort,
+            },
             .next_run_secs = next_run,
             .created_at_s = created_at,
         };
@@ -1007,6 +1013,121 @@ test "DbCronBackend dequeue preserves delivery_best_effort and session_target" {
     try std.testing.expect(result != null);
     try std.testing.expectEqual(types.SessionTarget.main, result.?.spec.session_target);
     try std.testing.expect(result.?.spec.delivery.best_effort);
+}
+
+test "DbCronBackend skill job E2E: add → tick → dequeue → complete" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/skill_e2e.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    var backend = try DbCronBackend.init(allocator, db_path_z);
+    defer backend.deinit();
+    const be = backend.backend();
+
+    // ── 1. ADD ──────────────────────────────────────────────────────
+    const job = try be.add(allocator, .{
+        .expression = "* * * * *",
+        .command = "",
+        .job_type = .skill,
+        .skill_name = "news",
+        .skill_args = "--lang zh",
+        .timeout_secs = 120,
+        .delivery = .{ .mode = .always, .channel = "telegram", .to = "12345" },
+    });
+    defer {
+        allocator.free(job.id);
+        allocator.free(job.expression);
+        allocator.free(job.command);
+        if (job.skill_name) |sn| allocator.free(sn);
+        if (job.skill_args) |sa| allocator.free(sa);
+        if (job.delivery.channel) |ch| allocator.free(ch);
+        if (job.delivery.to) |t| allocator.free(t);
+    }
+    try std.testing.expectEqual(types.JobType.skill, job.job_type);
+    try std.testing.expectEqualStrings("news", job.skill_name.?);
+    try std.testing.expectEqualStrings("--lang zh", job.skill_args.?);
+
+    // ── 2. GET: round-trip through DB ───────────────────────────────
+    const loaded = (try be.get(allocator, job.id)).?;
+    defer {
+        allocator.free(loaded.id);
+        allocator.free(loaded.expression);
+        allocator.free(loaded.command);
+        if (loaded.skill_name) |sn| allocator.free(sn);
+        if (loaded.skill_args) |sa| allocator.free(sa);
+        if (loaded.delivery.channel) |ch| allocator.free(ch);
+        if (loaded.delivery.to) |t| allocator.free(t);
+    }
+    try std.testing.expectEqual(types.JobType.skill, loaded.job_type);
+    try std.testing.expectEqualStrings("news", loaded.skill_name.?);
+    try std.testing.expectEqualStrings("--lang zh", loaded.skill_args.?);
+    try std.testing.expectEqual(@as(u32, 120), loaded.timeout_secs.?);
+    try std.testing.expectEqualStrings("telegram", loaded.delivery.channel.?);
+    try std.testing.expectEqualStrings("12345", loaded.delivery.to.?);
+
+    // ── 3. TICK ─────────────────────────────────────────────────────
+    _ = try be.update(job.id, .{ .next_run_secs = std.time.timestamp() - 60 });
+    try std.testing.expectEqual(@as(usize, 1), try be.tick(std.time.timestamp()));
+
+    // ── 4. DEQUEUE ──────────────────────────────────────────────────
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const dr = (try be.dequeue(arena.allocator())).?;
+    try std.testing.expectEqualStrings(job.id, dr.spec.id);
+    try std.testing.expectEqual(types.JobType.skill, dr.spec.job_type);
+    try std.testing.expectEqualStrings("news", dr.spec.skill_name.?);
+    try std.testing.expectEqualStrings("--lang zh", dr.spec.skill_args.?);
+    try std.testing.expectEqual(@as(u32, 120), dr.spec.timeout_secs.?);
+
+    // ── 4b. RESOLVE: skill → python3 script ─────────────────────────
+    try tmp.dir.makePath("skills/news");
+    try tmp.dir.writeFile(.{
+        .sub_path = "skills/news/SKILL.md",
+        .data = "# news\n\nFetch news.\n\n## Script\n\n~/scripts/news_fetcher.py\n\n## Notes\n\ntest\n",
+    });
+    const skills_dir = try std.fmt.allocPrint(allocator, "{s}/skills", .{base});
+    defer allocator.free(skills_dir);
+    const skill_cmd = try cron.resolveSkillExecFrom(allocator, dr.spec.skill_name, dr.spec.skill_args, skills_dir, base);
+    defer allocator.free(skill_cmd);
+    const expected_cmd = try std.fmt.allocPrint(allocator, "python3 {s}/scripts/news_fetcher.py --lang zh", .{base});
+    defer allocator.free(expected_cmd);
+    try std.testing.expectEqualStrings(expected_cmd, skill_cmd);
+
+    // ── 5. COMPLETE ─────────────────────────────────────────────────
+    const now = std.time.timestamp();
+    try be.complete(dr.spec.id, dr.queue_row_id, now, "ok", "skill output here", false);
+
+    // ── 6. VERIFY final state ───────────────────────────────────────
+    const final = (try be.get(allocator, job.id)).?;
+    defer {
+        allocator.free(final.id);
+        allocator.free(final.expression);
+        allocator.free(final.command);
+        if (final.skill_name) |sn| allocator.free(sn);
+        if (final.skill_args) |sa| allocator.free(sa);
+        if (final.last_status) |s| allocator.free(s);
+        if (final.last_output) |o| allocator.free(o);
+        if (final.delivery.channel) |ch| allocator.free(ch);
+        if (final.delivery.to) |t| allocator.free(t);
+    }
+    try std.testing.expectEqualStrings("ok", final.last_status.?);
+    try std.testing.expectEqualStrings("skill output here", final.last_output.?);
+    try std.testing.expect(final.last_run_secs != null);
+    try std.testing.expectEqual(types.JobType.skill, final.job_type);
+    try std.testing.expectEqualStrings("news", final.skill_name.?);
+    try std.testing.expectEqualStrings("--lang zh", final.skill_args.?);
+
+    // ── 7. Queue empty ──────────────────────────────────────────────
+    var arena2 = std.heap.ArenaAllocator.init(allocator);
+    defer arena2.deinit();
+    try std.testing.expect((try be.dequeue(arena2.allocator())) == null);
 }
 
 test "DbCronBackend remove clears queued head job" {

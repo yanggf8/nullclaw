@@ -406,7 +406,9 @@ test "schedule create with expression" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-    // Succeeds if HOME/.nullclaw is writable, otherwise may fail gracefully
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    // In test mode, loadScheduler returns empty in-memory scheduler and
+    // persistSchedulerOrFail may fail due to DB isolation. Either outcome is valid.
     if (result.success) {
         try std.testing.expect(std.mem.indexOf(u8, result.output, "Created job") != null);
     }
@@ -529,6 +531,7 @@ test "schedule once creates one-shot task" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
     if (result.success) {
         try std.testing.expect(std.mem.indexOf(u8, result.output, "one-shot") != null);
     }
@@ -541,6 +544,7 @@ test "schedule add creates recurring job" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
     if (result.success) {
         try std.testing.expect(std.mem.indexOf(u8, result.output, "Created job") != null);
     }

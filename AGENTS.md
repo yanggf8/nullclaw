@@ -218,8 +218,15 @@ Apply these naming rules consistently:
 |------------|-----------|----------|
 | `shell`    | subprocess via `sh -c <command>` | script self-delivers via `--deliver-to`; set `delivery_mode: none` |
 | `agent`    | inline agent loop | cron delivers stdout; set `delivery_mode: always` + `delivery_channel` + `delivery_to` |
+| `skill`    | `resolveSkillExec` → `python3 <script> [args]` subprocess | script self-delivers; gateway injects `NULLCLAW_JOB_ID` env var |
 
-#### `skill:` prefix — how it works
+#### First-class `skill` job type
+
+Set `job_type: "skill"`, `skill_name: "<name>"`, and optionally `skill_args: "<args>"`. The gateway calls `resolveSkillExec()` (or the testable `resolveSkillExecFrom()`) in `src/cron.zig` to read `## Script` from `~/.claude/skills/<name>/SKILL.md`, expand `~/`, and build `python3 <path> [args]`. The subprocess receives `NULLCLAW_JOB_ID=<job-instance-id>` as an environment variable so scripts can embed the job ID in their output for tracking.
+
+Both execution paths (DB-direct via `DbCronBackend` and legacy via `CronScheduler`) support skill jobs. The `vtableAdd` in `src/cron/db.zig` heap-dupes all delivery fields (`channel`, `account_id`, `to`, `best_effort`) for ownership consistency.
+
+#### `skill:` prefix (legacy)
 
 The `skill:` prefix in `command` or `prompt` is resolved at execution time by `resolveSkillCommand()` / `resolveSkillPrompt()` in `src/cron.zig`. It is **not** the same as the CLI `/skill <name>` command (which spawns a background subagent and returns immediately — unusable in cron).
 
@@ -230,7 +237,8 @@ Never use `/skill <name>` or `-m /skill <name>` as a cron prompt. It spawns a su
 
 #### Delivery contract
 
-- **Shell skills** must accept `--deliver-to CHAT_ID` and call the Python telegram helper directly (`~/.claude/skills/lib/telegram.py`). Do not rely on nullclaw's delivery system.
+- **Skill jobs** (`job_type: skill`) must accept `--deliver-to CHAT_ID` and call the Python telegram helper directly (`~/.claude/skills/lib/telegram.py`). Scripts can read `NULLCLAW_JOB_ID` from the environment to append the job instance ID.
+- **Shell skills** (legacy `skill:` prefix) follow the same contract as skill jobs.
 - **Agent skills** set `delivery_mode: always`. The agent's stdout is captured and sent by the cron runner. No `--deliver-to` needed.
 - The `## Script` section in `SKILL.md` must contain the script path as its first non-empty, non-backtick line, prefixed with `~/`.
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -112,8 +113,11 @@ pub const CronAddTool = struct {
 
 /// Load the CronScheduler from persisted state (~/.nullclaw/cron.db, falling back to cron.json).
 /// Shared by cron_add, cron_list, cron_remove, and schedule tools.
+/// Under builtin.is_test, uses an in-memory-only scheduler (no DB) to prevent
+/// tests from contaminating the real ~/.nullclaw/cron.db.
 pub fn loadScheduler(allocator: std.mem.Allocator) !CronScheduler {
     var scheduler = CronScheduler.init(allocator, 1024, true);
+    if (builtin.is_test) return scheduler; // Skip loading from real DB in tests
     cron.loadJobs(&scheduler) catch {};
     return scheduler;
 }
@@ -148,6 +152,7 @@ test "cron_add_with_expression" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
     if (result.success) {
         try std.testing.expect(std.mem.indexOf(u8, result.output, "Created cron job") != null);
     }
@@ -160,6 +165,7 @@ test "cron_add_with_delay" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
     if (result.success) {
         try std.testing.expect(std.mem.indexOf(u8, result.output, "Created cron job") != null);
     }

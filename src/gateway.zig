@@ -3605,6 +3605,8 @@ fn runQueueWorker(state: *GatewayState) void {
                         .command = legacy_spec.command,
                         .prompt = legacy_spec.prompt,
                         .model = legacy_spec.model,
+                        .skill_name = legacy_spec.skill_name,
+                        .skill_args = legacy_spec.skill_args,
                         .one_shot = legacy_spec.one_shot,
                         .delete_after_run = legacy_spec.delete_after_run,
                         .timeout_secs = legacy_spec.timeout_secs,
@@ -3754,12 +3756,14 @@ fn runQueueWorker(state: *GatewayState) void {
                 .skill => {
                     // Skill jobs own their entire workflow including delivery.
                     // Cron only triggers and records status.
-                    const skill_cmd = cron_mod.resolveSkillExec(arena, spec.skill_name, spec.skill_args) catch |err| {
+                    const raw_skill_cmd = cron_mod.resolveSkillExec(arena, spec.skill_name, spec.skill_args) catch |err| {
                         log.err("[{s}] skill resolution failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false);
                         continue;
                     };
-                    defer arena.free(skill_cmd);
+                    defer arena.free(raw_skill_cmd);
+                    // Inject job ID as env var so scripts can reference it.
+                    const skill_cmd = std.fmt.allocPrint(arena, "NULLCLAW_JOB_ID={s} {s}", .{ spec.id, raw_skill_cmd }) catch raw_skill_cmd;
                     var skill_child = std.process.Child.init(
                         &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), skill_cmd },
                         arena,
@@ -4009,7 +4013,7 @@ fn runQueueWorker(state: *GatewayState) void {
                 },
                 .skill => {
                     // Skill jobs: resolve via SKILL.md and run as subprocess.
-                    const skill_cmd = cron_mod.resolveSkillExec(allocator, skill_name_leg, skill_args_leg) catch |err| {
+                    const raw_skill_cmd = cron_mod.resolveSkillExec(allocator, skill_name_leg, skill_args_leg) catch |err| {
                         log.err("[{s}] skill resolution failed: {s}", .{ id, @errorName(err) });
                         state.scheduler_mutex.lock();
                         if (sched.getMutableJob(id)) |j| {
@@ -4020,7 +4024,9 @@ fn runQueueWorker(state: *GatewayState) void {
                         _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
                         continue;
                     };
-                    defer allocator.free(skill_cmd);
+                    defer allocator.free(raw_skill_cmd);
+                    // Inject job ID as env var so scripts can reference it.
+                    const skill_cmd = std.fmt.allocPrint(allocator, "NULLCLAW_JOB_ID={s} {s}", .{ id, raw_skill_cmd }) catch raw_skill_cmd;
                     var skill_child = std.process.Child.init(
                         &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), skill_cmd },
                         allocator,
