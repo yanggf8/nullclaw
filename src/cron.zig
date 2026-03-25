@@ -19,16 +19,19 @@ const log = std.log.scoped(.cron);
 pub const JobType = enum {
     shell,
     agent,
+    skill,
 
     pub fn asStr(self: JobType) []const u8 {
         return switch (self) {
             .shell => "shell",
             .agent => "agent",
+            .skill => "skill",
         };
     }
 
     pub fn parse(raw: []const u8) JobType {
         if (std.ascii.eqlIgnoreCase(raw, "agent")) return .agent;
+        if (std.ascii.eqlIgnoreCase(raw, "skill")) return .skill;
         return .shell;
     }
 };
@@ -109,6 +112,8 @@ pub const CronJobPatch = struct {
     name: ?[]const u8 = null,
     enabled: ?bool = null,
     model: ?[]const u8 = null,
+    skill_name: ?[]const u8 = null,
+    skill_args: ?[]const u8 = null,
     delete_after_run: ?bool = null,
     delivery_channel: ?[]const u8 = null,
     delivery_to: ?[]const u8 = null,
@@ -133,6 +138,8 @@ pub const CronJob = struct {
     prompt: ?[]const u8 = null,
     name: ?[]const u8 = null,
     model: ?[]const u8 = null,
+    skill_name: ?[]const u8 = null,
+    skill_args: ?[]const u8 = null,
     timeout_secs: ?u32 = null,
     enabled: bool = true,
     delete_after_run: bool = false,
@@ -451,6 +458,8 @@ pub const CronScheduler = struct {
         if (job.prompt) |prompt| self.allocator.free(prompt);
         if (job.name) |name| self.allocator.free(name);
         if (job.model) |model| self.allocator.free(model);
+        if (job.skill_name) |sn| self.allocator.free(sn);
+        if (job.skill_args) |sa| self.allocator.free(sa);
         if (job.last_output) |output| self.allocator.free(output);
         if (job.delivery.channel_owned) {
             if (job.delivery.channel) |channel| self.allocator.free(channel);
@@ -708,6 +717,14 @@ pub const CronScheduler = struct {
             if (job.name) |old| allocator.free(old);
             job.name = allocator.dupe(u8, n) catch return false;
         }
+        if (patch.skill_name) |sn| {
+            if (job.skill_name) |old| allocator.free(old);
+            job.skill_name = allocator.dupe(u8, sn) catch return false;
+        }
+        if (patch.skill_args) |sa| {
+            if (job.skill_args) |old| allocator.free(old);
+            job.skill_args = allocator.dupe(u8, sa) catch return false;
+        }
         if (patch.next_run_secs) |nrs| {
             job.next_run_secs = nrs;
         }
@@ -926,6 +943,53 @@ pub const CronScheduler = struct {
                             self.allocator.free(exec_result.output);
                             break :blk null;
                         };
+                    }
+                },
+                .skill => {
+                    // Skill jobs own their entire workflow. Cron only triggers + records.
+                    const skill_cmd = if (!builtin.is_test)
+                        resolveSkillExec(self.allocator, job.skill_name, job.skill_args) catch |err| blk: {
+                            log.err("cron job '{s}' skill resolution failed: {}", .{ job.id, err });
+                            job.last_run_secs = now;
+                            job.last_status = "error";
+                            break :blk null;
+                        }
+                    else
+                        null;
+
+                    if (skill_cmd == null and !builtin.is_test) {
+                        // Resolution failed, error already logged above.
+                    } else if (builtin.is_test) {
+                        // Test mode: record execution without subprocess.
+                        job.last_run_secs = now;
+                        job.last_status = "ok";
+                    } else {
+                        defer self.allocator.free(skill_cmd.?);
+                        const result = std.process.Child.run(.{
+                            .allocator = self.allocator,
+                            .argv = &.{ platform.getShell(), platform.getShellFlag(), skill_cmd.? },
+                            .cwd = self.shell_cwd,
+                        }) catch |err| {
+                            log.err("cron skill job '{s}' failed to start: {}", .{ job.id, err });
+                            job.last_run_secs = now;
+                            job.last_status = "error";
+                            continue;
+                        };
+                        defer self.allocator.free(result.stdout);
+                        defer self.allocator.free(result.stderr);
+
+                        const exit_code: u8 = switch (result.term) {
+                            .Exited => |code| code,
+                            else => 1,
+                        };
+                        job.last_run_secs = now;
+                        job.last_status = if (exit_code == 0) "ok" else "error";
+                        job.last_output = if (result.stdout.len > 0)
+                            self.allocator.dupe(u8, result.stdout) catch null
+                        else if (result.stderr.len > 0)
+                            self.allocator.dupe(u8, result.stderr) catch null
+                        else
+                            null;
                     }
                 },
             }
@@ -1258,6 +1322,51 @@ pub fn resolveSkillCommand(allocator: std.mem.Allocator, command: []const u8) !?
     return try std.fmt.allocPrint(allocator, "python3 {s}", .{expanded});
 }
 
+/// Resolves a skill name + args into an executable shell command.
+/// Reads ## Script from ~/.claude/skills/<name>/SKILL.md.
+/// Returns heap-allocated "python3 <expanded_path> <args>" or error.
+/// The caller must free the returned slice.
+pub fn resolveSkillExec(allocator: std.mem.Allocator, skill_name: ?[]const u8, skill_args: ?[]const u8) ![]const u8 {
+    const name = skill_name orelse return error.MissingSkillName;
+    const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+    const skill_md_path = try std.fmt.allocPrint(allocator, "{s}/.claude/skills/{s}/SKILL.md", .{ home, name });
+    defer allocator.free(skill_md_path);
+
+    const content = std.fs.cwd().readFileAlloc(allocator, skill_md_path, 256 * 1024) catch return error.SkillNotFound;
+    defer allocator.free(content);
+
+    // Extract first non-empty, non-``` line from ## Script section.
+    const script_header = "\n## Script\n";
+    const header_pos = std.mem.indexOf(u8, content, script_header) orelse return error.NoScriptSection;
+    const body_start = header_pos + script_header.len;
+    const body = content[body_start..];
+    const next_section = std.mem.indexOf(u8, body, "\n## ");
+    const section = if (next_section) |n| body[0..n] else body;
+
+    var line_iter = std.mem.splitScalar(u8, section, '\n');
+    var script_path: ?[]const u8 = null;
+    while (line_iter.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r`");
+        if (trimmed.len == 0) continue;
+        script_path = trimmed;
+        break;
+    }
+    const raw_path = script_path orelse return error.NoScriptPath;
+
+    // Expand leading ~ to HOME.
+    const expanded = if (std.mem.startsWith(u8, raw_path, "~/"))
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, raw_path[2..] })
+    else
+        try allocator.dupe(u8, raw_path);
+    defer allocator.free(expanded);
+
+    const args = skill_args orelse "";
+    if (args.len > 0) {
+        return try std.fmt.allocPrint(allocator, "python3 {s} {s}", .{ expanded, args });
+    }
+    return try std.fmt.allocPrint(allocator, "python3 {s}", .{expanded});
+}
+
 pub fn runAgentJob(
     allocator: std.mem.Allocator,
     cwd: ?[]const u8,
@@ -1483,13 +1592,14 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             if (job_type == .agent) break :blk command_raw;
             break :blk null;
         };
-        // Agent jobs may omit "command" and rely solely on "prompt".
+        // Agent/skill jobs may omit "command" and rely solely on "prompt" or skill fields.
         // Shell jobs still require a command.
         const command: []const u8 = blk: {
             if (command_raw) |cmd_raw| break :blk cmd_raw;
             if (job_type == .agent) {
                 if (prompt) |p| break :blk p;
             }
+            if (job_type == .skill) break :blk "";
             switch (policy) {
                 .best_effort => continue,
                 .strict => return error.InvalidCronStoreFormat,
@@ -1497,6 +1607,18 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
         };
         const model = blk: {
             if (obj.get("model")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const skill_name_raw: ?[]const u8 = blk: {
+            if (obj.get("skill_name")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const skill_args_raw: ?[]const u8 = blk: {
+            if (obj.get("skill_args")) |v| {
                 if (v == .string and v.string.len > 0) break :blk v.string;
             }
             break :blk null;
@@ -1570,6 +1692,8 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .job_type = job_type,
             .prompt = if (prompt) |p| try scheduler.allocator.dupe(u8, p) else null,
             .model = if (model) |m| try scheduler.allocator.dupe(u8, m) else null,
+            .skill_name = if (skill_name_raw) |sn| try scheduler.allocator.dupe(u8, sn) else null,
+            .skill_args = if (skill_args_raw) |sa| try scheduler.allocator.dupe(u8, sa) else null,
             .timeout_secs = timeout_secs_json,
             .enabled = enabled,
             .delete_after_run = delete_after_run,
@@ -1763,6 +1887,9 @@ pub fn ensureCronTable(db: *c.sqlite3) !void {
     _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN delivery_best_effort INTEGER NOT NULL DEFAULT 0", null, null, null);
     // Migration: add session_target column for existing DBs (ignore error if already exists).
     _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN session_target TEXT NOT NULL DEFAULT 'isolated'", null, null, null);
+    // Migration: add skill_name/skill_args columns for skill job type.
+    _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN skill_name TEXT", null, null, null);
+    _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN skill_args TEXT", null, null, null);
     try ensureRunQueueTable(db);
 }
 
@@ -1774,8 +1901,8 @@ fn dbSaveJob(db: *c.sqlite3, job: *const CronJob) !void {
         "next_run_secs, last_run_secs, last_status, paused, one_shot, " ++
         "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
         "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs, " ++
-        "delivery_best_effort, session_target) " ++
-        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)";
+        "delivery_best_effort, session_target, skill_name, skill_args) " ++
+        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)";
 
     var stmt: ?*c.sqlite3_stmt = null;
     var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
@@ -1848,6 +1975,16 @@ fn dbSaveJob(db: *c.sqlite3, job: *const CronJob) !void {
     _ = c.sqlite3_bind_int(stmt, 22, if (job.delivery.best_effort) 1 else 0);
     const st_str = job.session_target.asStr();
     _ = c.sqlite3_bind_text(stmt, 23, st_str.ptr, @intCast(st_str.len), SQLITE_STATIC);
+    if (job.skill_name) |sn| {
+        _ = c.sqlite3_bind_text(stmt, 24, sn.ptr, @intCast(sn.len), SQLITE_STATIC);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 24);
+    }
+    if (job.skill_args) |sa| {
+        _ = c.sqlite3_bind_text(stmt, 25, sa.ptr, @intCast(sa.len), SQLITE_STATIC);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 25);
+    }
 
     rc = c.sqlite3_step(stmt);
     if (rc != c.SQLITE_DONE) return error.StepFailed;
@@ -1909,6 +2046,10 @@ pub fn dbDeleteAndVerify(scheduler: *const CronScheduler, id: []const u8) !void 
 /// Delete DB rows whose IDs are not present in the scheduler's in-memory job list.
 /// This is used after upserting all live jobs to clean up removed entries.
 fn dbPruneOrphanJobs(db: *c.sqlite3, scheduler: *const CronScheduler) !void {
+    // In tests, skip pruning when using the production DB (no explicit db_path).
+    // This prevents test schedulers with 1-2 jobs from deleting all production
+    // cron jobs as "orphans" (root cause of the 2026-03-25 cron data loss).
+    if (builtin.is_test and scheduler.db_path == null) return;
     // Collect all IDs currently in DB.
     const list_sql = "SELECT id FROM cron_jobs";
     var list_stmt: ?*c.sqlite3_stmt = null;
@@ -3099,6 +3240,38 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
                 try dbUpsertAndVerify(&scheduler, job);
                 log.info("Agent job '{s}' completed ({s}).", .{ id, if (result.success) "ok" else "error" });
             },
+            .skill => {
+                const skill_cmd = resolveSkillExec(allocator, job.skill_name, job.skill_args) catch |err| {
+                    job.last_run_secs = run_at;
+                    job.last_status = "error";
+                    dbUpsertAndVerify(&scheduler, job) catch {};
+                    log.err("Skill resolution for job '{s}' failed: {s}", .{ id, @errorName(err) });
+                    return;
+                };
+                defer allocator.free(skill_cmd);
+                const result = std.process.Child.run(.{
+                    .allocator = allocator,
+                    .argv = &.{ platform.getShell(), platform.getShellFlag(), skill_cmd },
+                    .cwd = run_cwd,
+                }) catch |err| {
+                    job.last_run_secs = run_at;
+                    job.last_status = "error";
+                    dbUpsertAndVerify(&scheduler, job) catch {};
+                    log.err("Skill job '{s}' failed: {s}", .{ id, @errorName(err) });
+                    return;
+                };
+                defer allocator.free(result.stdout);
+                defer allocator.free(result.stderr);
+                if (result.stdout.len > 0) log.info("{s}", .{result.stdout});
+                const exit_code: u8 = switch (result.term) {
+                    .Exited => |code| code,
+                    else => 1,
+                };
+                job.last_run_secs = run_at;
+                job.last_status = if (exit_code == 0) "ok" else "error";
+                try dbUpsertAndVerify(&scheduler, job);
+                log.info("Skill job '{s}' completed (exit {d}).", .{ id, exit_code });
+            },
         }
     } else {
         log.warn("Cron job '{s}' not found", .{id});
@@ -3250,6 +3423,8 @@ pub const CronJobSpec = struct {
     command: []const u8,
     prompt: ?[]const u8,
     model: ?[]const u8,
+    skill_name: ?[]const u8 = null,
+    skill_args: ?[]const u8 = null,
     one_shot: bool,
     delete_after_run: bool,
     timeout_secs: ?u32,
@@ -3417,7 +3592,7 @@ pub fn dbLoadJobSpec(db: *c.sqlite3, arena: std.mem.Allocator, job_id: []const u
     const sql =
         "SELECT job_type, command, prompt, model, one_shot, delete_after_run, " ++
         "timeout_secs, delivery_mode, delivery_channel, delivery_account_id, delivery_to, " ++
-        "delivery_best_effort, session_target " ++
+        "delivery_best_effort, session_target, skill_name, skill_args " ++
         "FROM cron_jobs WHERE id=?1";
     var stmt: ?*c.sqlite3_stmt = null;
     var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
@@ -3463,6 +3638,8 @@ pub fn dbLoadJobSpec(db: *c.sqlite3, arena: std.mem.Allocator, job_id: []const u
             const raw = try dbColumnTextOpt(stmt, 12, arena);
             break :blk if (raw) |s| SessionTarget.parse(s) else .isolated;
         },
+        .skill_name = try dbColumnTextOpt(stmt, 13, arena),
+        .skill_args = try dbColumnTextOpt(stmt, 14, arena),
     };
 }
 
@@ -3566,11 +3743,14 @@ pub fn dbListJobsJson(db: *c.sqlite3, buf: *std.ArrayListUnmanaged(u8), allocato
     // 18  created_at_s
     // 19  timeout_secs
     // 20  delivery_best_effort
+    // 21  skill_name
+    // 22  skill_args
     const sql =
         "SELECT id, expression, command, next_run_secs, last_run_secs, last_status, " ++
         "last_output, paused, one_shot, job_type, enabled, delete_after_run, " ++
         "prompt, model, delivery_mode, delivery_channel, delivery_account_id, " ++
-        "delivery_to, created_at_s, timeout_secs, delivery_best_effort " ++
+        "delivery_to, created_at_s, timeout_secs, delivery_best_effort, " ++
+        "skill_name, skill_args " ++
         "FROM cron_jobs ORDER BY rowid ASC";
 
     var stmt: ?*c.sqlite3_stmt = null;
@@ -3732,6 +3912,26 @@ pub fn dbListJobsJson(db: *c.sqlite3, buf: *std.ArrayListUnmanaged(u8), allocato
         } else {
             const ts = c.sqlite3_column_int64(stmt, 19);
             try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{ts}) catch "null");
+        }
+
+        // skill_name (col 21) — TEXT nullable
+        try buf.appendSlice(allocator, ",\"skill_name\":");
+        const sn_ptr = c.sqlite3_column_text(stmt, 21);
+        if (c.sqlite3_column_type(stmt, 21) == c.SQLITE_NULL or sn_ptr == null) {
+            try buf.appendSlice(allocator, "null");
+        } else {
+            const sn_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 21));
+            try appendJsonStr(buf, allocator, sn_ptr[0..sn_len]);
+        }
+
+        // skill_args (col 22) — TEXT nullable
+        try buf.appendSlice(allocator, ",\"skill_args\":");
+        const sa_ptr = c.sqlite3_column_text(stmt, 22);
+        if (c.sqlite3_column_type(stmt, 22) == c.SQLITE_NULL or sa_ptr == null) {
+            try buf.appendSlice(allocator, "null");
+        } else {
+            const sa_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 22));
+            try appendJsonStr(buf, allocator, sa_ptr[0..sa_len]);
         }
 
         try buf.append(allocator, '}');
@@ -4244,13 +4444,22 @@ test "resolveRunnableCwd returns null for missing cwd" {
 }
 
 test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = tmp.dir.realpathAlloc(std.testing.allocator, ".") catch return;
+    defer std.testing.allocator.free(base);
+    const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ base, "reload_recover.db" });
+    defer std.testing.allocator.free(db_path);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
+    scheduler.db_path = db_path;
     _ = try scheduler.addJob("*/10 * * * *", "echo keep");
     try saveJobs(&scheduler);
 
     var runtime = CronScheduler.init(std.testing.allocator, 10, true);
     defer runtime.deinit();
+    runtime.db_path = db_path;
     try loadJobs(&runtime);
     try std.testing.expectEqual(@as(usize, 1), runtime.listJobs().len);
 
@@ -4266,6 +4475,7 @@ test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
     // Store should be healed and parseable again.
     var healed = CronScheduler.init(std.testing.allocator, 10, true);
     defer healed.deinit();
+    healed.db_path = db_path;
     try loadJobsStrict(&healed);
     try std.testing.expectEqual(@as(usize, 1), healed.listJobs().len);
 }

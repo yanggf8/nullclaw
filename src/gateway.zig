@@ -2573,6 +2573,10 @@ fn appendCronJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Alloca
     } else {
         try buf.appendSlice(allocator, "null");
     }
+    try buf.appendSlice(allocator, ",\"skill_name\":");
+    if (job.skill_name) |sn| try appendJsonStringBuf(buf, allocator, sn) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"skill_args\":");
+    if (job.skill_args) |sa| try appendJsonStringBuf(buf, allocator, sa) else try buf.appendSlice(allocator, "null");
     try buf.appendSlice(allocator, "}");
 }
 
@@ -2634,6 +2638,10 @@ fn appendCronBackendJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem
     } else {
         try buf.appendSlice(allocator, "null");
     }
+    try buf.appendSlice(allocator, ",\"skill_name\":");
+    if (job.skill_name) |sn| try appendJsonStringBuf(buf, allocator, sn) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"skill_args\":");
+    if (job.skill_args) |sa| try appendJsonStringBuf(buf, allocator, sa) else try buf.appendSlice(allocator, "null");
     try buf.appendSlice(allocator, "}");
 }
 
@@ -2758,6 +2766,9 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
     const delivery_best_effort = cronObjectBoolField(obj, "delivery_best_effort") orelse true;
     const one_shot_opt = cronObjectBoolField(obj, "one_shot");
     const enabled_add_opt = cronObjectBoolField(obj, "enabled");
+    const job_type_opt = cronObjectStringField(obj, "job_type");
+    const skill_name_opt = cronObjectStringField(obj, "skill_name");
+    const skill_args_opt = cronObjectStringField(obj, "skill_args");
     const timeout_secs_add: ?u32 = blk: {
         const v = jsonIntField(body, "timeout_secs") orelse break :blk null;
         if (v <= 0) break :blk null;
@@ -2806,13 +2817,25 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
             .best_effort = delivery_best_effort,
         };
 
+        // Determine job_type: explicit "skill" wins, then infer from fields.
+        const db_job_type: cron_backend_mod.JobType = if (job_type_opt) |jt|
+            cron_backend_mod.JobType.parse(jt)
+        else if (skill_name_opt != null)
+            .skill
+        else if (prompt_opt != null)
+            .agent
+        else
+            .shell;
+
         const spec = cron_backend_mod.NewJobSpec{
             .expression = expr,
-            .job_type = if (prompt_opt != null) .agent else .shell,
+            .job_type = db_job_type,
             .command = cmd,
             .prompt = prompt_opt,
             .name = name_add_opt,
             .model = model_opt,
+            .skill_name = skill_name_opt,
+            .skill_args = skill_args_opt,
             .one_shot = one_shot_opt orelse (delay_opt != null),
             .delete_after_run = one_shot_opt orelse (delay_opt != null),
             .enabled = enabled_add_opt orelse true,
@@ -2935,6 +2958,16 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
     }
     if (name_add_opt) |n| {
         job_ptr.name = sched.allocator.dupe(u8, n) catch null;
+    }
+    if (skill_name_opt) |sn| {
+        job_ptr.skill_name = sched.allocator.dupe(u8, sn) catch null;
+        job_ptr.job_type = .skill;
+    }
+    if (skill_args_opt) |sa| {
+        job_ptr.skill_args = sched.allocator.dupe(u8, sa) catch null;
+    }
+    if (job_type_opt) |jt| {
+        job_ptr.job_type = cron_mod.JobType.parse(jt);
     }
     // Apply delivery config for shell expression-path jobs (addJob doesn't accept delivery).
     // Strings must be duped into the scheduler allocator — delivery_*_opt point into
@@ -3218,6 +3251,8 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
     };
 
     const next_run_secs_opt: ?i64 = jsonIntField(body, "next_run_secs");
+    const skill_name_upd = cronObjectStringField(obj, "skill_name");
+    const skill_args_upd = cronObjectStringField(obj, "skill_args");
 
     // ── DB-direct path ────────────────────────────────────────────────
     if (ctx.state.cron_db_backend) |*be| {
@@ -3227,6 +3262,8 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
             .prompt = prompt,
             .name = name,
             .model = model,
+            .skill_name = skill_name_upd,
+            .skill_args = skill_args_upd,
             .enabled = enabled_opt,
             .delivery_channel = delivery_channel,
             .delivery_to = delivery_to,
@@ -3261,6 +3298,8 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
         .prompt = prompt,
         .name = name,
         .model = model,
+        .skill_name = skill_name_upd,
+        .skill_args = skill_args_upd,
         .enabled = enabled_opt,
         .delivery_channel = delivery_channel,
         .delivery_to = delivery_to,
@@ -3647,7 +3686,12 @@ fn runQueueWorker(state: *GatewayState) void {
                     var shell_stderr: std.ArrayList(u8) = .empty;
                     defer shell_stderr.deinit(arena);
                     const shell_timed_out = cron_mod.collectChildOutputWithTimeout(
-                        &shell_child, arena, &shell_stdout, &shell_stderr, timeout, shell_start_ns,
+                        &shell_child,
+                        arena,
+                        &shell_stdout,
+                        &shell_stderr,
+                        timeout,
+                        shell_start_ns,
                     ) catch |err| {
                         log.err("[{s}] collect failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false);
@@ -3677,8 +3721,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         }
                     }
                     const status = if (success) "ok" else "error";
-                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, status,
-                        if (raw_output.len > 0) raw_output else null, spec.delete_after_run, delivered);
+                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, status, if (raw_output.len > 0) raw_output else null, spec.delete_after_run, delivered);
                     log.info("[{s}] completed ({s})", .{ spec.id, status });
                 },
                 .agent => {
@@ -3705,9 +3748,67 @@ fn runQueueWorker(state: *GatewayState) void {
                         }
                     }
                     const status = if (agent_result.success) "ok" else "error";
-                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, status,
-                        if (raw_agent.len > 0) raw_agent else null, spec.delete_after_run, delivered);
+                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, status, if (raw_agent.len > 0) raw_agent else null, spec.delete_after_run, delivered);
                     log.info("[{s}] completed ({s})", .{ spec.id, status });
+                },
+                .skill => {
+                    // Skill jobs own their entire workflow including delivery.
+                    // Cron only triggers and records status.
+                    const skill_cmd = cron_mod.resolveSkillExec(arena, spec.skill_name, spec.skill_args) catch |err| {
+                        log.err("[{s}] skill resolution failed: {s}", .{ spec.id, @errorName(err) });
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false);
+                        continue;
+                    };
+                    defer arena.free(skill_cmd);
+                    var skill_child = std.process.Child.init(
+                        &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), skill_cmd },
+                        arena,
+                    );
+                    skill_child.stdin_behavior = .Ignore;
+                    skill_child.stdout_behavior = .Pipe;
+                    skill_child.stderr_behavior = .Pipe;
+                    skill_child.spawn() catch |err| {
+                        log.err("[{s}] skill exec failed: {s}", .{ spec.id, @errorName(err) });
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false);
+                        continue;
+                    };
+                    errdefer {
+                        _ = skill_child.kill() catch {};
+                        _ = skill_child.wait() catch {};
+                    }
+                    const skill_start_ns = std.time.nanoTimestamp();
+                    var skill_stdout: std.ArrayList(u8) = .empty;
+                    defer skill_stdout.deinit(arena);
+                    var skill_stderr: std.ArrayList(u8) = .empty;
+                    defer skill_stderr.deinit(arena);
+                    const skill_timed_out = cron_mod.collectChildOutputWithTimeout(
+                        &skill_child,
+                        arena,
+                        &skill_stdout,
+                        &skill_stderr,
+                        timeout,
+                        skill_start_ns,
+                    ) catch |err| {
+                        log.err("[{s}] skill collect failed: {s}", .{ spec.id, @errorName(err) });
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false);
+                        continue;
+                    };
+                    const skill_term = skill_child.wait() catch |err| {
+                        log.err("[{s}] skill wait failed: {s}", .{ spec.id, @errorName(err) });
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false);
+                        continue;
+                    };
+                    if (skill_timed_out) log.warn("[{s}] skill timed out after {d}s", .{ spec.id, timeout });
+                    const skill_exit: u8 = switch (skill_term) {
+                        .Exited => |ec| ec,
+                        else => 1,
+                    };
+                    const skill_ok = !skill_timed_out and skill_exit == 0;
+                    const skill_output = if (skill_stdout.items.len > 0) skill_stdout.items else skill_stderr.items;
+                    const skill_status = if (skill_ok) "ok" else "error";
+                    // Skills self-deliver — no cron delivery needed.
+                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, skill_status, if (skill_output.len > 0) skill_output else null, spec.delete_after_run, false);
+                    log.info("[{s}] skill completed ({s})", .{ spec.id, skill_status });
                 },
             }
         } else {
@@ -3735,7 +3836,7 @@ fn runQueueWorker(state: *GatewayState) void {
                 };
             };
 
-            const job_type, const command, const prompt, const model, const delivery, const run_cwd = j: {
+            const job_type, const command, const prompt, const model, const delivery, const run_cwd, const skill_name_leg, const skill_args_leg = j: {
                 state.scheduler_mutex.lock();
                 defer state.scheduler_mutex.unlock();
                 const job = sched.getMutableJob(id) orelse {
@@ -3749,6 +3850,8 @@ fn runQueueWorker(state: *GatewayState) void {
                 const owned_command = allocator.dupe(u8, job.command) catch job.command;
                 const owned_prompt = if (job.prompt) |p| allocator.dupe(u8, p) catch p else null;
                 const owned_model = if (job.model) |m| allocator.dupe(u8, m) catch m else null;
+                const owned_sn: ?[]const u8 = if (job.skill_name) |sn| allocator.dupe(u8, sn) catch sn else null;
+                const owned_sa: ?[]const u8 = if (job.skill_args) |sa| allocator.dupe(u8, sa) catch sa else null;
                 var owned_delivery = job.delivery;
                 owned_delivery.channel_owned = false;
                 owned_delivery.account_id_owned = false;
@@ -3756,7 +3859,7 @@ fn runQueueWorker(state: *GatewayState) void {
                 if (job.delivery.channel) |ch| owned_delivery.channel = allocator.dupe(u8, ch) catch ch;
                 if (job.delivery.account_id) |aid| owned_delivery.account_id = allocator.dupe(u8, aid) catch aid;
                 if (job.delivery.to) |t| owned_delivery.to = allocator.dupe(u8, t) catch t;
-                break :j .{ job.job_type, owned_command, owned_prompt, owned_model, owned_delivery, cwd };
+                break :j .{ job.job_type, owned_command, owned_prompt, owned_model, owned_delivery, cwd, owned_sn, owned_sa };
             };
 
             const now = std.time.timestamp();
@@ -3782,23 +3885,37 @@ fn runQueueWorker(state: *GatewayState) void {
                     shell_child.spawn() catch |err| {
                         log.err("job '{s}' exec failed: {s}", .{ id, @errorName(err) });
                         state.scheduler_mutex.lock();
-                        if (sched.getMutableJob(id)) |j| { j.last_run_secs = now; j.last_status = "error"; }
+                        if (sched.getMutableJob(id)) |j| {
+                            j.last_run_secs = now;
+                            j.last_status = "error";
+                        }
                         state.scheduler_mutex.unlock();
                         _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
                         continue;
                     };
-                    errdefer { _ = shell_child.kill() catch {}; _ = shell_child.wait() catch {}; }
+                    errdefer {
+                        _ = shell_child.kill() catch {};
+                        _ = shell_child.wait() catch {};
+                    }
                     const shell_start_ns = std.time.nanoTimestamp();
                     var shell_stdout: std.ArrayList(u8) = .empty;
                     defer shell_stdout.deinit(allocator);
                     var shell_stderr: std.ArrayList(u8) = .empty;
                     defer shell_stderr.deinit(allocator);
                     const shell_timed_out = cron_mod.collectChildOutputWithTimeout(
-                        &shell_child, allocator, &shell_stdout, &shell_stderr, timeout, shell_start_ns,
+                        &shell_child,
+                        allocator,
+                        &shell_stdout,
+                        &shell_stderr,
+                        timeout,
+                        shell_start_ns,
                     ) catch |err| {
                         log.err("job '{s}' collect failed: {s}", .{ id, @errorName(err) });
                         state.scheduler_mutex.lock();
-                        if (sched.getMutableJob(id)) |j| { j.last_run_secs = now; j.last_status = "error"; }
+                        if (sched.getMutableJob(id)) |j| {
+                            j.last_run_secs = now;
+                            j.last_status = "error";
+                        }
                         state.scheduler_mutex.unlock();
                         _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
                         continue;
@@ -3806,13 +3923,19 @@ fn runQueueWorker(state: *GatewayState) void {
                     const shell_term = shell_child.wait() catch |err| {
                         log.err("job '{s}' wait failed: {s}", .{ id, @errorName(err) });
                         state.scheduler_mutex.lock();
-                        if (sched.getMutableJob(id)) |j| { j.last_run_secs = now; j.last_status = "error"; }
+                        if (sched.getMutableJob(id)) |j| {
+                            j.last_run_secs = now;
+                            j.last_status = "error";
+                        }
                         state.scheduler_mutex.unlock();
                         _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
                         continue;
                     };
                     if (shell_timed_out) log.warn("job '{s}' shell command timed out after {d}s", .{ id, timeout });
-                    const exit_code: u8 = switch (shell_term) { .Exited => |ec| ec, else => 1 };
+                    const exit_code: u8 = switch (shell_term) {
+                        .Exited => |ec| ec,
+                        else => 1,
+                    };
                     const success = !shell_timed_out and exit_code == 0;
                     const raw_output = if (shell_stdout.items.len > 0) shell_stdout.items else shell_stderr.items;
                     const output = std.fmt.allocPrint(allocator, "{s}\n\n`{s}`", .{ raw_output, id }) catch raw_output;
@@ -3847,7 +3970,10 @@ fn runQueueWorker(state: *GatewayState) void {
                     const agent_result = cron_mod.runAgentJob(allocator, run_cwd, p, model, timeout) catch |err| {
                         log.err("[{s}] agent failed: {s}", .{ id, @errorName(err) });
                         state.scheduler_mutex.lock();
-                        if (sched.getMutableJob(id)) |j| { j.last_run_secs = now; j.last_status = "error"; }
+                        if (sched.getMutableJob(id)) |j| {
+                            j.last_run_secs = now;
+                            j.last_status = "error";
+                        }
                         state.scheduler_mutex.unlock();
                         _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
                         continue;
@@ -3880,6 +4006,101 @@ fn runQueueWorker(state: *GatewayState) void {
                         continue;
                     }) catch |err| log.err("[{s}] db persist failed: {s}", .{ id, @errorName(err) });
                     log.info("[{s}] completed ({s})", .{ id, if (agent_result.success) "ok" else "error" });
+                },
+                .skill => {
+                    // Skill jobs: resolve via SKILL.md and run as subprocess.
+                    const skill_cmd = cron_mod.resolveSkillExec(allocator, skill_name_leg, skill_args_leg) catch |err| {
+                        log.err("[{s}] skill resolution failed: {s}", .{ id, @errorName(err) });
+                        state.scheduler_mutex.lock();
+                        if (sched.getMutableJob(id)) |j| {
+                            j.last_run_secs = now;
+                            j.last_status = "error";
+                        }
+                        state.scheduler_mutex.unlock();
+                        _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
+                        continue;
+                    };
+                    defer allocator.free(skill_cmd);
+                    var skill_child = std.process.Child.init(
+                        &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), skill_cmd },
+                        allocator,
+                    );
+                    skill_child.stdin_behavior = .Ignore;
+                    skill_child.stdout_behavior = .Pipe;
+                    skill_child.stderr_behavior = .Pipe;
+                    skill_child.cwd = run_cwd;
+                    skill_child.spawn() catch |err| {
+                        log.err("[{s}] skill exec failed: {s}", .{ id, @errorName(err) });
+                        state.scheduler_mutex.lock();
+                        if (sched.getMutableJob(id)) |j| {
+                            j.last_run_secs = now;
+                            j.last_status = "error";
+                        }
+                        state.scheduler_mutex.unlock();
+                        _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
+                        continue;
+                    };
+                    errdefer {
+                        _ = skill_child.kill() catch {};
+                        _ = skill_child.wait() catch {};
+                    }
+                    const skill_start_ns = std.time.nanoTimestamp();
+                    var skill_stdout: std.ArrayList(u8) = .empty;
+                    defer skill_stdout.deinit(allocator);
+                    var skill_stderr: std.ArrayList(u8) = .empty;
+                    defer skill_stderr.deinit(allocator);
+                    const skill_timed_out = cron_mod.collectChildOutputWithTimeout(
+                        &skill_child,
+                        allocator,
+                        &skill_stdout,
+                        &skill_stderr,
+                        timeout,
+                        skill_start_ns,
+                    ) catch |err| {
+                        log.err("[{s}] skill collect failed: {s}", .{ id, @errorName(err) });
+                        state.scheduler_mutex.lock();
+                        if (sched.getMutableJob(id)) |j| {
+                            j.last_run_secs = now;
+                            j.last_status = "error";
+                        }
+                        state.scheduler_mutex.unlock();
+                        _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
+                        continue;
+                    };
+                    const skill_term = skill_child.wait() catch |err| {
+                        log.err("[{s}] skill wait failed: {s}", .{ id, @errorName(err) });
+                        state.scheduler_mutex.lock();
+                        if (sched.getMutableJob(id)) |j| {
+                            j.last_run_secs = now;
+                            j.last_status = "error";
+                        }
+                        state.scheduler_mutex.unlock();
+                        _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
+                        continue;
+                    };
+                    if (skill_timed_out) log.warn("[{s}] skill timed out after {d}s", .{ id, timeout });
+                    const skill_exit: u8 = switch (skill_term) {
+                        .Exited => |ec| ec,
+                        else => 1,
+                    };
+                    const skill_ok = !skill_timed_out and skill_exit == 0;
+                    const skill_output = if (skill_stdout.items.len > 0) skill_stdout.items else skill_stderr.items;
+                    {
+                        state.scheduler_mutex.lock();
+                        if (sched.getMutableJob(id)) |j| {
+                            j.last_run_secs = now;
+                            j.last_status = if (skill_ok) "ok" else "error";
+                            if (j.last_output) |old| sched.allocator.free(old);
+                            j.last_output = if (skill_output.len > 0) sched.allocator.dupe(u8, skill_output) catch null else null;
+                        }
+                        state.scheduler_mutex.unlock();
+                    }
+                    // Skills self-deliver — no cron delivery.
+                    _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse {
+                        log.info("[{s}] skill completed ({s})", .{ id, if (skill_ok) "ok" else "error" });
+                        continue;
+                    }) catch |err| log.err("[{s}] db persist failed: {s}", .{ id, @errorName(err) });
+                    log.info("[{s}] skill completed ({s})", .{ id, if (skill_ok) "ok" else "error" });
                 },
             }
         }

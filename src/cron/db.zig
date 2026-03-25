@@ -114,6 +114,8 @@ pub const DbCronBackend = struct {
             .prompt = if (spec.prompt) |p| try allocator.dupe(u8, p) else null,
             .name = if (spec.name) |n| try allocator.dupe(u8, n) else null,
             .model = if (spec.model) |m| try allocator.dupe(u8, m) else null,
+            .skill_name = if (spec.skill_name) |sn| try allocator.dupe(u8, sn) else null,
+            .skill_args = if (spec.skill_args) |sa| try allocator.dupe(u8, sa) else null,
             .job_type = spec.job_type,
             .session_target = spec.session_target,
             .one_shot = spec.one_shot,
@@ -133,6 +135,8 @@ pub const DbCronBackend = struct {
             .prompt = job.prompt,
             .name = job.name,
             .model = job.model,
+            .skill_name = job.skill_name,
+            .skill_args = job.skill_args,
             .job_type = @enumFromInt(@intFromEnum(job.job_type)),
             .session_target = @enumFromInt(@intFromEnum(job.session_target)),
             .one_shot = job.one_shot,
@@ -461,6 +465,26 @@ fn dbApplyPatch(db: *c.sqlite3, id: []const u8, patch: types.CronJobPatch) !void
             _ = c.sqlite3_finalize(s);
         }
     }
+    if (patch.skill_name) |sn| {
+        const sql = "UPDATE cron_jobs SET skill_name=?1 WHERE id=?2";
+        var s: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
+            _ = c.sqlite3_bind_text(s, 1, sn.ptr, @intCast(sn.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
+            _ = c.sqlite3_step(s);
+            _ = c.sqlite3_finalize(s);
+        }
+    }
+    if (patch.skill_args) |sa| {
+        const sql = "UPDATE cron_jobs SET skill_args=?1 WHERE id=?2";
+        var s: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
+            _ = c.sqlite3_bind_text(s, 1, sa.ptr, @intCast(sa.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
+            _ = c.sqlite3_step(s);
+            _ = c.sqlite3_finalize(s);
+        }
+    }
 }
 
 /// Load a full CronJob by ID (includes all columns + last_output).
@@ -471,7 +495,7 @@ fn dbLoadJobFull(db: *c.sqlite3, allocator: std.mem.Allocator, id: []const u8) !
         "next_run_secs, last_run_secs, last_status, paused, one_shot, " ++
         "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
         "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs, " ++
-        "delivery_best_effort, session_target " ++
+        "delivery_best_effort, session_target, skill_name, skill_args " ++
         "FROM cron_jobs WHERE id=?1";
 
     var stmt: ?*c.sqlite3_stmt = null;
@@ -524,6 +548,8 @@ fn dbLoadJobFull(db: *c.sqlite3, allocator: std.mem.Allocator, id: []const u8) !
             break :blk @intCast(v);
         },
         .session_target = if (st_raw) |s| types.SessionTarget.parse(s) else .isolated,
+        .skill_name = try colTextOpt(stmt, 23, allocator),
+        .skill_args = try colTextOpt(stmt, 24, allocator),
     };
 }
 
@@ -532,7 +558,7 @@ fn dbStreamSummaries(db: *c.sqlite3, allocator: std.mem.Allocator, visitor: root
     const sql =
         "SELECT id, expression, name, job_type, next_run_secs, last_run_secs, last_status, " ++
         "paused, enabled, one_shot, delete_after_run, delivery_mode, delivery_channel, " ++
-        "delivery_to, created_at_s, timeout_secs " ++
+        "delivery_to, created_at_s, timeout_secs, skill_name, skill_args " ++
         "FROM cron_jobs ORDER BY rowid ASC";
 
     var stmt: ?*c.sqlite3_stmt = null;
@@ -588,6 +614,10 @@ fn dbStreamSummaries(db: *c.sqlite3, allocator: std.mem.Allocator, visitor: root
         defer if (to_opt) |s| allocator.free(s);
         const ls_opt = try colTextOpt(stmt, 6, allocator);
         defer if (ls_opt) |s| allocator.free(s);
+        const sn_opt = try colTextOpt(stmt, 16, allocator);
+        defer if (sn_opt) |s| allocator.free(s);
+        const sa_opt = try colTextOpt(stmt, 17, allocator);
+        defer if (sa_opt) |s| allocator.free(s);
 
         const summary = types.CronJobSummary{
             .id = id_ptr[0..id_len],
@@ -614,6 +644,8 @@ fn dbStreamSummaries(db: *c.sqlite3, allocator: std.mem.Allocator, visitor: root
                 if (v <= 0) break :blk null;
                 break :blk @intCast(v);
             },
+            .skill_name = sn_opt,
+            .skill_args = sa_opt,
         };
         try visitor.visit(visitor.ptr, summary);
     }
@@ -714,6 +746,8 @@ fn dbAtomicDequeue(db: *c.sqlite3, allocator: std.mem.Allocator) !?types.Dequeue
             .command = legacy_spec.command,
             .prompt = legacy_spec.prompt,
             .model = legacy_spec.model,
+            .skill_name = legacy_spec.skill_name,
+            .skill_args = legacy_spec.skill_args,
             .one_shot = legacy_spec.one_shot,
             .delete_after_run = legacy_spec.delete_after_run,
             .timeout_secs = legacy_spec.timeout_secs,
@@ -760,8 +794,8 @@ fn dbSaveJobDirect(db: *c.sqlite3, job: *const cron.CronJob) !void {
         "next_run_secs, last_run_secs, last_status, paused, one_shot, " ++
         "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
         "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs, " ++
-        "delivery_best_effort, session_target) " ++
-        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)";
+        "delivery_best_effort, session_target, skill_name, skill_args) " ++
+        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)";
     var stmt: ?*c.sqlite3_stmt = null;
     var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
     if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -793,6 +827,8 @@ fn dbSaveJobDirect(db: *c.sqlite3, job: *const cron.CronJob) !void {
     _ = c.sqlite3_bind_int(stmt, 22, if (job.delivery.best_effort) 1 else 0);
     const st = job.session_target.asStr();
     _ = c.sqlite3_bind_text(stmt, 23, st.ptr, @intCast(st.len), SQLITE_STATIC);
+    if (job.skill_name) |sn| _ = c.sqlite3_bind_text(stmt, 24, sn.ptr, @intCast(sn.len), SQLITE_STATIC) else _ = c.sqlite3_bind_null(stmt, 24);
+    if (job.skill_args) |sa| _ = c.sqlite3_bind_text(stmt, 25, sa.ptr, @intCast(sa.len), SQLITE_STATIC) else _ = c.sqlite3_bind_null(stmt, 25);
 
     rc = c.sqlite3_step(stmt);
     if (rc != c.SQLITE_DONE) return error.StepFailed;
@@ -1106,4 +1142,100 @@ test "DbCronBackend listRows visitor" {
     };
     try be.listRows(allocator, visitor);
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "DbCronBackend jobs survive bounce — add, reopen, remove, reopen" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/bounce.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    // Phase 1: seed 3 jobs, close the backend (simulate shutdown).
+    var added_id: []const u8 = undefined;
+    {
+        var be1 = try DbCronBackend.init(allocator, db_path_z);
+        defer be1.deinit();
+        const iface1 = be1.backend();
+        for ([_][]const u8{ "echo a", "echo b", "echo c" }) |cmd| {
+            const j = try iface1.add(allocator, .{ .expression = "* * * * *", .command = cmd });
+            allocator.free(j.id);
+            allocator.free(j.expression);
+            allocator.free(j.command);
+        }
+    }
+
+    // Phase 2: reopen (bounce), verify 3 jobs survived, add 1 more.
+    {
+        var be2 = try DbCronBackend.init(allocator, db_path_z);
+        defer be2.deinit();
+        const iface2 = be2.backend();
+
+        var count: usize = 0;
+        const counter = root.CronBackend.RowVisitor{
+            .ptr = &count,
+            .visit = struct {
+                fn f(ptr: *anyopaque, _: types.CronJobSummary) anyerror!void {
+                    const c_ptr: *usize = @ptrCast(@alignCast(ptr));
+                    c_ptr.* += 1;
+                }
+            }.f,
+        };
+        try iface2.listRows(allocator, counter);
+        try std.testing.expectEqual(@as(usize, 3), count);
+
+        const extra = try iface2.add(allocator, .{ .expression = "*/5 * * * *", .command = "echo test-bounce" });
+        added_id = try allocator.dupe(u8, extra.id);
+        allocator.free(extra.id);
+        allocator.free(extra.expression);
+        allocator.free(extra.command);
+    }
+    defer allocator.free(added_id);
+
+    // Phase 3: reopen (bounce), verify 4 jobs, remove the added one.
+    {
+        var be3 = try DbCronBackend.init(allocator, db_path_z);
+        defer be3.deinit();
+        const iface3 = be3.backend();
+
+        var count2: usize = 0;
+        const counter2 = root.CronBackend.RowVisitor{
+            .ptr = &count2,
+            .visit = struct {
+                fn f(ptr: *anyopaque, _: types.CronJobSummary) anyerror!void {
+                    const c_ptr: *usize = @ptrCast(@alignCast(ptr));
+                    c_ptr.* += 1;
+                }
+            }.f,
+        };
+        try iface3.listRows(allocator, counter2);
+        try std.testing.expectEqual(@as(usize, 4), count2);
+
+        try std.testing.expect(try iface3.remove(added_id));
+    }
+
+    // Phase 4: reopen (bounce), verify back to 3 jobs.
+    {
+        var be4 = try DbCronBackend.init(allocator, db_path_z);
+        defer be4.deinit();
+        const iface4 = be4.backend();
+
+        var count3: usize = 0;
+        const counter3 = root.CronBackend.RowVisitor{
+            .ptr = &count3,
+            .visit = struct {
+                fn f(ptr: *anyopaque, _: types.CronJobSummary) anyerror!void {
+                    const c_ptr: *usize = @ptrCast(@alignCast(ptr));
+                    c_ptr.* += 1;
+                }
+            }.f,
+        };
+        try iface4.listRows(allocator, counter3);
+        try std.testing.expectEqual(@as(usize, 3), count3);
+    }
 }

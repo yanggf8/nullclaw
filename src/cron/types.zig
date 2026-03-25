@@ -5,16 +5,19 @@ const std = @import("std");
 pub const JobType = enum {
     shell,
     agent,
+    skill,
 
     pub fn asStr(self: JobType) []const u8 {
         return switch (self) {
             .shell => "shell",
             .agent => "agent",
+            .skill => "skill",
         };
     }
 
     pub fn parse(raw: []const u8) JobType {
         if (std.ascii.eqlIgnoreCase(raw, "agent")) return .agent;
+        if (std.ascii.eqlIgnoreCase(raw, "skill")) return .skill;
         return .shell;
     }
 };
@@ -95,6 +98,8 @@ pub const CronJobPatch = struct {
     name: ?[]const u8 = null,
     enabled: ?bool = null,
     model: ?[]const u8 = null,
+    skill_name: ?[]const u8 = null,
+    skill_args: ?[]const u8 = null,
     delete_after_run: ?bool = null,
     delivery_channel: ?[]const u8 = null,
     delivery_to: ?[]const u8 = null,
@@ -119,6 +124,8 @@ pub const CronJob = struct {
     prompt: ?[]const u8 = null,
     name: ?[]const u8 = null,
     model: ?[]const u8 = null,
+    skill_name: ?[]const u8 = null,
+    skill_args: ?[]const u8 = null,
     timeout_secs: ?u32 = null,
     enabled: bool = true,
     delete_after_run: bool = false,
@@ -136,6 +143,8 @@ pub const CronJobSpec = struct {
     command: []const u8,
     prompt: ?[]const u8,
     model: ?[]const u8,
+    skill_name: ?[]const u8 = null,
+    skill_args: ?[]const u8 = null,
     one_shot: bool,
     delete_after_run: bool,
     timeout_secs: ?u32,
@@ -175,6 +184,8 @@ pub const CronJobSummary = struct {
     delivery_to: ?[]const u8,
     created_at_s: i64,
     timeout_secs: ?u32,
+    skill_name: ?[]const u8 = null,
+    skill_args: ?[]const u8 = null,
 };
 
 /// Parameters for adding a new job. All strings are caller-owned slices.
@@ -185,6 +196,8 @@ pub const NewJobSpec = struct {
     prompt: ?[]const u8 = null,
     name: ?[]const u8 = null,
     model: ?[]const u8 = null,
+    skill_name: ?[]const u8 = null,
+    skill_args: ?[]const u8 = null,
     one_shot: bool = false,
     delete_after_run: bool = false,
     enabled: bool = true,

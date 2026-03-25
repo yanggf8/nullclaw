@@ -106,6 +106,8 @@ pub const MemoryCronBackend = struct {
         if (spec.prompt) |p| job_ptr.prompt = try self.allocator.dupe(u8, p);
         if (spec.name) |n| job_ptr.name = try self.allocator.dupe(u8, n);
         if (spec.model) |m| job_ptr.model = try self.allocator.dupe(u8, m);
+        if (spec.skill_name) |sn| job_ptr.skill_name = try self.allocator.dupe(u8, sn);
+        if (spec.skill_args) |sa| job_ptr.skill_args = try self.allocator.dupe(u8, sa);
         job_ptr.delivery = cron.DeliveryConfig{
             .mode = @enumFromInt(@intFromEnum(spec.delivery.mode)),
             .channel = if (spec.delivery.channel) |ch| try self.allocator.dupe(u8, ch) else null,
@@ -153,6 +155,8 @@ pub const MemoryCronBackend = struct {
             .name = patch.name,
             .enabled = patch.enabled,
             .model = patch.model,
+            .skill_name = patch.skill_name,
+            .skill_args = patch.skill_args,
             .delete_after_run = patch.delete_after_run,
             .delivery_channel = patch.delivery_channel,
             .delivery_to = patch.delivery_to,
@@ -194,6 +198,8 @@ pub const MemoryCronBackend = struct {
                 .delivery_to = job.delivery.to,
                 .created_at_s = job.created_at_s,
                 .timeout_secs = job.timeout_secs,
+                .skill_name = job.skill_name,
+                .skill_args = job.skill_args,
             };
             _ = allocator; // visitor owns any copies it needs
             try visitor.visit(visitor.ptr, summary);
@@ -258,6 +264,8 @@ pub const MemoryCronBackend = struct {
             .command = try allocator.dupe(u8, job.command),
             .prompt = if (job.prompt) |p| try allocator.dupe(u8, p) else null,
             .model = if (job.model) |m| try allocator.dupe(u8, m) else null,
+            .skill_name = if (job.skill_name) |sn| try allocator.dupe(u8, sn) else null,
+            .skill_args = if (job.skill_args) |sa| try allocator.dupe(u8, sa) else null,
             .one_shot = job.one_shot,
             .delete_after_run = job.delete_after_run,
             .timeout_secs = job.timeout_secs,
@@ -361,6 +369,8 @@ fn copyJobToTypes(allocator: std.mem.Allocator, job: cron.CronJob) !types.CronJo
         .prompt = if (job.prompt) |p| try allocator.dupe(u8, p) else null,
         .name = if (job.name) |n| try allocator.dupe(u8, n) else null,
         .model = if (job.model) |m| try allocator.dupe(u8, m) else null,
+        .skill_name = if (job.skill_name) |sn| try allocator.dupe(u8, sn) else null,
+        .skill_args = if (job.skill_args) |sa| try allocator.dupe(u8, sa) else null,
         .job_type = @enumFromInt(@intFromEnum(job.job_type)),
         .session_target = @enumFromInt(@intFromEnum(job.session_target)),
         .one_shot = job.one_shot,
@@ -435,12 +445,20 @@ test "MemoryCronBackend pause and resumeJob" {
 
     try std.testing.expect(try be.pause(job.id));
     const paused = (try be.get(allocator, job.id)).?;
-    defer { allocator.free(paused.id); allocator.free(paused.expression); allocator.free(paused.command); }
+    defer {
+        allocator.free(paused.id);
+        allocator.free(paused.expression);
+        allocator.free(paused.command);
+    }
     try std.testing.expect(paused.paused);
 
     try std.testing.expect(try be.resumeJob(job.id));
     const resumed = (try be.get(allocator, job.id)).?;
-    defer { allocator.free(resumed.id); allocator.free(resumed.expression); allocator.free(resumed.command); }
+    defer {
+        allocator.free(resumed.id);
+        allocator.free(resumed.expression);
+        allocator.free(resumed.command);
+    }
     try std.testing.expect(!resumed.paused);
 }
 
@@ -503,9 +521,17 @@ test "MemoryCronBackend listRows visitor" {
     const be = mem_be.backend();
 
     const j1 = try be.add(allocator, .{ .expression = "* * * * *", .command = "a" });
-    defer { allocator.free(j1.id); allocator.free(j1.expression); allocator.free(j1.command); }
+    defer {
+        allocator.free(j1.id);
+        allocator.free(j1.expression);
+        allocator.free(j1.command);
+    }
     const j2 = try be.add(allocator, .{ .expression = "* * * * *", .command = "b" });
-    defer { allocator.free(j2.id); allocator.free(j2.expression); allocator.free(j2.command); }
+    defer {
+        allocator.free(j2.id);
+        allocator.free(j2.expression);
+        allocator.free(j2.command);
+    }
 
     var count: usize = 0;
     const visitor = root.CronBackend.RowVisitor{

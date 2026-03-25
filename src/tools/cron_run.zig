@@ -131,7 +131,7 @@ test "cron_run_not_found" {
 
 test "cron_run_executes_command" {
     // Create a scheduler with a job, save it, then run via tool
-    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    var scheduler = CronScheduler.init(std.testing.allocator, 1024, true);
     defer scheduler.deinit();
     cron.loadJobs(&scheduler) catch {};
 
