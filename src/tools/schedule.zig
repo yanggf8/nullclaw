@@ -5,10 +5,13 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
-const cron_gateway = @import("cron_gateway.zig");
+const cron_types = @import("../cron/types.zig");
+const cron_backend_mod = @import("../cron/root.zig");
 const cron_add = @import("cron_add.zig");
 const loadScheduler = cron_add.loadScheduler;
+const loadDbBackend = cron_add.loadDbBackend;
 const persistSchedulerOrFail = cron_add.persistSchedulerOrFail;
+const cron_gateway = @import("cron_gateway.zig"); // used by tests
 
 threadlocal var tls_schedule_channel: ?[]const u8 = null;
 threadlocal var tls_schedule_account_id: ?[]const u8 = null;
@@ -65,14 +68,46 @@ pub const ScheduleTool = struct {
         }
 
         if (std.mem.eql(u8, action, "list")) {
-            switch (cron.requestGatewayGet(allocator, "/cron")) {
-                .unavailable => {},
-                .response => |resp| {
-                    if (resp.status_code >= 200 and resp.status_code < 300) {
-                        return ToolResult{ .success = true, .output = resp.body };
+            // DB-direct path
+            if (loadDbBackend(allocator)) |be_val| {
+                var be = be_val;
+                defer be.deinit();
+                var backend = be.backend();
+
+                var buf: std.ArrayList(u8) = .empty;
+                defer buf.deinit(allocator);
+                var count: usize = 0;
+
+                const ListCtx = struct {
+                    buf: *std.ArrayList(u8),
+                    alloc: std.mem.Allocator,
+                    count: *usize,
+
+                    fn visit(ptr: *anyopaque, row: cron_backend_mod.CronJobSummary) anyerror!void {
+                        const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                        const flags: []const u8 = blk: {
+                            if (row.paused and row.one_shot) break :blk " [paused, one-shot]";
+                            if (row.paused) break :blk " [paused]";
+                            if (row.one_shot) break :blk " [one-shot]";
+                            break :blk "";
+                        };
+                        const status = row.last_status orelse "pending";
+                        const cmd_label: []const u8 = if (row.skill_name) |sn| sn else if (row.name) |n| n else "?";
+                        const wr = ctx.buf.writer(ctx.alloc);
+                        try wr.print("- {s} | {s} | status={s}{s} | cmd: {s}", .{ row.id, row.expression, status, flags, cmd_label });
+                        if (row.skill_args) |sa| try wr.print(" {s}", .{sa});
+                        try wr.print("\n", .{});
+                        ctx.count.* += 1;
                     }
-                    return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
-                },
+                };
+                var ctx = ListCtx{ .buf = &buf, .alloc = allocator, .count = &count };
+                backend.listRows(allocator, .{ .ptr = @ptrCast(&ctx), .visit = ListCtx.visit }) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "DB error listing jobs: {s}", .{@errorName(err)});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                };
+                if (count == 0)
+                    return ToolResult{ .success = true, .output = try allocator.dupe(u8, "No scheduled jobs.") };
+                return ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
             }
 
             var scheduler = loadScheduler(allocator) catch {
@@ -113,24 +148,33 @@ pub const ScheduleTool = struct {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter for get action");
 
-            switch (cron.requestGatewayGet(allocator, "/cron")) {
-                .unavailable => {},
-                .response => |resp| {
-                    if (resp.status_code < 200 or resp.status_code >= 300) {
-                        return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
-                    }
-                    defer allocator.free(resp.body);
-
-                    const job_json = cron_gateway.findJobByIdJson(allocator, resp.body, id) catch {
-                        return ToolResult.fail("Invalid gateway response");
-                    };
-                    if (job_json) |json| {
-                        return ToolResult{ .success = true, .output = json };
-                    }
-
-                    const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{id});
+            // DB-direct path
+            if (loadDbBackend(allocator)) |be_val| {
+                var be = be_val;
+                defer be.deinit();
+                var backend = be.backend();
+                var job_arena = std.heap.ArenaAllocator.init(allocator);
+                defer job_arena.deinit();
+                const job_or_err = backend.get(job_arena.allocator(), id);
+                const job_opt = job_or_err catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to get job: {s}", .{@errorName(err)});
                     return ToolResult{ .success = false, .output = "", .error_msg = msg };
-                },
+                };
+                if (job_opt) |job| {
+                    const flags: []const u8 = blk: {
+                        if (job.paused and job.one_shot) break :blk " [paused, one-shot]";
+                        if (job.paused) break :blk " [paused]";
+                        if (job.one_shot) break :blk " [one-shot]";
+                        break :blk "";
+                    };
+                    const status = job.last_status orelse "pending";
+                    const msg = try std.fmt.allocPrint(allocator, "Job {s} | {s} | next={d} | status={s}{s}\n  cmd: {s}", .{
+                        job.id, job.expression, job.next_run_secs, status, flags, job.command,
+                    });
+                    return ToolResult{ .success = true, .output = msg };
+                }
+                const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{id});
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
             }
 
             var scheduler = loadScheduler(allocator) catch {
@@ -167,8 +211,8 @@ pub const ScheduleTool = struct {
             const expression = root.getString(args, "expression") orelse
                 return ToolResult.fail("Missing 'expression' parameter for cron job");
 
-            const gateway_delivery = if (chat_id) |cid|
-                cron.DeliveryConfig{
+            const delivery = if (chat_id) |cid|
+                cron_types.DeliveryConfig{
                     .mode = .always,
                     .channel = delivery_channel,
                     .account_id = delivery_account_id,
@@ -176,19 +220,27 @@ pub const ScheduleTool = struct {
                     .best_effort = true,
                 }
             else
-                null;
-            const gateway_body = cron_gateway.buildAddBody(allocator, expression, null, command, null, null, gateway_delivery) catch null;
-            if (gateway_body) |json_body| {
-                defer allocator.free(json_body);
-                switch (cron.requestGatewayPost(allocator, "/cron/add", json_body)) {
-                    .unavailable => {},
-                    .response => |resp| {
-                        if (resp.status_code >= 200 and resp.status_code < 300) {
-                            return ToolResult{ .success = true, .output = resp.body };
-                        }
-                        return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
-                    },
-                }
+                cron_types.DeliveryConfig{};
+
+            // DB-direct path
+            if (loadDbBackend(allocator)) |be_val| {
+                var be = be_val;
+                defer be.deinit();
+                var backend = be.backend();
+                var job_arena = std.heap.ArenaAllocator.init(allocator);
+                defer job_arena.deinit();
+                const job = backend.add(job_arena.allocator(), .{
+                    .expression = expression,
+                    .command = command,
+                    .delivery = delivery,
+                }) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to create job: {s}", .{@errorName(err)});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                };
+                const msg = try std.fmt.allocPrint(allocator, "Created job {s} | {s} | cmd: {s}", .{
+                    job.id, job.expression, job.command,
+                });
+                return ToolResult{ .success = true, .output = msg };
             }
 
             var scheduler = loadScheduler(allocator) catch {
@@ -230,8 +282,8 @@ pub const ScheduleTool = struct {
             const delay = root.getString(args, "delay") orelse
                 return ToolResult.fail("Missing 'delay' parameter for one-shot task");
 
-            const gateway_delivery = if (chat_id) |cid|
-                cron.DeliveryConfig{
+            const delivery = if (chat_id) |cid|
+                cron_types.DeliveryConfig{
                     .mode = .always,
                     .channel = delivery_channel,
                     .account_id = delivery_account_id,
@@ -239,19 +291,32 @@ pub const ScheduleTool = struct {
                     .best_effort = true,
                 }
             else
-                null;
-            const gateway_body = cron_gateway.buildAddBody(allocator, null, delay, command, null, null, gateway_delivery) catch null;
-            if (gateway_body) |json_body| {
-                defer allocator.free(json_body);
-                switch (cron.requestGatewayPost(allocator, "/cron/add", json_body)) {
-                    .unavailable => {},
-                    .response => |resp| {
-                        if (resp.status_code >= 200 and resp.status_code < 300) {
-                            return ToolResult{ .success = true, .output = resp.body };
-                        }
-                        return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
-                    },
-                }
+                cron_types.DeliveryConfig{};
+
+            // DB-direct path
+            if (loadDbBackend(allocator)) |be_val| {
+                var be = be_val;
+                defer be.deinit();
+                var backend = be.backend();
+                var job_arena = std.heap.ArenaAllocator.init(allocator);
+                defer job_arena.deinit();
+                const now = std.time.timestamp();
+                const delay_secs = cron.parseDuration(delay) catch 60;
+                const job = backend.add(job_arena.allocator(), .{
+                    .expression = "@once",
+                    .command = command,
+                    .one_shot = true,
+                    .delete_after_run = true,
+                    .next_run_secs_override = now + delay_secs,
+                    .delivery = delivery,
+                }) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot task: {s}", .{@errorName(err)});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                };
+                const msg = try std.fmt.allocPrint(allocator, "Created one-shot task {s} | runs at {d} | cmd: {s}", .{
+                    job.id, job.next_run_secs, job.command,
+                });
+                return ToolResult{ .success = true, .output = msg };
             }
 
             var scheduler = loadScheduler(allocator) catch {
@@ -291,18 +356,21 @@ pub const ScheduleTool = struct {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter for cancel action");
 
-            const gateway_body = cron_gateway.buildIdBody(allocator, id) catch null;
-            if (gateway_body) |json_body| {
-                defer allocator.free(json_body);
-                switch (cron.requestGatewayPost(allocator, "/cron/remove", json_body)) {
-                    .unavailable => {},
-                    .response => |resp| {
-                        if (resp.status_code >= 200 and resp.status_code < 300) {
-                            return ToolResult{ .success = true, .output = resp.body };
-                        }
-                        return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
-                    },
+            // DB-direct path
+            if (loadDbBackend(allocator)) |be_val| {
+                var be = be_val;
+                defer be.deinit();
+                var backend = be.backend();
+                const found = backend.remove(id) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "DB error removing job: {s}", .{@errorName(err)});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                };
+                if (found) {
+                    const msg = try std.fmt.allocPrint(allocator, "Cancelled job {s}", .{id});
+                    return ToolResult{ .success = true, .output = msg };
                 }
+                const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{id});
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
             }
 
             var scheduler = loadScheduler(allocator) catch {
@@ -323,19 +391,30 @@ pub const ScheduleTool = struct {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter");
 
-            const gateway_body = cron_gateway.buildIdBody(allocator, id) catch null;
-            if (gateway_body) |json_body| {
-                defer allocator.free(json_body);
-                const path = if (std.mem.eql(u8, action, "pause")) "/cron/pause" else "/cron/resume";
-                switch (cron.requestGatewayPost(allocator, path, json_body)) {
-                    .unavailable => {},
-                    .response => |resp| {
-                        if (resp.status_code >= 200 and resp.status_code < 300) {
-                            return ToolResult{ .success = true, .output = resp.body };
-                        }
-                        return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
-                    },
+            const is_pause = std.mem.eql(u8, action, "pause");
+
+            // DB-direct path
+            if (loadDbBackend(allocator)) |be_val| {
+                var be = be_val;
+                defer be.deinit();
+                var backend = be.backend();
+                const found = if (is_pause)
+                    backend.pause(id) catch |err| {
+                        const msg = try std.fmt.allocPrint(allocator, "DB error: {s}", .{@errorName(err)});
+                        return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                    }
+                else
+                    backend.resumeJob(id) catch |err| {
+                        const msg = try std.fmt.allocPrint(allocator, "DB error: {s}", .{@errorName(err)});
+                        return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                    };
+                if (found) {
+                    const verb: []const u8 = if (is_pause) "Paused" else "Resumed";
+                    const msg = try std.fmt.allocPrint(allocator, "{s} job {s}", .{ verb, id });
+                    return ToolResult{ .success = true, .output = msg };
                 }
+                const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{id});
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
             }
 
             var scheduler = loadScheduler(allocator) catch {
@@ -343,7 +422,6 @@ pub const ScheduleTool = struct {
             };
             defer scheduler.deinit();
 
-            const is_pause = std.mem.eql(u8, action, "pause");
             const found = if (is_pause) scheduler.pauseJob(id) else scheduler.resumeJob(id);
 
             if (found) {

@@ -5,7 +5,10 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
-const loadScheduler = @import("cron_add.zig").loadScheduler;
+const cron_backend_mod = @import("../cron/root.zig");
+const cron_add = @import("cron_add.zig");
+const loadScheduler = cron_add.loadScheduler;
+const loadDbBackend = cron_add.loadDbBackend;
 
 /// CronList tool — lists all scheduled cron jobs with their status and next run time.
 pub const CronListTool = struct {
@@ -25,14 +28,50 @@ pub const CronListTool = struct {
     }
 
     pub fn execute(_: *CronListTool, allocator: std.mem.Allocator, _: JsonObjectMap) !ToolResult {
-        switch (cron.requestGatewayGet(allocator, "/cron")) {
-            .unavailable => {},
-            .response => |resp| {
-                if (resp.status_code >= 200 and resp.status_code < 300) {
-                    return ToolResult{ .success = true, .output = resp.body };
+        // DB-direct path
+        if (loadDbBackend(allocator)) |be_val| {
+            var be = be_val;
+            defer be.deinit();
+            var backend = be.backend();
+
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            var count: usize = 0;
+
+            const ListCtx = struct {
+                buf: *std.ArrayList(u8),
+                alloc: std.mem.Allocator,
+                count: *usize,
+
+                fn visit(ptr: *anyopaque, row: cron_backend_mod.CronJobSummary) anyerror!void {
+                    const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                    const status: []const u8 = if (row.paused) "paused" else "enabled";
+                    const cmd_label: []const u8 = if (row.skill_name) |sn| sn else if (row.name) |n| n else "?";
+                    const wr = ctx.buf.writer(ctx.alloc);
+                    try wr.print("- {s} | {s} | {s} | next: {d} | cmd: {s}", .{
+                        row.id,
+                        row.expression,
+                        status,
+                        row.next_run_secs,
+                        cmd_label,
+                    });
+                    if (row.skill_args) |args| try wr.print(" {s}", .{args});
+                    try wr.print("\n", .{});
+                    ctx.count.* += 1;
                 }
-                return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
-            },
+            };
+            var ctx = ListCtx{ .buf = &buf, .alloc = allocator, .count = &count };
+            backend.listRows(allocator, .{
+                .ptr = @ptrCast(&ctx),
+                .visit = ListCtx.visit,
+            }) catch |err| {
+                const msg = try std.fmt.allocPrint(allocator, "DB error listing jobs: {s}", .{@errorName(err)});
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            };
+            if (count == 0) {
+                return ToolResult{ .success = true, .output = try allocator.dupe(u8, "No scheduled cron jobs.") };
+            }
+            return ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
         }
 
         var scheduler = loadScheduler(allocator) catch {

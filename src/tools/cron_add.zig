@@ -7,6 +7,8 @@ const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
 const cron_gateway = @import("cron_gateway.zig");
+const cron_db_mod = @import("../cron/db.zig");
+const cron_types = @import("../cron/types.zig");
 
 pub fn persistSchedulerOrFail(allocator: std.mem.Allocator, scheduler: *const CronScheduler) !?ToolResult {
     cron.saveJobs(scheduler) catch |err| {
@@ -55,18 +57,38 @@ pub const CronAddTool = struct {
                 return ToolResult.fail("Invalid delay format");
         }
 
-        const gateway_body = cron_gateway.buildAddBody(allocator, expression, delay, command, null, null, null) catch null;
-        if (gateway_body) |json_body| {
-            defer allocator.free(json_body);
-            switch (cron.requestGatewayPost(allocator, "/cron/add", json_body)) {
-                .unavailable => {},
-                .response => |resp| {
-                    if (resp.status_code >= 200 and resp.status_code < 300) {
-                        return ToolResult{ .success = true, .output = resp.body };
-                    }
-                    return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
-                },
-            }
+        // DB-direct path: try DbCronBackend first, fall back to CronScheduler.
+        if (loadDbBackend(allocator)) |be_val| {
+            var be = be_val;
+            defer be.deinit();
+            var backend = be.backend();
+
+            const expr_str = expression orelse "@once";
+            const now = std.time.timestamp();
+            const next_override: i64 = if (delay) |d|
+                now + (cron.parseDuration(d) catch 60)
+            else
+                0;
+
+            var job_arena = std.heap.ArenaAllocator.init(allocator);
+            defer job_arena.deinit();
+            const job = backend.add(job_arena.allocator(), .{
+                .expression = expr_str,
+                .command = command,
+                .one_shot = delay != null,
+                .delete_after_run = delay != null,
+                .next_run_secs_override = next_override,
+            }) catch |err| {
+                const msg = try std.fmt.allocPrint(allocator, "Failed to create job: {s}", .{@errorName(err)});
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            };
+
+            const msg = try std.fmt.allocPrint(allocator, "Created cron job {s}: {s} \u{2192} {s}", .{
+                job.id,
+                job.expression,
+                job.command,
+            });
+            return ToolResult{ .success = true, .output = msg };
         }
 
         var scheduler = loadScheduler(allocator) catch {
@@ -120,6 +142,16 @@ pub fn loadScheduler(allocator: std.mem.Allocator) !CronScheduler {
     if (builtin.is_test) return scheduler; // Skip loading from real DB in tests
     cron.loadJobs(&scheduler) catch {};
     return scheduler;
+}
+
+/// Open a DbCronBackend pointing at ~/.nullclaw/cron.db.
+/// Returns null under builtin.is_test or if SQLite/path resolution fails.
+/// Caller must call deinit() on the returned backend.
+pub fn loadDbBackend(allocator: std.mem.Allocator) ?cron_db_mod.DbCronBackend {
+    if (builtin.is_test) return null;
+    const db_path = cron.getCronDbPathZ(allocator) catch return null;
+    defer allocator.free(db_path);
+    return cron_db_mod.DbCronBackend.init(allocator, db_path) catch return null;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

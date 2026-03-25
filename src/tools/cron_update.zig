@@ -5,10 +5,12 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
-const cron_gateway = @import("cron_gateway.zig");
+const cron_types = @import("../cron/types.zig");
 const cron_add = @import("cron_add.zig");
 const loadScheduler = cron_add.loadScheduler;
+const loadDbBackend = cron_add.loadDbBackend;
 const persistSchedulerOrFail = cron_add.persistSchedulerOrFail;
+const cron_gateway = @import("cron_gateway.zig"); // used by tests
 
 /// CronUpdate tool — update a cron job's expression, command, or enabled state.
 pub const CronUpdateTool = struct {
@@ -45,18 +47,32 @@ pub const CronUpdateTool = struct {
                 return ToolResult.fail("Invalid cron expression");
         }
 
-        const gateway_body = cron_gateway.buildUpdateBody(allocator, job_id, expression, command, null, null, enabled) catch null;
-        if (gateway_body) |json_body| {
-            defer allocator.free(json_body);
-            switch (cron.requestGatewayPost(allocator, "/cron/update", json_body)) {
-                .unavailable => {},
-                .response => |resp| {
-                    if (resp.status_code >= 200 and resp.status_code < 300) {
-                        return ToolResult{ .success = true, .output = resp.body };
-                    }
-                    return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
-                },
+        // DB-direct path
+        if (loadDbBackend(allocator)) |be_val| {
+            var be = be_val;
+            defer be.deinit();
+            var backend = be.backend();
+            const patch = cron_types.CronJobPatch{
+                .expression = expression,
+                .command = command,
+                .enabled = enabled,
+            };
+            const found = backend.update(job_id, patch) catch |err| {
+                const msg = try std.fmt.allocPrint(allocator, "DB error updating job: {s}", .{@errorName(err)});
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            };
+            if (!found) {
+                const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{job_id});
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
             }
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            const w = buf.writer(allocator);
+            try w.print("Updated job {s}", .{job_id});
+            if (expression) |expr| try w.print(" | expression={s}", .{expr});
+            if (command) |cmd| try w.print(" | command={s}", .{cmd});
+            if (enabled) |ena| try w.print(" | enabled={s}", .{if (ena) "true" else "false"});
+            return ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
         }
 
         var scheduler = loadScheduler(allocator) catch {

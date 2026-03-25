@@ -5,10 +5,11 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
-const cron_gateway = @import("cron_gateway.zig");
 const cron_add = @import("cron_add.zig");
 const loadScheduler = cron_add.loadScheduler;
+const loadDbBackend = cron_add.loadDbBackend;
 const persistSchedulerOrFail = cron_add.persistSchedulerOrFail;
+const cron_gateway = @import("cron_gateway.zig"); // used by tests
 
 /// CronRemove tool — removes a scheduled cron job by its ID.
 pub const CronRemoveTool = struct {
@@ -34,18 +35,21 @@ pub const CronRemoveTool = struct {
         if (job_id.len == 0)
             return ToolResult.fail("Missing required parameter: job_id");
 
-        const gateway_body = cron_gateway.buildIdBody(allocator, job_id) catch null;
-        if (gateway_body) |json_body| {
-            defer allocator.free(json_body);
-            switch (cron.requestGatewayPost(allocator, "/cron/remove", json_body)) {
-                .unavailable => {},
-                .response => |resp| {
-                    if (resp.status_code >= 200 and resp.status_code < 300) {
-                        return ToolResult{ .success = true, .output = resp.body };
-                    }
-                    return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
-                },
+        // DB-direct path
+        if (loadDbBackend(allocator)) |be_val| {
+            var be = be_val;
+            defer be.deinit();
+            var backend = be.backend();
+            const found = backend.remove(job_id) catch |err| {
+                const msg = try std.fmt.allocPrint(allocator, "DB error removing job: {s}", .{@errorName(err)});
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            };
+            if (found) {
+                const msg = try std.fmt.allocPrint(allocator, "Removed cron job {s}", .{job_id});
+                return ToolResult{ .success = true, .output = msg };
             }
+            const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{job_id});
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
         }
 
         var scheduler = loadScheduler(allocator) catch {
