@@ -1,7 +1,7 @@
 # Cron-as-Subagent: Standalone Daemon with Bus-Driven Execution
 
 **Date**: 2026-03-26
-**Status**: Draft v4
+**Status**: Draft v5
 **Scope**: Decouple cron scheduling and execution from the gateway. Cron jobs execute as spawned sub-agent threads, using the bus outbound queue for delivery only.
 
 ---
@@ -63,13 +63,13 @@ CronTicker (timer thread)
   → tick(now): SQLite scan + enqueue to cron_run_queue
   → condvar.signal()
 
-CronWorker (reactive, condvar-driven)
-  → condvar.wait() ← blocks until signaled
+CronWorker (reactive, condvar + timedWait)
+  → condvar.timedWait(1s) ← blocks until signaled OR timeout
   → drain cron_run_queue:
       → dequeue job spec
       → spawn OS thread for this job (like SubagentManager.spawn)
       → continue draining (non-blocking)
-  → condvar.wait() ← blocks again
+  → condvar.timedWait(1s) ← blocks again
 
 Job Thread (spawned per job, like subagentThreadFn)
   → resolve skill → run subprocess with timeout
@@ -78,27 +78,33 @@ Job Thread (spawned per job, like subagentThreadFn)
   → thread exits
 ```
 
-### Reactive Worker (No Polling)
+### Reactive Worker (timedWait + condvar)
 
-The worker does NOT tick or poll. It is purely signal-driven:
+The worker uses `timedWait` with a 1-second fallback, not unbounded `wait`. This handles **cross-process enqueue**: external processes (CLI `cron run`, gateway `/cron/run`) INSERT into `cron_run_queue` via SQLite but cannot signal the daemon's in-memory condvar. The 1-second `timedWait` ensures externally enqueued jobs are picked up within 1 second. The condvar signal from the in-process ticker still provides **instant** wakeup for scheduled jobs.
 
 ```
-CronTicker (timer)              CronWorker (blocked)           Job Threads
+CronTicker (timer)              CronWorker                     Job Threads
     │                                │
-    ├─ sleep(poll_secs)              ├─ condvar.wait() ← blocks
+    ├─ sleep(poll_secs)              ├─ timedWait(1s) ← blocks
     ├─ tick → 3 jobs enqueued        │
-    ├─ condvar.signal() ─────────────▶ wakes
+    ├─ condvar.signal() ─────────────▶ wakes instantly
     │                                ├─ dequeue job 1 → spawn ──────▶ [thread 1: running]
     │                                ├─ dequeue job 2 → spawn ──────▶ [thread 2: running]
     │                                ├─ dequeue job 3 → spawn ──────▶ [thread 3: running]
     │                                ├─ dequeue → null
-    ├─ sleep(poll_secs)              ├─ condvar.wait() ← blocks
+    ├─ sleep(poll_secs)              ├─ timedWait(1s) ← blocks
     │                                │                         [thread 1: complete → outbound bus]
     │                                │                         [thread 2: complete → outbound bus]
     │                                │                         [thread 3: complete → outbound bus]
+
+External enqueue (CLI/gateway):
+    nullclaw cron run <id>
+      → dbEnqueueJob(db, id, now)   (no condvar signal — cross-process)
+      → worker wakes within ≤1s via timedWait timeout
+      → dequeues and spawns as normal
 ```
 
-The ticker is the only component with a timer. The worker drains the queue and spawns — it never blocks on execution. Job threads run in parallel, respecting `max_concurrent` limit.
+The 1-second `timedWait` is negligible overhead (one mutex lock + queue check per second when idle) and eliminates the need for any cross-process signaling mechanism (pipes, Unix sockets, etc.). Scheduled jobs still get instant wakeup via the in-process condvar signal from CronTicker.
 
 ### SubagentManager Parallel
 
@@ -276,19 +282,20 @@ pub const CronWorker = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         while (!self.shutdown) {
-            // Standard condvar predicate loop — prevents lost wakeups.
-            // On each iteration: drain queue, THEN re-check before waiting.
+            // Predicate loop: drain queue, then re-check before waiting.
             // If ticker signaled while we were spawning, the queue is non-empty
-            // and we loop back to drain without entering wait().
+            // and we loop back to drain without entering timedWait.
             while (self.drainQueue()) {}  // drain returns true if it spawned anything
             if (self.shutdown) break;
-            self.cond.wait(self.mutex);   // blocks only when queue is confirmed empty
+            // timedWait(1s): wakes on condvar signal (instant, from ticker)
+            // OR on timeout (≤1s, picks up cross-process enqueues from CLI/gateway).
+            self.cond.timedWait(self.mutex, 1 * std.time.ns_per_s) catch {};
         }
     }
 };
 ```
 
-**Lost-wakeup prevention**: The worker holds `mutex` and checks the queue (via `drainQueue`) in a loop. It only enters `cond.wait()` after confirming the queue is empty. If the ticker signals between two `drainQueue` calls, the signal is "absorbed" but the next `drainQueue` iteration finds the new rows and processes them. This is the standard condvar predicate pattern — no wakeups are lost.
+**Lost-wakeup prevention**: The worker holds `mutex` and checks the queue (via `drainQueue`) in a loop. It only enters `cond.timedWait()` after confirming the queue is empty. If the ticker signals between two `drainQueue` calls, the signal is "absorbed" but the next `drainQueue` iteration finds the new rows and processes them. Even if a condvar signal is lost entirely, the 1-second `timedWait` timeout ensures the worker wakes and re-checks. This provides a double safety net: condvar for instant wakeup + timedWait for cross-process enqueues and missed signals.
 
 **`drainQueue` semantics**: Returns `true` if it dequeued and spawned (or attempted to spawn) at least one job. Returns `false` when `dequeue()` returns `null` (queue empty). The outer `while (self.drainQueue()) {}` loop terminates only when the queue is confirmed empty — the predicate for entering `cond.wait()`.
 
@@ -300,7 +307,7 @@ Dependencies: SQLite, bus (outbound only, passed to job threads for delivery)
 No polling — purely reactive. No execution — just dispatch.
 ```
 
-On startup, calls `resetInProgress()` with `worker_pid` filter to only reset its own rows.
+On startup, calls `resetInProgress()` to reset all in-progress rows back to pending (crash recovery). Safe because the heartbeat lease guarantees only one daemon is running.
 
 **Dequeue-then-spawn ordering**: The worker calls `dequeue()` (marks row `in_progress`) then spawns the thread. If the spawn fails (out of memory, thread limit), the worker calls `resetRow(queue_row_id)` to return the row to `pending` for retry on next wake.
 
@@ -374,34 +381,77 @@ A new CLI command: `nullclaw cron daemon`
 Lifecycle:
   1. Load config
   2. Open cron.db, enforce WAL mode (PRAGMA journal_mode=wal)
-  3. Acquire SQLite advisory lock (cron_meta table) — exit if another daemon holds it
+  3. Acquire daemon lease (see Daemon Lease Protocol below) — exit if another daemon holds it
   4. Init bus (outbound queue only, for delivery)
   5. Init CronWorker (registers on_complete for DB writes)
-  6. Spawn CronTicker thread (timer — the only thread that sleeps)
-  7. Spawn CronWorker thread (reactive — blocks on condvar)
+  6. Spawn CronTicker thread (timer — the only thread that sleeps on poll interval)
+  7. Spawn CronWorker thread (timedWait 1s — picks up both ticker signals and external enqueues)
   8. Spawn outbound dispatcher thread (consumes bus outbound → channel delivery)
-  9. Main thread: wait for shutdown signal
-  10. On shutdown: signal condvar, close bus, join threads, close DB
+  9. Main thread: heartbeat loop (update lease timestamp every 5s) + wait for shutdown signal
+  10. On shutdown: signal condvar, close bus, join threads, release lease, close DB
 ```
 
 No HTTP listener. No inbound dispatcher. No session manager.
+
+### Daemon Lease Protocol
+
+SQLite does not provide process-scoped advisory locks. A persisted row does not auto-release on crash. Instead, the daemon uses a **heartbeat lease**:
+
+**Table DDL** (created by `ensureCronMetaTable`, called alongside `ensureCronTable`):
+
+```sql
+CREATE TABLE IF NOT EXISTS cron_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+```
+
+**Lease row**: `key = 'daemon_lease'`, `value = JSON { "pid": <pid>, "heartbeat": <unix_timestamp> }`.
+
+**Acquire** (atomic — no TOCTOU):
+
+```sql
+-- Step 1: Try INSERT for first-time acquisition
+INSERT OR IGNORE INTO cron_meta (key, value)
+VALUES ('daemon_lease', json_object('pid', ?new_pid, 'heartbeat', ?now));
+-- If sqlite3_changes() == 1 → acquired (no prior row)
+
+-- Step 2: If INSERT was ignored (row exists), try conditional UPDATE
+UPDATE cron_meta
+SET value = json_object('pid', ?new_pid, 'heartbeat', ?now)
+WHERE key = 'daemon_lease'
+  AND CAST(json_extract(value, '$.heartbeat') AS INTEGER) < ?stale_threshold;
+-- If sqlite3_changes() == 1 → acquired (lease was stale)
+-- If sqlite3_changes() == 0 → another daemon is alive → exit with error
+```
+
+Both steps are single SQL statements — no SELECT-then-UPDATE gap. Two concurrent starters cannot both succeed: SQLite serializes writes, and the conditional `WHERE` clause ensures only one UPDATE matches a stale heartbeat.
+
+**Heartbeat**: Main thread runs `UPDATE cron_meta SET value=json_object('pid', ?pid, 'heartbeat', ?now) WHERE key='daemon_lease'` every 5 seconds. Stale threshold is 15s (3× heartbeat interval).
+
+**Release** (clean shutdown): `DELETE FROM cron_meta WHERE key='daemon_lease'`.
+
+**Crash recovery**: If the daemon crashes, the heartbeat stops updating. After 15 seconds, any new daemon (or gateway fallback) sees a stale lease via the conditional UPDATE and takes over. No stranded lock rows.
+
+**Rollback to gateway**: Stop daemon → lease expires in ≤15s → restart gateway. Gateway's scheduler resumes. Or: stop daemon cleanly (deletes lease) → gateway takes over immediately.
 
 ## Data Flow Diagram
 
 ```
 ┌─────────────┐                    ┌─────────────┐
-│ CronTicker  │──tick+enqueue─────▶│ cron_run_   │
-│ (timer)     │──condvar.signal()  │ queue (DB)  │
-└─────────────┘        │           └──────┬──────┘
+│ CronTicker  │──tick+enqueue─────▶│ cron_run_   │◀──── CLI: nullclaw cron run <id>
+│ (timer)     │──condvar.signal()  │ queue (DB)  │◀──── Gateway: POST /cron/run
+└─────────────┘        │           └──────┬──────┘      (cross-process, no condvar)
                        │                  │
-                       ▼                  │ dequeue (on wake)
+                       ▼                  │ dequeue (on wake or timedWait timeout)
                ┌──────────────┐           │
-               │  condvar     │◀──────────┘
+               │  condvar +   │◀──────────┘
+               │  timedWait   │
                └──────┬───────┘
-                      │ wake
+                      │ wake (signal or 1s timeout)
                ┌──────▼──────┐
                │ CronWorker  │──spawn──┬──────────────────────┐
-               │ (reactive)  │        │                      │
+               │             │        │                      │
                └─────────────┘        ▼                      ▼
                               ┌──────────────┐      ┌──────────────┐
                               │ Job Thread 1 │      │ Job Thread 2 │  ...
@@ -544,9 +594,9 @@ Inbound bus is completely untouched. User message processing is unaffected.
 
 Add `nullclaw cron daemon` CLI command. Runs CronTicker + CronWorker + outbound dispatcher. No HTTP, no inbound dispatcher, no session manager.
 
-**Process coordination**: SQLite advisory lock via `cron_daemon_lock` row in `cron_meta` table. Auto-releases on process death (SQLite handles this).
+**Process coordination**: Heartbeat lease in `cron_meta` table (see Daemon Lease Protocol). Stale threshold 15s — if daemon crashes, lease expires and gateway/new daemon can take over.
 
-**Rollback**: Stop daemon, restart gateway. Gateway's scheduler resumes (lock released). Same DB tables, no migration.
+**Rollback**: Stop daemon → lease expires in ≤15s → restart gateway. Gateway's scheduler resumes. Same DB tables, no migration.
 
 ### Phase 4: Cleanup
 
@@ -558,9 +608,9 @@ Add `nullclaw cron daemon` CLI command. Runs CronTicker + CronWorker + outbound 
 ## Constraints
 
 - **Binary size**: Under 678 KB. Build with `-Dchannels=telegram` for standalone daemon.
-- **Memory**: ~1 MB RSS. Bus ring buffer fixed-size (100 slots). Job threads use arena allocators (freed on exit).
+- **Memory**: RSS is dominated by thread stacks. 4 job threads × 2 MiB (`HEAVY_RUNTIME_STACK_SIZE`) = 8 MiB, plus 3 infrastructure threads (ticker, worker, outbound dispatcher) × ~1 MiB each = 3 MiB, plus SQLite/arenas/bus ≈ 1 MiB. Expect **~12–14 MiB** peak RSS with `max_concurrent = 4` agent jobs. Skill/shell-only workloads use smaller default stacks. The ~1 MiB target from the main binary does not apply — the daemon trades memory for concurrency.
 - **SQLite WAL**: Enforced on startup via `PRAGMA journal_mode=wal`. Verified, not assumed.
-- **SQLite concurrency**: `worker_pid` column in `cron_run_queue`. Each process resets only its own rows.
+- **SQLite concurrency**: The heartbeat lease guarantees single-daemon operation. `resetInProgress()` resets ALL in-progress rows globally on startup — safe because only one daemon holds the lease. No `worker_pid` column needed.
 - **Thread stacks**: Job threads use `SESSION_TURN_STACK_SIZE` (2 MB) for agent jobs, default stack for skill/shell subprocess jobs.
 - **Concurrency**: `max_concurrent` (default 4) limits parallel job threads. Matches `SubagentConfig.max_concurrent`.
 - **Bus backpressure**: `publishOutboundTimeout` with 30s timeout. On timeout, delivery is marked failed (best_effort jobs ignore this). Worker never blocks on publish — only job threads do. **Note**: `Bus.publishOutboundTimeout` is a trivial addition — `BoundedQueue.publishTimeout` already exists (used by `publishInboundTimeout`); the outbound forwarding method just needs to be added.
@@ -581,7 +631,7 @@ Add `nullclaw cron daemon` CLI command. Runs CronTicker + CronWorker + outbound 
 | `src/cron/worker.zig` | New — reactive condvar worker, spawn-per-job |
 | `src/cron/job_thread.zig` | New — per-job thread function (like subagentThreadFn) |
 | `src/cron/daemon.zig` | New — standalone daemon entry point |
-| `src/cron.zig` | Remove gateway-coupled execution code |
+| `src/cron.zig` | Remove gateway-coupled execution code. Rewrite `cliRunJob` to DB-direct enqueue (`backend.enqueue(id, now)`) — drop gateway HTTP fallback and local sync execution. Add `ensureCronMetaTable` DDL. |
 | `src/cron/root.zig` | Add `resetRow(row_id)` vtable method for spawn-failure recovery |
 | `src/daemon.zig` | `schedulerThread` delegates to `CronTicker` |
 | `src/gateway.zig` | Remove `runQueueWorker`, `tickDbScheduler`, `signalRunQueueWorker` |
@@ -590,5 +640,5 @@ Add `nullclaw cron daemon` CLI command. Runs CronTicker + CronWorker + outbound 
 
 ## Open Questions
 
-1. **Agent job thread stack**: Agent jobs run full LLM loops — should they use `HEAVY_RUNTIME_STACK_SIZE` (2 MB) like SubagentManager, or `SESSION_TURN_STACK_SIZE`?
+1. ~~**Agent job thread stack**~~: **Resolved** — `SESSION_TURN_STACK_SIZE` and `HEAVY_RUNTIME_STACK_SIZE` are the same constant (2 MiB) in `src/thread_stacks.zig:28`. Use `HEAVY_RUNTIME_STACK_SIZE` for agent jobs (matches SubagentManager) and default stack for skill/shell jobs.
 2. **Shared bus instance**: If running embedded in daemon (not standalone), the cron outbound messages share the bus with user response messages. Should the outbound dispatcher prioritize user messages over cron delivery?
