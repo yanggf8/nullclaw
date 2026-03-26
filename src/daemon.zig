@@ -165,6 +165,74 @@ pub fn isShutdownRequested() bool {
     return shutdown_requested.load(.acquire);
 }
 
+// ── PID file ──────────────────────────────────────────────────────
+
+/// Compute path to daemon.pid from config directory.
+pub fn pidFilePath(allocator: std.mem.Allocator, config: *const Config) ![]u8 {
+    if (std.fs.path.dirname(config.config_path)) |dir| {
+        return std.fs.path.join(allocator, &.{ dir, "daemon.pid" });
+    }
+    return allocator.dupe(u8, "daemon.pid");
+}
+
+/// Write current process PID to daemon.pid.
+fn writePidFile(allocator: std.mem.Allocator, config: *const Config) void {
+    const path = pidFilePath(allocator, config) catch return;
+    defer allocator.free(path);
+    const file = std.fs.createFileAbsolute(path, .{}) catch return;
+    defer file.close();
+    const pid = getCurrentPid();
+    var buf: [20]u8 = undefined;
+    const slice = std.fmt.bufPrint(&buf, "{d}", .{pid}) catch return;
+    file.writeAll(slice) catch {};
+}
+
+/// Remove daemon.pid on shutdown.
+fn removePidFile(allocator: std.mem.Allocator, config: *const Config) void {
+    const path = pidFilePath(allocator, config) catch return;
+    defer allocator.free(path);
+    std.fs.deleteFileAbsolute(path) catch {};
+}
+
+/// Read PID from daemon.pid. Returns 0 on failure.
+pub fn readPidFile(allocator: std.mem.Allocator, config: *const Config) u32 {
+    const path = pidFilePath(allocator, config) catch return 0;
+    defer allocator.free(path);
+    const file = std.fs.openFileAbsolute(path, .{}) catch return 0;
+    defer file.close();
+    var buf: [20]u8 = undefined;
+    const len = file.readAll(&buf) catch return 0;
+    if (len == 0) return 0;
+    return std.fmt.parseInt(u32, buf[0..len], 10) catch 0;
+}
+
+fn getCurrentPid() u32 {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .linux) return @intCast(std.os.linux.getpid());
+    if (builtin.os.tag == .macos) return @intCast(std.c.getpid());
+    return 0;
+}
+
+// ── Signal handler ────────────────────────────────────────────────
+
+/// Install SIGTERM/SIGINT handler so `kill PID` triggers graceful shutdown.
+fn installSignalHandlers() void {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
+        const handler: std.posix.Sigaction = .{
+            .handler = .{ .handler = signalHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.TERM, &handler, null);
+        std.posix.sigaction(std.posix.SIG.INT, &handler, null);
+    }
+}
+
+fn signalHandler(_: c_int) callconv(.c) void {
+    requestShutdown();
+}
+
 fn recordGatewayFailure(err: anyerror, state: *DaemonState) void {
     requestShutdown();
     state.markError("gateway", @errorName(err));
@@ -1119,6 +1187,8 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     health.markComponentOk("daemon");
     shutdown_requested.store(false, .release);
+    installSignalHandlers();
+    writePidFile(allocator, config);
     const has_supervised_channels = hasSupervisedChannels(config);
     const has_runtime_dependent_channels = channel_catalog.hasRuntimeDependentChannels(config);
 
@@ -1290,6 +1360,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
         t.stop();
     }
 
+    removePidFile(allocator, config);
     try stdout.print("nullclaw gateway runtime stopped.\n", .{});
 }
 

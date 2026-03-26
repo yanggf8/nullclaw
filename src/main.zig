@@ -319,9 +319,13 @@ fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const
 
 fn printGatewayUsage() void {
     std.debug.print(
-        \\Usage: nullclaw gateway [options]
+        \\Usage: nullclaw gateway [subcommand|options]
         \\
-        \\Start the gateway server (HTTP/WebSocket).
+        \\Start the gateway server (HTTP/WebSocket), or manage a running instance.
+        \\
+        \\SUBCOMMANDS:
+        \\  stop                   Stop a running gateway (sends SIGTERM)
+        \\  restart                Restart a running gateway (stop + start)
         \\
         \\OPTIONS:
         \\  --port PORT, -p PORT   Override gateway listen port
@@ -354,6 +358,16 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     if (gatewayHelpRequested(sub_args)) {
         printGatewayUsage();
         return;
+    }
+
+    // Handle subcommands: stop, restart
+    if (sub_args.len >= 1) {
+        if (std.mem.eql(u8, sub_args[0], "stop")) {
+            return gatewayStop(allocator);
+        }
+        if (std.mem.eql(u8, sub_args[0], "restart")) {
+            return gatewayRestart(allocator, sub_args[1..]);
+        }
     }
 
     var cfg = yc.config.Config.load(allocator) catch {
@@ -399,6 +413,84 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     applyRuntimeProviderOverrides(&cfg);
 
     try yc.daemon.run(allocator, &cfg, cfg.gateway.host, cfg.gateway.port);
+}
+
+// ── Gateway stop/restart ──────────────────────────────────────────
+
+fn gatewayStop(allocator: std.mem.Allocator) void {
+    var cfg = yc.config.Config.load(allocator) catch {
+        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+        std.process.exit(1);
+    };
+    defer cfg.deinit();
+
+    const pid = yc.daemon.readPidFile(allocator, &cfg);
+    if (pid == 0) {
+        std.debug.print("No running gateway found (no PID file).\n", .{});
+        std.process.exit(1);
+    }
+
+    std.debug.print("Stopping gateway (PID {d})...\n", .{pid});
+    std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch |err| {
+        std.debug.print("Failed to send SIGTERM to PID {d}: {s}\n", .{ pid, @errorName(err) });
+        std.process.exit(1);
+    };
+
+    // Wait up to 10s for process to exit
+    var waited: u8 = 0;
+    while (waited < 10) : (waited += 1) {
+        std.Thread.sleep(1 * std.time.ns_per_s);
+        // Check if process is still alive
+        std.posix.kill(@intCast(pid), 0) catch {
+            // Process gone — success
+            std.debug.print("Gateway stopped.\n", .{});
+            return;
+        };
+    }
+    std.debug.print("Gateway did not stop within 10s. You may need to kill PID {d} manually.\n", .{pid});
+    std.process.exit(1);
+}
+
+fn gatewayRestart(allocator: std.mem.Allocator, remaining_args: []const []const u8) !void {
+    var cfg = yc.config.Config.load(allocator) catch {
+        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+        std.process.exit(1);
+    };
+
+    const pid = yc.daemon.readPidFile(allocator, &cfg);
+    cfg.deinit();
+
+    if (pid != 0) {
+        std.debug.print("Stopping gateway (PID {d})...\n", .{pid});
+        std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch {};
+        // Wait up to 10s
+        var waited: u8 = 0;
+        while (waited < 10) : (waited += 1) {
+            std.Thread.sleep(1 * std.time.ns_per_s);
+            std.posix.kill(@intCast(pid), 0) catch break;
+        }
+        std.debug.print("Gateway stopped. Restarting...\n", .{});
+    }
+
+    // Re-load config and start fresh
+    var new_cfg = yc.config.Config.load(allocator) catch {
+        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+        std.process.exit(1);
+    };
+    defer new_cfg.deinit();
+
+    applyGatewayDaemonOverrides(&new_cfg, remaining_args) catch {
+        std.debug.print("Invalid port in CLI args.\n", .{});
+        std.process.exit(1);
+    };
+
+    new_cfg.validate() catch |err| {
+        yc.config.Config.printValidationError(err);
+        std.process.exit(1);
+    };
+    applyRuntimeProviderOverrides(&new_cfg);
+
+    try yc.daemon.run(allocator, &new_cfg, new_cfg.gateway.host, new_cfg.gateway.port);
 }
 
 // ── Service ──────────────────────────────────────────────────────
