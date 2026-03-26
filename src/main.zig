@@ -324,14 +324,17 @@ fn printGatewayUsage() void {
         \\Start the gateway server (HTTP/WebSocket), or manage a running instance.
         \\
         \\SUBCOMMANDS:
-        \\  stop                   Stop a running gateway (sends SIGTERM)
-        \\  restart                Restart a running gateway (stop + start)
+        \\  stop                   Stop a running gateway
+        \\  restart                Restart a running gateway
+        \\  status                 Show gateway status (PID, port, uptime)
         \\
         \\OPTIONS:
         \\  --port PORT, -p PORT   Override gateway listen port
         \\  --host HOST            Override gateway listen host
         \\  --verbose, -v          Enable verbose logging
         \\  --help, -h             Show this help
+        \\
+        \\If managed by systemd, stop/restart use systemctl automatically.
         \\
     , .{});
 }
@@ -360,13 +363,16 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         return;
     }
 
-    // Handle subcommands: stop, restart
+    // Handle subcommands: stop, restart, status
     if (sub_args.len >= 1) {
         if (std.mem.eql(u8, sub_args[0], "stop")) {
             return gatewayStop(allocator);
         }
         if (std.mem.eql(u8, sub_args[0], "restart")) {
             return gatewayRestart(allocator, sub_args[1..]);
+        }
+        if (std.mem.eql(u8, sub_args[0], "status")) {
+            return gatewayStatus(allocator);
         }
     }
 
@@ -417,16 +423,98 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 
 // ── Gateway stop/restart ──────────────────────────────────────────
 
+/// Find gateway PID: try PID file first, then fall back to scanning /proc on Linux.
+fn findGatewayPid(allocator: std.mem.Allocator, cfg: *const yc.config.Config) u32 {
+    // Try PID file first
+    const pid = yc.daemon.readPidFile(allocator, cfg);
+    if (pid != 0) {
+        // Verify process is actually alive
+        std.posix.kill(@intCast(pid), 0) catch return 0;
+        return pid;
+    }
+    // Fallback: scan /proc for "nullclaw gateway" (Linux only)
+    return findGatewayPidByProc(allocator);
+}
+
+fn findGatewayPidByProc(allocator: std.mem.Allocator) u32 {
+    if (builtin.os.tag != .linux) return 0;
+
+    const self_pid = @as(u32, @intCast(std.os.linux.getpid()));
+    var dir = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const pid = std.fmt.parseInt(u32, entry.name, 10) catch continue;
+        if (pid == self_pid) continue;
+        // Read /proc/<pid>/cmdline
+        var path_buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cmdline", .{pid}) catch continue;
+        const file = std.fs.openFileAbsolute(path, .{}) catch continue;
+        defer file.close();
+        var buf: [512]u8 = undefined;
+        const len = file.readAll(&buf) catch continue;
+        if (len == 0) continue;
+        // cmdline is NUL-separated: check if it contains "nullclaw" and "gateway"
+        const cmdline = buf[0..len];
+        _ = allocator;
+        if (std.mem.indexOf(u8, cmdline, "nullclaw") != null and
+            std.mem.indexOf(u8, cmdline, "gateway") != null)
+        {
+            return pid;
+        }
+    }
+    return 0;
+}
+
+/// Check if nullclaw is managed by a systemd user service.
+fn isSystemdManaged() bool {
+    if (builtin.os.tag != .linux) return false;
+    const argv: []const []const u8 = &.{ "systemctl", "--user", "is-active", "--quiet", "nullclaw.service" };
+    var child = std.process.Child.init(argv, std.heap.page_allocator);
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    const term = child.spawnAndWait() catch return false;
+    return switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+}
+
+/// Run a systemctl --user command and wait for completion.
+fn systemctlUser(action: []const u8) bool {
+    const argv: []const []const u8 = &.{ "systemctl", "--user", action, "nullclaw.service" };
+    var child = std.process.Child.init(argv, std.heap.page_allocator);
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    const term = child.spawnAndWait() catch return false;
+    return switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+}
+
 fn gatewayStop(allocator: std.mem.Allocator) void {
+    if (isSystemdManaged()) {
+        std.debug.print("Gateway is managed by systemd. Running: systemctl --user stop nullclaw.service\n", .{});
+        if (systemctlUser("stop")) {
+            std.debug.print("Gateway stopped.\n", .{});
+        } else {
+            std.debug.print("Failed to stop via systemctl.\n", .{});
+            std.process.exit(1);
+        }
+        return;
+    }
+
     var cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
         std.process.exit(1);
     };
     defer cfg.deinit();
 
-    const pid = yc.daemon.readPidFile(allocator, &cfg);
+    const pid = findGatewayPid(allocator, &cfg);
     if (pid == 0) {
-        std.debug.print("No running gateway found (no PID file).\n", .{});
+        std.debug.print("No running gateway found.\n", .{});
         std.process.exit(1);
     }
 
@@ -440,9 +528,7 @@ fn gatewayStop(allocator: std.mem.Allocator) void {
     var waited: u8 = 0;
     while (waited < 10) : (waited += 1) {
         std.Thread.sleep(1 * std.time.ns_per_s);
-        // Check if process is still alive
         std.posix.kill(@intCast(pid), 0) catch {
-            // Process gone — success
             std.debug.print("Gateway stopped.\n", .{});
             return;
         };
@@ -452,18 +538,28 @@ fn gatewayStop(allocator: std.mem.Allocator) void {
 }
 
 fn gatewayRestart(allocator: std.mem.Allocator, remaining_args: []const []const u8) !void {
+    if (isSystemdManaged()) {
+        std.debug.print("Gateway is managed by systemd. Running: systemctl --user restart nullclaw.service\n", .{});
+        if (systemctlUser("restart")) {
+            std.debug.print("Gateway restarted.\n", .{});
+        } else {
+            std.debug.print("Failed to restart via systemctl.\n", .{});
+            std.process.exit(1);
+        }
+        return;
+    }
+
     var cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
         std.process.exit(1);
     };
 
-    const pid = yc.daemon.readPidFile(allocator, &cfg);
+    const pid = findGatewayPid(allocator, &cfg);
     cfg.deinit();
 
     if (pid != 0) {
         std.debug.print("Stopping gateway (PID {d})...\n", .{pid});
         std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch {};
-        // Wait up to 10s
         var waited: u8 = 0;
         while (waited < 10) : (waited += 1) {
             std.Thread.sleep(1 * std.time.ns_per_s);
@@ -472,7 +568,6 @@ fn gatewayRestart(allocator: std.mem.Allocator, remaining_args: []const []const 
         std.debug.print("Gateway stopped. Restarting...\n", .{});
     }
 
-    // Re-load config and start fresh
     var new_cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
         std.process.exit(1);
@@ -491,6 +586,43 @@ fn gatewayRestart(allocator: std.mem.Allocator, remaining_args: []const []const 
     applyRuntimeProviderOverrides(&new_cfg);
 
     try yc.daemon.run(allocator, &new_cfg, new_cfg.gateway.host, new_cfg.gateway.port);
+}
+
+fn gatewayStatus(allocator: std.mem.Allocator) void {
+    var cfg = yc.config.Config.load(allocator) catch {
+        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+        std.process.exit(1);
+    };
+    defer cfg.deinit();
+
+    const managed = isSystemdManaged();
+    const pid = findGatewayPid(allocator, &cfg);
+
+    std.debug.print("Gateway Status\n", .{});
+    std.debug.print("  Configured:  {s}:{d}\n", .{ cfg.gateway.host, cfg.gateway.port });
+    std.debug.print("  Managed by:  {s}\n", .{if (managed) "systemd (nullclaw.service)" else "manual"});
+
+    if (pid != 0) {
+        std.debug.print("  Status:      running (PID {d})\n", .{pid});
+        // Read daemon_state.json for component info
+        const state_path = yc.daemon.stateFilePath(allocator, &cfg) catch {
+            std.debug.print("  State file:  unavailable\n", .{});
+            return;
+        };
+        defer allocator.free(state_path);
+        const file = std.fs.openFileAbsolute(state_path, .{}) catch {
+            std.debug.print("  State file:  not found\n", .{});
+            return;
+        };
+        defer file.close();
+        var buf: [4096]u8 = undefined;
+        const len = file.readAll(&buf) catch 0;
+        if (len > 0) {
+            std.debug.print("  State:       {s}\n", .{buf[0..len]});
+        }
+    } else {
+        std.debug.print("  Status:      stopped\n", .{});
+    }
 }
 
 // ── Service ──────────────────────────────────────────────────────
