@@ -3253,20 +3253,7 @@ fn resolveRunnableCwd(cwd_opt: ?[]const u8) ?[]const u8 {
 }
 
 pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
-    // Prefer delegating to the live gateway so delivery (Telegram etc.) works.
-    if (readGatewayUrl(allocator)) |url| {
-        defer allocator.free(url);
-        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer body_buf.deinit(allocator);
-        body_buf.appendSlice(allocator, "{") catch {};
-        json_util.appendJsonKeyValue(&body_buf, allocator, "id", id) catch {};
-        body_buf.appendSlice(allocator, "}") catch {};
-        if (gatewayPost(allocator, url, "/cron/run", body_buf.items)) {
-            log.info("Job '{s}' triggered via gateway (delivery active).", .{id});
-            return;
-        }
-    }
-
+    // DB-direct execution — no gateway dependency.
     var cfg_opt: ?Config = Config.load(allocator) catch null;
     defer if (cfg_opt) |*cfg| cfg.deinit();
 
