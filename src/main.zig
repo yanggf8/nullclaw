@@ -437,17 +437,72 @@ fn findGatewayPid(allocator: std.mem.Allocator, cfg: *const yc.config.Config) u3
 }
 
 fn findGatewayPidByProc(allocator: std.mem.Allocator) u32 {
-    if (builtin.os.tag != .linux) return 0;
+    const pids = findAllGatewayPidsByProc(allocator);
+    defer allocator.free(pids);
+    return if (pids.len > 0) pids[0] else 0;
+}
+
+/// Check if a NUL-separated cmdline represents a "nullclaw gateway" daemon
+/// (i.e. argv[0] contains "nullclaw" and argv[1] is exactly "gateway",
+/// with no further subcommand like "stop"/"status"/"restart").
+fn isGatewayDaemonCmdline(cmdline: []const u8) bool {
+    // Split on NUL to get argv
+    var arg_idx: usize = 0;
+    var start: usize = 0;
+    var found_nullclaw = false;
+    var found_gateway_only = false;
+
+    for (cmdline, 0..) |byte, i| {
+        if (byte == 0) {
+            const arg = cmdline[start..i];
+            if (arg_idx == 0) {
+                found_nullclaw = std.mem.indexOf(u8, arg, "nullclaw") != null;
+            } else if (arg_idx == 1 and found_nullclaw) {
+                if (std.mem.eql(u8, arg, "gateway")) {
+                    found_gateway_only = true;
+                } else {
+                    return false;
+                }
+            } else if (arg_idx == 2 and found_gateway_only) {
+                // argv[2] exists — if it's a management subcommand, this is NOT a daemon
+                if (std.mem.eql(u8, arg, "stop") or
+                    std.mem.eql(u8, arg, "restart") or
+                    std.mem.eql(u8, arg, "status"))
+                {
+                    return false;
+                }
+                // Otherwise it's a flag like --port, still a daemon
+                return true;
+            }
+            arg_idx += 1;
+            start = i + 1;
+        }
+    }
+    // Handle last arg without trailing NUL
+    if (start < cmdline.len) {
+        const arg = cmdline[start..];
+        if (arg_idx == 1 and found_nullclaw) {
+            return std.mem.eql(u8, arg, "gateway");
+        }
+    }
+    return found_gateway_only;
+}
+
+/// Find ALL nullclaw gateway daemon processes via /proc scan (Linux only).
+fn findAllGatewayPidsByProc(allocator: std.mem.Allocator) []u32 {
+    if (builtin.os.tag != .linux) return allocator.alloc(u32, 0) catch &.{};
 
     const self_pid = @as(u32, @intCast(std.os.linux.getpid()));
-    var dir = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return 0;
+    var dir = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch
+        return allocator.alloc(u32, 0) catch &.{};
     defer dir.close();
+
+    var list: std.ArrayListUnmanaged(u32) = .empty;
     var iter = dir.iterate();
     while (iter.next() catch null) |entry| {
         if (entry.kind != .directory) continue;
         const pid = std.fmt.parseInt(u32, entry.name, 10) catch continue;
         if (pid == self_pid) continue;
-        // Read /proc/<pid>/cmdline
         var path_buf: [64]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cmdline", .{pid}) catch continue;
         const file = std.fs.openFileAbsolute(path, .{}) catch continue;
@@ -455,16 +510,11 @@ fn findGatewayPidByProc(allocator: std.mem.Allocator) u32 {
         var buf: [512]u8 = undefined;
         const len = file.readAll(&buf) catch continue;
         if (len == 0) continue;
-        // cmdline is NUL-separated: check if it contains "nullclaw" and "gateway"
-        const cmdline = buf[0..len];
-        _ = allocator;
-        if (std.mem.indexOf(u8, cmdline, "nullclaw") != null and
-            std.mem.indexOf(u8, cmdline, "gateway") != null)
-        {
-            return pid;
+        if (isGatewayDaemonCmdline(buf[0..len])) {
+            list.append(allocator, pid) catch continue;
         }
     }
-    return 0;
+    return list.toOwnedSlice(allocator) catch &.{};
 }
 
 /// Check if nullclaw is managed by a systemd user service.
@@ -494,6 +544,64 @@ fn systemctlUser(action: []const u8) bool {
     };
 }
 
+/// Send SIGTERM, wait up to 10s, then escalate to SIGKILL. Returns true if
+/// the process exited within the deadline.
+fn terminateAndWait(pid: u32) bool {
+    std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch |err| {
+        std.debug.print("Failed to send SIGTERM to PID {d}: {s}\n", .{ pid, @errorName(err) });
+        return false;
+    };
+
+    // Wait up to 10s for graceful exit
+    var waited: u8 = 0;
+    while (waited < 10) : (waited += 1) {
+        std.Thread.sleep(1 * std.time.ns_per_s);
+        std.posix.kill(@intCast(pid), 0) catch return true; // process gone
+    }
+
+    // Escalate to SIGKILL
+    std.debug.print("Process {d} did not exit after SIGTERM; sending SIGKILL...\n", .{pid});
+    std.posix.kill(@intCast(pid), std.posix.SIG.KILL) catch {};
+    waited = 0;
+    while (waited < 5) : (waited += 1) {
+        std.Thread.sleep(500 * std.time.ns_per_ms);
+        std.posix.kill(@intCast(pid), 0) catch return true;
+    }
+    return false;
+}
+
+/// Find the PID of a process listening on a given TCP port by scanning
+/// /proc/net/tcp (Linux only). Returns 0 if not found.
+fn findPidOnPort(allocator: std.mem.Allocator, port: u16) u32 {
+    if (builtin.os.tag != .linux) return 0;
+
+    // Use ss(8) which is widely available and avoids parsing /proc/net/tcp hex.
+    var port_buf: [8]u8 = undefined;
+    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch return 0;
+    const argv: []const []const u8 = &.{ "ss", "-tlnp", "sport", "=", port_str };
+    var child = std.process.Child.init(argv, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return 0;
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 8192) catch {
+        _ = child.wait() catch {};
+        return 0;
+    };
+    defer allocator.free(stdout);
+    _ = child.wait() catch {};
+
+    // Parse "pid=NNNN" from ss output
+    if (std.mem.indexOf(u8, stdout, "pid=")) |idx| {
+        const rest = stdout[idx + 4 ..];
+        var end: usize = 0;
+        while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') : (end += 1) {}
+        if (end > 0) {
+            return std.fmt.parseInt(u32, rest[0..end], 10) catch 0;
+        }
+    }
+    return 0;
+}
+
 fn gatewayStop(allocator: std.mem.Allocator) void {
     if (isSystemdManaged()) {
         std.debug.print("Gateway is managed by systemd. Running: systemctl --user stop nullclaw.service\n", .{});
@@ -503,38 +611,39 @@ fn gatewayStop(allocator: std.mem.Allocator) void {
             std.debug.print("Failed to stop via systemctl.\n", .{});
             std.process.exit(1);
         }
+        // Even with systemd, check for stale instances not managed by systemd
+        const stale = findAllGatewayPidsByProc(allocator);
+        defer allocator.free(stale);
+        for (stale) |p| {
+            std.debug.print("Cleaning up stale gateway PID {d}...\n", .{p});
+            _ = terminateAndWait(p);
+        }
         return;
     }
 
-    var cfg = yc.config.Config.load(allocator) catch {
-        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
-        std.process.exit(1);
-    };
-    defer cfg.deinit();
+    const all_pids = findAllGatewayPidsByProc(allocator);
+    defer allocator.free(all_pids);
 
-    const pid = findGatewayPid(allocator, &cfg);
-    if (pid == 0) {
+    if (all_pids.len == 0) {
         std.debug.print("No running gateway found.\n", .{});
         std.process.exit(1);
     }
 
-    std.debug.print("Stopping gateway (PID {d})...\n", .{pid});
-    std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch |err| {
-        std.debug.print("Failed to send SIGTERM to PID {d}: {s}\n", .{ pid, @errorName(err) });
-        std.process.exit(1);
-    };
-
-    // Wait up to 10s for process to exit
-    var waited: u8 = 0;
-    while (waited < 10) : (waited += 1) {
-        std.Thread.sleep(1 * std.time.ns_per_s);
-        std.posix.kill(@intCast(pid), 0) catch {
-            std.debug.print("Gateway stopped.\n", .{});
-            return;
-        };
+    var failed = false;
+    for (all_pids) |pid| {
+        std.debug.print("Stopping gateway (PID {d})...\n", .{pid});
+        if (terminateAndWait(pid)) {
+            std.debug.print("PID {d} stopped.\n", .{pid});
+        } else {
+            std.debug.print("Failed to stop PID {d} even with SIGKILL.\n", .{pid});
+            failed = true;
+        }
     }
-    std.debug.print("Gateway did not stop within 10s. You may need to kill PID {d} manually.\n", .{pid});
-    std.process.exit(1);
+    if (failed) {
+        std.process.exit(1);
+    } else {
+        std.debug.print("All gateway instances stopped.\n", .{});
+    }
 }
 
 fn gatewayRestart(allocator: std.mem.Allocator, remaining_args: []const []const u8) !void {
@@ -559,13 +668,11 @@ fn gatewayRestart(allocator: std.mem.Allocator, remaining_args: []const []const 
 
     if (pid != 0) {
         std.debug.print("Stopping gateway (PID {d})...\n", .{pid});
-        std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch {};
-        var waited: u8 = 0;
-        while (waited < 10) : (waited += 1) {
-            std.Thread.sleep(1 * std.time.ns_per_s);
-            std.posix.kill(@intCast(pid), 0) catch break;
+        if (!terminateAndWait(pid)) {
+            std.debug.print("WARNING: could not stop PID {d}; proceeding anyway.\n", .{pid});
+        } else {
+            std.debug.print("Gateway stopped. Restarting...\n", .{});
         }
-        std.debug.print("Gateway stopped. Restarting...\n", .{});
     }
 
     var new_cfg = yc.config.Config.load(allocator) catch {
@@ -578,6 +685,20 @@ fn gatewayRestart(allocator: std.mem.Allocator, remaining_args: []const []const 
         std.debug.print("Invalid port in CLI args.\n", .{});
         std.process.exit(1);
     };
+
+    // Check if target port is still occupied by a stale process
+    const target_port = new_cfg.gateway.port;
+    const port_holder = findPidOnPort(allocator, target_port);
+    if (port_holder != 0) {
+        std.debug.print("Port {d} is held by stale PID {d}; killing...\n", .{ target_port, port_holder });
+        if (!terminateAndWait(port_holder)) {
+            std.debug.print("ERROR: could not free port {d} (PID {d} won't die).\n", .{ target_port, port_holder });
+            std.debug.print("Try: nullclaw gateway restart --port <other-port>\n", .{});
+            std.process.exit(1);
+        }
+        // Brief pause to let the kernel release the socket
+        std.Thread.sleep(500 * std.time.ns_per_ms);
+    }
 
     new_cfg.validate() catch |err| {
         yc.config.Config.printValidationError(err);
@@ -597,6 +718,9 @@ fn gatewayStatus(allocator: std.mem.Allocator) void {
 
     const managed = isSystemdManaged();
     const pid = findGatewayPid(allocator, &cfg);
+    const port_holder = findPidOnPort(allocator, cfg.gateway.port);
+    const all_pids = findAllGatewayPidsByProc(allocator);
+    defer allocator.free(all_pids);
 
     std.debug.print("Gateway Status\n", .{});
     std.debug.print("  Configured:  {s}:{d}\n", .{ cfg.gateway.host, cfg.gateway.port });
@@ -604,6 +728,32 @@ fn gatewayStatus(allocator: std.mem.Allocator) void {
 
     if (pid != 0) {
         std.debug.print("  Status:      running (PID {d})\n", .{pid});
+    } else {
+        std.debug.print("  Status:      stopped\n", .{});
+    }
+
+    // Port occupancy info
+    if (port_holder != 0) {
+        if (pid != 0 and port_holder == pid) {
+            std.debug.print("  Port {d}:     bound (same PID)\n", .{cfg.gateway.port});
+        } else {
+            std.debug.print("  Port {d}:     CONFLICT — held by PID {d}\n", .{ cfg.gateway.port, port_holder });
+        }
+    } else if (pid == 0) {
+        std.debug.print("  Port {d}:     free\n", .{cfg.gateway.port});
+    }
+
+    // Report all gateway instances (detect duplicates / stale processes)
+    if (all_pids.len > 1) {
+        std.debug.print("  WARNING:     {d} gateway instances detected:\n", .{all_pids.len});
+        for (all_pids) |p| {
+            const marker: []const u8 = if (pid != 0 and p == pid) " (primary)" else " (stale)";
+            std.debug.print("               PID {d}{s}\n", .{ p, marker });
+        }
+        std.debug.print("  Run `nullclaw gateway stop` then `nullclaw gateway restart` to clean up.\n", .{});
+    }
+
+    if (pid != 0) {
         // Read daemon_state.json for component info
         const state_path = yc.daemon.stateFilePath(allocator, &cfg) catch {
             std.debug.print("  State file:  unavailable\n", .{});
@@ -620,8 +770,6 @@ fn gatewayStatus(allocator: std.mem.Allocator) void {
         if (len > 0) {
             std.debug.print("  State:       {s}\n", .{buf[0..len]});
         }
-    } else {
-        std.debug.print("  Status:      stopped\n", .{});
     }
 }
 
