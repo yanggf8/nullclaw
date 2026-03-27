@@ -2968,25 +2968,57 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, sho
     }
 
     if (show_all) {
-        // Show every job with cron expression, CST fire time, days, and status
-        var now_buf: [32]u8 = undefined;
-        const now_cst = formatCstTime(now + cst_offset, &now_buf);
-        log.info("All cron jobs ({d}), now: {s} CST:", .{ all_jobs.len, now_cst });
-        log.info("{s}", .{"─────────────────────────────────────────────────────────────────────────"});
+        // Show full week: expand each job into all its fire times for the next 7 days.
+        const cst_now = now + cst_offset;
+        const day_start_cst = cst_now - @mod(cst_now, 86400);
+        const week_start = day_start_cst - cst_offset; // start of today in UTC
+        const week_end = week_start + 7 * 86400;
 
-        // Sort indices by next_run_secs
-        var indices: std.ArrayListUnmanaged(usize) = .empty;
-        defer indices.deinit(allocator);
-        for (0..all_jobs.len) |i| try indices.append(allocator, i);
-        const jobs_ref = all_jobs;
-        std.mem.sortUnstable(usize, indices.items, jobs_ref, struct {
-            fn lessThan(ctx: []const CronJob, a: usize, b: usize) bool {
-                return ctx[a].next_run_secs < ctx[b].next_run_secs;
+        const FireEntry = struct { fire_time: i64, job_idx: usize };
+        var entries: std.ArrayListUnmanaged(FireEntry) = .empty;
+        defer entries.deinit(allocator);
+
+        for (all_jobs, 0..) |job, i| {
+            if (job.paused) continue;
+            // Walk the expression forward from start of today, collecting all fires within 7 days.
+            var cursor = week_start - 1;
+            var safety: u32 = 0;
+            while (safety < 200) : (safety += 1) {
+                const next = nextRunForCronExpression(job.expression, cursor) catch break;
+                if (next >= week_end) break;
+                if (next > cursor) {
+                    try entries.append(allocator, .{ .fire_time = next, .job_idx = i });
+                    cursor = next;
+                } else break;
+            }
+        }
+
+        // Sort by fire time
+        std.mem.sortUnstable(FireEntry, entries.items, {}, struct {
+            fn lessThan(_: void, a: FireEntry, b: FireEntry) bool {
+                return a.fire_time < b.fire_time;
             }
         }.lessThan);
 
-        for (indices.items) |idx| {
-            const job = all_jobs[idx];
+        var now_buf: [32]u8 = undefined;
+        const now_cst_str = formatCstTime(now + cst_offset, &now_buf);
+        log.info("Weekly schedule ({d} fires, now: {s} CST):", .{ entries.items.len, now_cst_str });
+        log.info("{s}", .{"─────────────────────────────────────────────────────────────────────────"});
+
+        const dow_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+
+        for (entries.items) |entry| {
+            const job = all_jobs[entry.job_idx];
+            var time_buf: [32]u8 = undefined;
+            const time_str = formatCstTime(entry.fire_time + cst_offset, &time_buf);
+
+            // Compute CST weekday
+            const cst_fire = entry.fire_time + cst_offset;
+            const fire_epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(cst_fire) };
+            const fire_day = fire_epoch.getEpochDay();
+            const weekday_num = @as(u3, @intCast((fire_day.day + 4) % 7));
+            const dow = dow_names[weekday_num];
+
             const label: []const u8 = switch (job.job_type) {
                 .skill => job.skill_name orelse "(unnamed)",
                 .agent => "agent",
@@ -2997,23 +3029,12 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, sho
                 .agent => if (job.prompt) |p| p[0..@min(p.len, 40)] else job.command,
                 .shell => "",
             };
-            const status = job.last_status orelse "never";
-            var next_buf: [32]u8 = undefined;
-            const next_str = formatCstTime(job.next_run_secs + cst_offset, &next_buf);
-            var days_buf: [64]u8 = undefined;
-            const days_str = formatCronDays(job.expression, &days_buf);
-            var cst_time_buf: [16]u8 = undefined;
-            const cst_time_str = formatCronTimeCst(job.expression, &cst_time_buf);
-            const paused_str: []const u8 = if (job.paused) " [paused]" else "";
+            const done: []const u8 = if (entry.fire_time < now) " [done]" else "";
 
             if (detail.len > 0) {
-                log.info("  {s} {s:<16} [{s}] {s}  {s}  (next: {s}, status: {s}{s})", .{
-                    cst_time_str, days_str, job.job_type.asStr(), label, detail, next_str, status, paused_str,
-                });
+                log.info("  {s} {s}  [{s}] {s}  {s}{s}", .{ dow, time_str, job.job_type.asStr(), label, detail, done });
             } else {
-                log.info("  {s} {s:<16} [{s}] {s}  (next: {s}, status: {s}{s})", .{
-                    cst_time_str, days_str, job.job_type.asStr(), label, next_str, status, paused_str,
-                });
+                log.info("  {s} {s}  [{s}] {s}{s}", .{ dow, time_str, job.job_type.asStr(), label, done });
             }
         }
         return;
