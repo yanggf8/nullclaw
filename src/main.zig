@@ -39,7 +39,7 @@ const Command = enum {
 };
 
 const SERVICE_SUBCOMMANDS = "install|start|stop|restart|status|uninstall";
-const CRON_SUBCOMMANDS = "list|status|add|add-agent|add-skill|once|once-agent|remove|pause|resume|run|update|runs|backup|restore|export-seed|load-seed";
+const CRON_SUBCOMMANDS = "list|status|schedule|add|add-agent|add-skill|once|once-agent|remove|pause|resume|run|update|runs|backup|restore|export-seed|load-seed";
 const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
@@ -905,6 +905,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\Commands:
             \\  list                          List all scheduled tasks
             \\  status                        Show scheduler daemon status
+            \\  schedule [--hours N]          Show upcoming jobs (default: 24h, CST)
             \\  add <expression> <command>    Add a recurring cron job
             \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
             \\                                Add a recurring agent cron job
@@ -934,6 +935,16 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliListJobs(allocator);
     } else if (std.mem.eql(u8, subcmd, "status")) {
         try yc.cron.cliStatus(allocator);
+    } else if (std.mem.eql(u8, subcmd, "schedule")) {
+        var hours: u32 = 24;
+        var i: usize = 1;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--hours") and i + 1 < sub_args.len) {
+                i += 1;
+                hours = std.fmt.parseInt(u32, sub_args[i], 10) catch 24;
+            }
+        }
+        try yc.cron.cliSchedule(allocator, hours);
     } else if (std.mem.eql(u8, subcmd, "add")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron add <expression> <command>\n", .{});

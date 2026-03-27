@@ -2879,6 +2879,94 @@ pub fn cliListJobs(allocator: std.mem.Allocator) !void {
     }
 }
 
+/// CLI: show upcoming schedule within a time window.
+/// Usage: nullclaw cron schedule [--hours N]
+/// Displays jobs sorted by next fire time in CST (UTC+8).
+pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32) !void {
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    const now = std.time.timestamp();
+    const window_end = now + @as(i64, hours) * 3600;
+    const cst_offset: i64 = 8 * 3600;
+
+    const all_jobs = scheduler.listJobs();
+
+    // Collect jobs within window
+    var upcoming: std.ArrayListUnmanaged(usize) = .empty;
+    defer upcoming.deinit(allocator);
+    for (all_jobs, 0..) |job, i| {
+        if (job.paused) continue;
+        if (job.next_run_secs >= now and job.next_run_secs < window_end) {
+            try upcoming.append(allocator, i);
+        }
+    }
+
+    // Sort by next_run_secs
+    const jobs_ref = all_jobs;
+    std.mem.sortUnstable(usize, upcoming.items, jobs_ref, struct {
+        fn lessThan(ctx: []const CronJob, a: usize, b: usize) bool {
+            return ctx[a].next_run_secs < ctx[b].next_run_secs;
+        }
+    }.lessThan);
+
+    if (upcoming.items.len == 0) {
+        log.info("No jobs scheduled in the next {d} hours.", .{hours});
+        return;
+    }
+
+    // Format header with current CST time
+    var now_buf: [32]u8 = undefined;
+    const now_cst = formatCstTime(now + cst_offset, &now_buf);
+    log.info("Schedule (next {d}h, now: {s} CST):", .{ hours, now_cst });
+    log.info("{s}", .{"─────────────────────────────────────────────────────────"});
+
+    for (upcoming.items) |idx| {
+        const job = all_jobs[idx];
+        var time_buf: [32]u8 = undefined;
+        const time_str = formatCstTime(job.next_run_secs + cst_offset, &time_buf);
+
+        const label: []const u8 = switch (job.job_type) {
+            .skill => job.skill_name orelse "(unnamed)",
+            .agent => "agent",
+            .shell => job.command,
+        };
+        const detail: []const u8 = switch (job.job_type) {
+            .skill => job.skill_args orelse "",
+            .agent => if (job.prompt) |p| p[0..@min(p.len, 40)] else job.command,
+            .shell => "",
+        };
+
+        if (detail.len > 0) {
+            log.info("  {s}  [{s}] {s}  {s}", .{ time_str, job.job_type.asStr(), label, detail });
+        } else {
+            log.info("  {s}  [{s}] {s}", .{ time_str, job.job_type.asStr(), label });
+        }
+    }
+}
+
+/// Format a UTC timestamp (already offset to CST) into "HH:MM" or "Mar 27 HH:MM" format.
+fn formatCstTime(cst_secs: i64, buf: []u8) []const u8 {
+    if (cst_secs < 0) return "??:??";
+    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = @intCast(cst_secs) };
+    const day_seconds = epoch_secs.getDaySeconds();
+    const epoch_day = epoch_secs.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    const month_num = month_day.month.numeric();
+    const month_index = if (month_num > 0 and month_num <= 12) month_num - 1 else 0;
+
+    const len = std.fmt.bufPrint(buf, "{s} {d:0>2} {d:0>2}:{d:0>2}", .{
+        month_names[month_index],
+        month_day.day_index + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+    }) catch return "??:??";
+    return buf[0..len.len];
+}
+
 /// CLI: show scheduler daemon status and diagnostics.
 pub fn cliStatus(allocator: std.mem.Allocator) !void {
     const sched_status = checkSchedulerStatus(allocator);
