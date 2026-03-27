@@ -3924,7 +3924,10 @@ pub fn cliExportSeed(allocator: std.mem.Allocator) !void {
 }
 
 /// CLI: load jobs from ~/.nullclaw/cron-seed.json into DB (DB-direct, no gateway).
-pub fn cliLoadSeed(allocator: std.mem.Allocator) !void {
+/// Initialize cron DB from seed file. DESTRUCTIVE: clears all existing jobs and run queue.
+/// Use only for fresh system setup. For operational changes, use update/remove/add-skill.
+/// For recovery, use `cron restore`.
+pub fn cliInitSeed(allocator: std.mem.Allocator) !void {
     const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
     const seed_path = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron-seed.json" });
@@ -3951,11 +3954,37 @@ pub fn cliLoadSeed(allocator: std.mem.Allocator) !void {
     defer closeCronDb(db);
     try ensureCronTable(db);
 
-    // Clear existing jobs — load-seed is a full replacement
+    // Check if DB already has jobs — warn and require confirmation.
+    const existing_count = blk: {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM cron_jobs", -1, &stmt, null) != c.SQLITE_OK) break :blk @as(i64, 0);
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) == c.SQLITE_ROW) break :blk c.sqlite3_column_int64(stmt, 0);
+        break :blk @as(i64, 0);
+    };
+
+    if (existing_count > 0) {
+        std.debug.print(
+            "WARNING: cron DB has {d} existing job(s). init-seed will DELETE ALL of them.\n" ++
+                "This is for fresh system setup only. For recovery, use 'cron restore'.\n" ++
+                "Type 'yes' to confirm: ",
+            .{existing_count},
+        );
+
+        const stdin = std.fs.File.stdin();
+        var buf: [64]u8 = undefined;
+        const n = stdin.read(&buf) catch 0;
+        const input = std.mem.trimRight(u8, buf[0..n], "\r\n ");
+        if (!std.mem.eql(u8, input, "yes")) {
+            log.info("Aborted.", .{});
+            return;
+        }
+    }
+
+    // DESTRUCTIVE: init-seed replaces ALL jobs. Use only for fresh setup.
+    log.warn("init-seed: WIPING all existing jobs and run queue", .{});
     _ = c.sqlite3_exec(db, "DELETE FROM cron_jobs", null, null, null);
-    // Also clear the run queue so stale references don't linger
     _ = c.sqlite3_exec(db, "DELETE FROM cron_queue", null, null, null);
-    log.info("Cleared existing jobs before seeding", .{});
 
     var count: usize = 0;
     for (parsed.value.array.items) |item| {

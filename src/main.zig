@@ -39,7 +39,7 @@ const Command = enum {
 };
 
 const SERVICE_SUBCOMMANDS = "install|start|stop|restart|status|uninstall";
-const CRON_SUBCOMMANDS = "list|status|schedule|add|add-agent|add-skill|once|once-agent|remove|pause|resume|run|update|runs|backup|restore|export-seed|load-seed";
+const CRON_SUBCOMMANDS = "list|status|schedule|add|add-agent|add-skill|once|once-agent|remove|pause|resume|run|update|runs|backup|restore|export-seed|init-seed";
 const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
@@ -923,7 +923,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  backup                        Backup cron.db to ~/.nullclaw/backup/
             \\  restore [file]                Restore cron.db from latest backup or specified file
             \\  export-seed                   Export enabled jobs to ~/.nullclaw/cron-seed.json
-            \\  load-seed                     Load jobs from ~/.nullclaw/cron-seed.json into DB
+            \\  init-seed                     Initialize DB from ~/.nullclaw/cron-seed.json (DESTRUCTIVE: replaces all jobs)
             \\
         , .{CRON_SUBCOMMANDS}), .{});
         std.process.exit(1);
@@ -1066,8 +1066,8 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliRestore(allocator, file);
     } else if (std.mem.eql(u8, subcmd, "export-seed")) {
         try yc.cron.cliExportSeed(allocator);
-    } else if (std.mem.eql(u8, subcmd, "load-seed")) {
-        try yc.cron.cliLoadSeed(allocator);
+    } else if (std.mem.eql(u8, subcmd, "init-seed")) {
+        try yc.cron.cliInitSeed(allocator);
     } else {
         std.debug.print("Unknown cron command: {s}\n", .{subcmd});
         std.process.exit(1);
