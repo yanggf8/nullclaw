@@ -938,6 +938,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     } else if (std.mem.eql(u8, subcmd, "schedule")) {
         var hours: u32 = 24;
         var show_all = false;
+        var show_today = false;
         var i: usize = 1;
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--hours") and i + 1 < sub_args.len) {
@@ -946,15 +947,10 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             } else if (std.mem.eql(u8, sub_args[i], "--all")) {
                 show_all = true;
             } else if (std.mem.eql(u8, sub_args[i], "--today")) {
-                // Hours remaining until end of day in CST (23:59:59)
-                const now = std.time.timestamp();
-                const cst_now = now + 8 * 3600;
-                const secs_into_day = @mod(cst_now, 86400);
-                const remaining: u32 = @intCast(86400 - secs_into_day);
-                hours = remaining / 3600 + 1; // round up
+                show_today = true;
             }
         }
-        try yc.cron.cliSchedule(allocator, hours, show_all);
+        try yc.cron.cliSchedule(allocator, hours, show_all, show_today);
     } else if (std.mem.eql(u8, subcmd, "add")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron add <expression> <command>\n", .{});

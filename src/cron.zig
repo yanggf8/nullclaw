@@ -2882,7 +2882,7 @@ pub fn cliListJobs(allocator: std.mem.Allocator) !void {
 /// CLI: show upcoming schedule within a time window, or all jobs.
 /// Usage: nullclaw cron schedule [--hours N] [--all]
 /// Displays jobs sorted by next fire time in CST (UTC+8).
-pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool) !void {
+pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, show_today: bool) !void {
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -2893,6 +2893,77 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool) !vo
 
     if (all_jobs.len == 0) {
         log.info("No cron jobs configured.", .{});
+        return;
+    }
+
+    if (show_today) {
+        // Full day in CST: 00:00 to 23:59:59
+        const cst_now = now + cst_offset;
+        const day_start_cst = cst_now - @mod(cst_now, 86400);
+        const window_start = day_start_cst - cst_offset; // back to UTC
+        const window_end = window_start + 86400;
+
+        var upcoming: std.ArrayListUnmanaged(usize) = .empty;
+        defer upcoming.deinit(allocator);
+        for (all_jobs, 0..) |job, i| {
+            if (job.paused) continue;
+            // Check if this job fires today by computing next-run from start of CST day
+            // The stored next_run_secs may be for a future day, so also check if the
+            // expression would match today by testing if next_run from day_start lands within today
+            if (job.next_run_secs >= window_start and job.next_run_secs < window_end) {
+                try upcoming.append(allocator, i);
+            } else {
+                // Job's next_run is beyond today, but it may have already fired today.
+                // Check if computing next-run from yesterday's end lands within today.
+                const next_from_start = nextRunForCronExpression(job.expression, window_start - 1) catch continue;
+                if (next_from_start >= window_start and next_from_start < window_end) {
+                    try upcoming.append(allocator, i);
+                }
+            }
+        }
+
+        const jobs_ref = all_jobs;
+        std.mem.sortUnstable(usize, upcoming.items, jobs_ref, struct {
+            fn lessThan(ctx: []const CronJob, a: usize, b: usize) bool {
+                // Sort by the CST time of the expression, not next_run_secs
+                return ctx[a].next_run_secs < ctx[b].next_run_secs;
+            }
+        }.lessThan);
+
+        var now_buf: [32]u8 = undefined;
+        const now_cst_str = formatCstTime(now + cst_offset, &now_buf);
+        log.info("Today's schedule ({d} jobs, now: {s} CST):", .{ upcoming.items.len, now_cst_str });
+        log.info("{s}", .{"─────────────────────────────────────────────────────────────────────────"});
+
+        for (upcoming.items) |idx| {
+            const job = all_jobs[idx];
+            // Compute the actual fire time for today
+            const fire_time = blk: {
+                const ft = nextRunForCronExpression(job.expression, window_start - 1) catch job.next_run_secs;
+                break :blk if (ft >= window_start and ft < window_end) ft else job.next_run_secs;
+            };
+            var time_buf: [32]u8 = undefined;
+            const time_str = formatCstTime(fire_time + cst_offset, &time_buf);
+
+            const label: []const u8 = switch (job.job_type) {
+                .skill => job.skill_name orelse "(unnamed)",
+                .agent => "agent",
+                .shell => job.command,
+            };
+            const detail: []const u8 = switch (job.job_type) {
+                .skill => job.skill_args orelse "",
+                .agent => if (job.prompt) |p| p[0..@min(p.len, 40)] else job.command,
+                .shell => "",
+            };
+            const status = job.last_status orelse "never";
+            const done: []const u8 = if (fire_time < now) " [done]" else "";
+
+            if (detail.len > 0) {
+                log.info("  {s}  [{s}] {s}  {s}  (status: {s}{s})", .{ time_str, job.job_type.asStr(), label, detail, status, done });
+            } else {
+                log.info("  {s}  [{s}] {s}  (status: {s}{s})", .{ time_str, job.job_type.asStr(), label, status, done });
+            }
+        }
         return;
     }
 
