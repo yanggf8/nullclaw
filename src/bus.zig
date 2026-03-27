@@ -510,6 +510,10 @@ pub const Bus = struct {
         return self.outbound.publish(msg);
     }
 
+    pub fn publishOutboundTimeout(self: *Bus, msg: OutboundMessage, timeout_ms: u32) error{ Closed, Timeout }!void {
+        return self.outbound.publishTimeout(msg, timeout_ms);
+    }
+
     pub fn consumeOutbound(self: *Bus) ?OutboundMessage {
         return self.outbound.consume();
     }
