@@ -2879,21 +2879,78 @@ pub fn cliListJobs(allocator: std.mem.Allocator) !void {
     }
 }
 
-/// CLI: show upcoming schedule within a time window.
-/// Usage: nullclaw cron schedule [--hours N]
+/// CLI: show upcoming schedule within a time window, or all jobs.
+/// Usage: nullclaw cron schedule [--hours N] [--all]
 /// Displays jobs sorted by next fire time in CST (UTC+8).
-pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32) !void {
+pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool) !void {
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
     const now = std.time.timestamp();
-    const window_end = now + @as(i64, hours) * 3600;
     const cst_offset: i64 = 8 * 3600;
-
     const all_jobs = scheduler.listJobs();
 
-    // Collect jobs within window
+    if (all_jobs.len == 0) {
+        log.info("No cron jobs configured.", .{});
+        return;
+    }
+
+    if (show_all) {
+        // Show every job with cron expression, CST fire time, days, and status
+        var now_buf: [32]u8 = undefined;
+        const now_cst = formatCstTime(now + cst_offset, &now_buf);
+        log.info("All cron jobs ({d}), now: {s} CST:", .{ all_jobs.len, now_cst });
+        log.info("{s}", .{"─────────────────────────────────────────────────────────────────────────"});
+
+        // Sort indices by next_run_secs
+        var indices: std.ArrayListUnmanaged(usize) = .empty;
+        defer indices.deinit(allocator);
+        for (0..all_jobs.len) |i| try indices.append(allocator, i);
+        const jobs_ref = all_jobs;
+        std.mem.sortUnstable(usize, indices.items, jobs_ref, struct {
+            fn lessThan(ctx: []const CronJob, a: usize, b: usize) bool {
+                return ctx[a].next_run_secs < ctx[b].next_run_secs;
+            }
+        }.lessThan);
+
+        for (indices.items) |idx| {
+            const job = all_jobs[idx];
+            const label: []const u8 = switch (job.job_type) {
+                .skill => job.skill_name orelse "(unnamed)",
+                .agent => "agent",
+                .shell => job.command,
+            };
+            const detail: []const u8 = switch (job.job_type) {
+                .skill => job.skill_args orelse "",
+                .agent => if (job.prompt) |p| p[0..@min(p.len, 40)] else job.command,
+                .shell => "",
+            };
+            const status = job.last_status orelse "never";
+            var next_buf: [32]u8 = undefined;
+            const next_str = formatCstTime(job.next_run_secs + cst_offset, &next_buf);
+            var days_buf: [64]u8 = undefined;
+            const days_str = formatCronDays(job.expression, &days_buf);
+            var cst_time_buf: [16]u8 = undefined;
+            const cst_time_str = formatCronTimeCst(job.expression, &cst_time_buf);
+            const paused_str: []const u8 = if (job.paused) " [paused]" else "";
+
+            if (detail.len > 0) {
+                log.info("  {s} {s:<16} [{s}] {s}  {s}  (next: {s}, status: {s}{s})", .{
+                    cst_time_str, days_str, job.job_type.asStr(), label, detail, next_str, status, paused_str,
+                });
+            } else {
+                log.info("  {s} {s:<16} [{s}] {s}  (next: {s}, status: {s}{s})", .{
+                    cst_time_str, days_str, job.job_type.asStr(), label, next_str, status, paused_str,
+                });
+            }
+        }
+        return;
+    }
+
+    // Window-based upcoming view
+    const window_end = now + @as(i64, hours) * 3600;
+
     var upcoming: std.ArrayListUnmanaged(usize) = .empty;
     defer upcoming.deinit(allocator);
     for (all_jobs, 0..) |job, i| {
@@ -2903,7 +2960,6 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32) !void {
         }
     }
 
-    // Sort by next_run_secs
     const jobs_ref = all_jobs;
     std.mem.sortUnstable(usize, upcoming.items, jobs_ref, struct {
         fn lessThan(ctx: []const CronJob, a: usize, b: usize) bool {
@@ -2916,7 +2972,6 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32) !void {
         return;
     }
 
-    // Format header with current CST time
     var now_buf: [32]u8 = undefined;
     const now_cst = formatCstTime(now + cst_offset, &now_buf);
     log.info("Schedule (next {d}h, now: {s} CST):", .{ hours, now_cst });
@@ -2944,6 +2999,94 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32) !void {
             log.info("  {s}  [{s}] {s}", .{ time_str, job.job_type.asStr(), label });
         }
     }
+}
+
+/// Parse cron expression dow field into human-readable day names (CST-adjusted).
+/// If the UTC hour + 8 >= 24, the effective CST day is +1 from the cron dow.
+fn formatCronDays(expression: []const u8, buf: []u8) []const u8 {
+    const dow_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    var it = std.mem.splitScalar(u8, expression, ' ');
+    var field_idx: u8 = 0;
+    var hour_field: []const u8 = "*";
+    var dow_field: []const u8 = "*";
+    while (it.next()) |field| {
+        if (field.len == 0) continue;
+        if (field_idx == 1) hour_field = field;
+        if (field_idx == 4) { dow_field = field; break; }
+        field_idx += 1;
+    }
+
+    // Determine if CST crosses midnight (UTC hour + 8 >= 24 means next day)
+    const day_shift: u8 = blk: {
+        const hour_utc = std.fmt.parseInt(u8, hour_field, 10) catch break :blk 0;
+        break :blk if (hour_utc + 8 >= 24) 1 else 0;
+    };
+
+    if (std.mem.eql(u8, dow_field, "*")) {
+        return std.fmt.bufPrint(buf, "Every day", .{}) catch "Every day";
+    }
+
+    var pos: usize = 0;
+    var part_it = std.mem.splitScalar(u8, dow_field, ',');
+    var first = true;
+    while (part_it.next()) |part| {
+        if (!first and pos < buf.len) {
+            buf[pos] = ',';
+            pos += 1;
+        }
+        first = false;
+
+        if (std.mem.indexOfScalar(u8, part, '-')) |dash| {
+            const lo = std.fmt.parseInt(u8, part[0..dash], 10) catch continue;
+            const hi = std.fmt.parseInt(u8, part[dash + 1 ..], 10) catch continue;
+            var d = lo;
+            while (d <= hi) : (d += 1) {
+                if (d > lo and pos < buf.len) {
+                    buf[pos] = ',';
+                    pos += 1;
+                }
+                const cst_d = (d + day_shift) % 7;
+                const name = if (cst_d <= 6) dow_names[cst_d] else "?";
+                for (name) |ch| {
+                    if (pos < buf.len) {
+                        buf[pos] = ch;
+                        pos += 1;
+                    }
+                }
+            }
+        } else {
+            const d = std.fmt.parseInt(u8, part, 10) catch continue;
+            const cst_d = (d + day_shift) % 7;
+            const name = if (cst_d <= 6) dow_names[cst_d] else "?";
+            for (name) |ch| {
+                if (pos < buf.len) {
+                    buf[pos] = ch;
+                    pos += 1;
+                }
+            }
+        }
+    }
+    return buf[0..pos];
+}
+
+/// Parse cron expression minute+hour fields into CST time string "HH:MM".
+fn formatCronTimeCst(expression: []const u8, buf: []u8) []const u8 {
+    var it = std.mem.splitScalar(u8, expression, ' ');
+    var field_idx: u8 = 0;
+    var min_field: []const u8 = "*";
+    var hour_field: []const u8 = "*";
+    while (it.next()) |field| {
+        if (field.len == 0) continue;
+        if (field_idx == 0) min_field = field;
+        if (field_idx == 1) { hour_field = field; break; }
+        field_idx += 1;
+    }
+
+    const minute = std.fmt.parseInt(u8, min_field, 10) catch return std.fmt.bufPrint(buf, "**:{s}", .{min_field}) catch "??:??";
+    const hour_utc = std.fmt.parseInt(u8, hour_field, 10) catch return std.fmt.bufPrint(buf, "{s}:{d:0>2}", .{ hour_field, minute }) catch "??:??";
+    const hour_cst = (hour_utc + 8) % 24;
+
+    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ hour_cst, minute }) catch "??:??";
 }
 
 /// Format a UTC timestamp (already offset to CST) into "HH:MM" or "Mar 27 HH:MM" format.
