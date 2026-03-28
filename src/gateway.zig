@@ -2577,6 +2577,8 @@ fn appendCronJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Alloca
     if (job.skill_name) |sn| try appendJsonStringBuf(buf, allocator, sn) else try buf.appendSlice(allocator, "null");
     try buf.appendSlice(allocator, ",\"skill_args\":");
     if (job.skill_args) |sa| try appendJsonStringBuf(buf, allocator, sa) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"tz_offset_s\":");
+    try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{job.tz_offset_s}) catch "0");
     try buf.appendSlice(allocator, "}");
 }
 
@@ -2642,6 +2644,8 @@ fn appendCronBackendJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem
     if (job.skill_name) |sn| try appendJsonStringBuf(buf, allocator, sn) else try buf.appendSlice(allocator, "null");
     try buf.appendSlice(allocator, ",\"skill_args\":");
     if (job.skill_args) |sa| try appendJsonStringBuf(buf, allocator, sa) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"tz_offset_s\":");
+    try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{job.tz_offset_s}) catch "0");
     try buf.appendSlice(allocator, "}");
 }
 
@@ -3251,6 +3255,10 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
     };
 
     const next_run_secs_opt: ?i64 = jsonIntField(body, "next_run_secs");
+    const tz_offset_s_opt: ?i32 = blk: {
+        const v = jsonIntField(body, "tz_offset_s") orelse break :blk null;
+        break :blk @intCast(v);
+    };
     const skill_name_upd = cronObjectStringField(obj, "skill_name");
     const skill_args_upd = cronObjectStringField(obj, "skill_args");
 
@@ -3271,6 +3279,7 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
             .delivery_account_id = delivery_account_id,
             .timeout_secs = timeout_secs_opt,
             .next_run_secs = next_run_secs_opt,
+            .tz_offset_s = tz_offset_s_opt,
         };
         const found = be.backend().update(id, patch) catch false;
         if (!found) {
@@ -3307,6 +3316,7 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
         .delivery_account_id = delivery_account_id,
         .timeout_secs = timeout_secs_opt,
         .next_run_secs = next_run_secs_opt,
+        .tz_offset_s = tz_offset_s_opt,
     };
 
     if (!sched.updateJob(sched.allocator, id, patch)) {

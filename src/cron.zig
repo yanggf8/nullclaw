@@ -121,6 +121,7 @@ pub const CronJobPatch = struct {
     delivery_account_id: ?[]const u8 = null,
     timeout_secs: ?u32 = null,
     next_run_secs: ?i64 = null,
+    tz_offset_s: ?i32 = null,
 };
 
 /// A scheduled cron job.
@@ -146,6 +147,7 @@ pub const CronJob = struct {
     created_at_s: i64 = 0,
     last_output: ?[]const u8 = null,
     delivery: DeliveryConfig = .{},
+    tz_offset_s: i32 = 0,
 };
 
 /// Duration unit for "once" delay parsing.
@@ -363,10 +365,11 @@ fn parseCronExpression(expression: []const u8) !ParsedCronExpression {
     return parsed;
 }
 
-fn cronExpressionMatches(parsed: *const ParsedCronExpression, ts: i64) bool {
-    if (ts < 0) return false;
+fn cronExpressionMatches(parsed: *const ParsedCronExpression, ts: i64, tz_offset_s: i32) bool {
+    const local_ts = ts + @as(i64, tz_offset_s);
+    if (local_ts < 0) return false;
 
-    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(ts) };
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(local_ts) };
     const epoch_day = epoch_seconds.getEpochDay();
     const year_day = epoch_day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
@@ -406,12 +409,16 @@ fn alignToNextMinute(from_secs: i64) i64 {
 }
 
 pub fn nextRunForCronExpression(expression: []const u8, from_secs: i64) !i64 {
+    return nextRunForCronExpressionTz(expression, from_secs, 0);
+}
+
+pub fn nextRunForCronExpressionTz(expression: []const u8, from_secs: i64, tz_offset_s: i32) !i64 {
     const parsed = try parseCronExpression(expression);
     var candidate = alignToNextMinute(from_secs);
 
     var i: usize = 0;
     while (i < MAX_CRON_LOOKAHEAD_MINUTES) : (i += 1) {
-        if (cronExpressionMatches(&parsed, candidate)) return candidate;
+        if (cronExpressionMatches(&parsed, candidate, tz_offset_s)) return candidate;
         candidate += 60;
     }
     return error.NoFutureRunFound;
@@ -676,8 +683,10 @@ pub const CronScheduler = struct {
     /// Update a job's fields from a patch.
     pub fn updateJob(self: *CronScheduler, allocator: std.mem.Allocator, id: []const u8, patch: CronJobPatch) bool {
         const job = self.getMutableJob(id) orelse return false;
+        // Apply tz_offset_s before expression so the new offset is used for next_run calculation.
+        if (patch.tz_offset_s) |tz| job.tz_offset_s = tz;
         if (patch.expression) |expr| {
-            const next_run_secs = nextRunForCronExpression(expr, std.time.timestamp()) catch return false;
+            const next_run_secs = nextRunForCronExpressionTz(expr, std.time.timestamp(), job.tz_offset_s) catch return false;
             const new_expr = allocator.dupe(u8, expr) catch return false;
             allocator.free(job.expression);
             job.expression = new_expr;
@@ -1035,7 +1044,7 @@ pub const CronScheduler = struct {
                     job.paused = true;
                 };
             } else {
-                job.next_run_secs = nextRunForCronExpression(job.expression, now) catch |err| blk: {
+                job.next_run_secs = nextRunForCronExpressionTz(job.expression, now, job.tz_offset_s) catch |err| blk: {
                     log.warn("cron job '{s}' schedule parse failed ({s}); fallback to +60s", .{ job.id, @errorName(err) });
                     break :blk now + 60;
                 };
@@ -1081,7 +1090,7 @@ pub const CronScheduler = struct {
                     job.paused = true;
                 };
             } else {
-                job.next_run_secs = nextRunForCronExpression(job.expression, now) catch |err| blk: {
+                job.next_run_secs = nextRunForCronExpressionTz(job.expression, now, job.tz_offset_s) catch |err| blk: {
                     log.warn("cron job '{s}' schedule parse failed ({s}); fallback to +60s", .{ job.id, @errorName(err) });
                     break :blk now + 60;
                 };
@@ -1943,6 +1952,8 @@ pub fn ensureCronTable(db: *c.sqlite3) !void {
     // Migration: add skill_name/skill_args columns for skill job type.
     _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN skill_name TEXT", null, null, null);
     _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN skill_args TEXT", null, null, null);
+    // Migration: add tz_offset_s column for per-job timezone offset (seconds, default 0 = UTC).
+    _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN tz_offset_s INTEGER NOT NULL DEFAULT 0", null, null, null);
     try ensureRunQueueTable(db);
 }
 
@@ -1954,8 +1965,8 @@ fn dbSaveJob(db: *c.sqlite3, job: *const CronJob) !void {
         "next_run_secs, last_run_secs, last_status, paused, one_shot, " ++
         "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
         "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs, " ++
-        "delivery_best_effort, session_target, skill_name, skill_args) " ++
-        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)";
+        "delivery_best_effort, session_target, skill_name, skill_args, tz_offset_s) " ++
+        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)";
 
     var stmt: ?*c.sqlite3_stmt = null;
     var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
@@ -2038,6 +2049,7 @@ fn dbSaveJob(db: *c.sqlite3, job: *const CronJob) !void {
     } else {
         _ = c.sqlite3_bind_null(stmt, 25);
     }
+    _ = c.sqlite3_bind_int(stmt, 26, job.tz_offset_s);
 
     rc = c.sqlite3_step(stmt);
     if (rc != c.SQLITE_DONE) return error.StepFailed;
@@ -2171,7 +2183,7 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
         "next_run_secs, last_run_secs, last_status, paused, one_shot, " ++
         "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
         "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs, " ++
-        "skill_name, skill_args, delivery_best_effort " ++
+        "skill_name, skill_args, delivery_best_effort, tz_offset_s " ++
         "FROM cron_jobs ORDER BY rowid ASC";
 
     var stmt: ?*c.sqlite3_stmt = null;
@@ -2256,6 +2268,7 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
         const skill_name_opt = try dbColumnTextOpt(stmt, 21, allocator);
         const skill_args_opt = try dbColumnTextOpt(stmt, 22, allocator);
         const delivery_best_effort = c.sqlite3_column_int(stmt, 23) != 0;
+        const tz_offset_s: i32 = @intCast(c.sqlite3_column_int(stmt, 24));
 
         // Normalize last_status to a static literal ("ok"/"error"/null).
         // freeJobOwned does NOT free last_status, so we must never heap-allocate it.
@@ -2295,6 +2308,7 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
                 .to_owned = delivery_to != null,
                 .best_effort = delivery_best_effort,
             },
+            .tz_offset_s = tz_offset_s,
         });
     }
 }
@@ -2888,7 +2902,6 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, sho
     try loadJobs(&scheduler);
 
     const now = std.time.timestamp();
-    const cst_offset: i64 = 8 * 3600;
     const all_jobs = scheduler.listJobs();
 
     if (all_jobs.len == 0) {
@@ -2897,25 +2910,24 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, sho
     }
 
     if (show_today) {
-        // Full day in CST: 00:00 to 23:59:59
-        const cst_now = now + cst_offset;
-        const day_start_cst = cst_now - @mod(cst_now, 86400);
-        const window_start = day_start_cst - cst_offset; // back to UTC
+        // Use the first job's tz_offset for the "now" display, or default to UTC+8.
+        const display_tz: i64 = if (all_jobs.len > 0) @as(i64, all_jobs[0].tz_offset_s) else 8 * 3600;
+        // Full day in job-local time: 00:00 to 23:59:59
+        const local_now = now + display_tz;
+        const day_start_local = local_now - @mod(local_now, 86400);
+        const window_start = day_start_local - display_tz; // back to UTC
         const window_end = window_start + 86400;
 
         var upcoming: std.ArrayListUnmanaged(usize) = .empty;
         defer upcoming.deinit(allocator);
         for (all_jobs, 0..) |job, i| {
             if (job.paused) continue;
-            // Check if this job fires today by computing next-run from start of CST day
-            // The stored next_run_secs may be for a future day, so also check if the
-            // expression would match today by testing if next_run from day_start lands within today
+            // Check if this job fires today by computing next-run from start of day
             if (job.next_run_secs >= window_start and job.next_run_secs < window_end) {
                 try upcoming.append(allocator, i);
             } else {
                 // Job's next_run is beyond today, but it may have already fired today.
-                // Check if computing next-run from yesterday's end lands within today.
-                const next_from_start = nextRunForCronExpression(job.expression, window_start - 1) catch continue;
+                const next_from_start = nextRunForCronExpressionTz(job.expression, window_start - 1, job.tz_offset_s) catch continue;
                 if (next_from_start >= window_start and next_from_start < window_end) {
                     try upcoming.append(allocator, i);
                 }
@@ -2925,25 +2937,26 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, sho
         const jobs_ref = all_jobs;
         std.mem.sortUnstable(usize, upcoming.items, jobs_ref, struct {
             fn lessThan(ctx: []const CronJob, a: usize, b: usize) bool {
-                // Sort by the CST time of the expression, not next_run_secs
                 return ctx[a].next_run_secs < ctx[b].next_run_secs;
             }
         }.lessThan);
 
         var now_buf: [32]u8 = undefined;
-        const now_cst_str = formatCstTime(now + cst_offset, &now_buf);
-        log.info("Today's schedule ({d} jobs, now: {s} CST):", .{ upcoming.items.len, now_cst_str });
+        const now_local_str = formatCstTime(now + display_tz, &now_buf);
+        const tz_label = formatTzLabel(display_tz);
+        log.info("Today's schedule ({d} jobs, now: {s} {s}):", .{ upcoming.items.len, now_local_str, tz_label });
         log.info("{s}", .{"─────────────────────────────────────────────────────────────────────────"});
 
         for (upcoming.items) |idx| {
             const job = all_jobs[idx];
+            const job_tz: i64 = @as(i64, job.tz_offset_s);
             // Compute the actual fire time for today
             const fire_time = blk: {
-                const ft = nextRunForCronExpression(job.expression, window_start - 1) catch job.next_run_secs;
+                const ft = nextRunForCronExpressionTz(job.expression, window_start - 1, job.tz_offset_s) catch job.next_run_secs;
                 break :blk if (ft >= window_start and ft < window_end) ft else job.next_run_secs;
             };
             var time_buf: [32]u8 = undefined;
-            const time_str = formatCstTime(fire_time + cst_offset, &time_buf);
+            const time_str = formatCstTime(fire_time + job_tz, &time_buf);
 
             const label: []const u8 = switch (job.job_type) {
                 .skill => job.skill_name orelse "(unnamed)",
@@ -2969,9 +2982,11 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, sho
 
     if (show_all) {
         // Show full week: expand each job into all its fire times for the next 7 days.
-        const cst_now = now + cst_offset;
-        const day_start_cst = cst_now - @mod(cst_now, 86400);
-        const week_start = day_start_cst - cst_offset; // start of today in UTC
+        // Use the first job's tz_offset for the display window, or default to UTC+8.
+        const display_tz: i64 = if (all_jobs.len > 0) @as(i64, all_jobs[0].tz_offset_s) else 8 * 3600;
+        const local_now = now + display_tz;
+        const day_start_local = local_now - @mod(local_now, 86400);
+        const week_start = day_start_local - display_tz; // start of today in UTC
         const week_end = week_start + 7 * 86400;
 
         const FireEntry = struct { fire_time: i64, job_idx: usize };
@@ -2984,7 +2999,7 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, sho
             var cursor = week_start - 1;
             var safety: u32 = 0;
             while (safety < 200) : (safety += 1) {
-                const next = nextRunForCronExpression(job.expression, cursor) catch break;
+                const next = nextRunForCronExpressionTz(job.expression, cursor, job.tz_offset_s) catch break;
                 if (next >= week_end) break;
                 if (next > cursor) {
                     try entries.append(allocator, .{ .fire_time = next, .job_idx = i });
@@ -3001,20 +3016,22 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, sho
         }.lessThan);
 
         var now_buf: [32]u8 = undefined;
-        const now_cst_str = formatCstTime(now + cst_offset, &now_buf);
-        log.info("Weekly schedule ({d} fires, now: {s} CST):", .{ entries.items.len, now_cst_str });
+        const now_local_str = formatCstTime(now + display_tz, &now_buf);
+        const tz_label_w = formatTzLabel(display_tz);
+        log.info("Weekly schedule ({d} fires, now: {s} {s}):", .{ entries.items.len, now_local_str, tz_label_w });
         log.info("{s}", .{"─────────────────────────────────────────────────────────────────────────"});
 
         const dow_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
 
         for (entries.items) |entry| {
             const job = all_jobs[entry.job_idx];
+            const job_tz: i64 = @as(i64, job.tz_offset_s);
             var time_buf: [32]u8 = undefined;
-            const time_str = formatCstTime(entry.fire_time + cst_offset, &time_buf);
+            const time_str = formatCstTime(entry.fire_time + job_tz, &time_buf);
 
-            // Compute CST weekday
-            const cst_fire = entry.fire_time + cst_offset;
-            const fire_epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(cst_fire) };
+            // Compute local weekday using job's timezone
+            const local_fire = entry.fire_time + job_tz;
+            const fire_epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(local_fire) };
             const fire_day = fire_epoch.getEpochDay();
             const weekday_num = @as(u3, @intCast((fire_day.day + 4) % 7));
             const dow = dow_names[weekday_num];
@@ -3064,15 +3081,19 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, sho
         return;
     }
 
+    // Use the first job's tz_offset for "now" display, or default to UTC+8.
+    const sched_tz: i64 = if (all_jobs.len > 0) @as(i64, all_jobs[0].tz_offset_s) else 8 * 3600;
     var now_buf: [32]u8 = undefined;
-    const now_cst = formatCstTime(now + cst_offset, &now_buf);
-    log.info("Schedule (next {d}h, now: {s} CST):", .{ hours, now_cst });
+    const now_local = formatCstTime(now + sched_tz, &now_buf);
+    const sched_tz_label = formatTzLabel(sched_tz);
+    log.info("Schedule (next {d}h, now: {s} {s}):", .{ hours, now_local, sched_tz_label });
     log.info("{s}", .{"─────────────────────────────────────────────────────────"});
 
     for (upcoming.items) |idx| {
         const job = all_jobs[idx];
+        const job_tz: i64 = @as(i64, job.tz_offset_s);
         var time_buf: [32]u8 = undefined;
-        const time_str = formatCstTime(job.next_run_secs + cst_offset, &time_buf);
+        const time_str = formatCstTime(job.next_run_secs + job_tz, &time_buf);
 
         const label: []const u8 = switch (job.job_type) {
             .skill => job.skill_name orelse "(unnamed)",
@@ -3104,7 +3125,10 @@ fn formatCronDays(expression: []const u8, buf: []u8) []const u8 {
     while (it.next()) |field| {
         if (field.len == 0) continue;
         if (field_idx == 1) hour_field = field;
-        if (field_idx == 4) { dow_field = field; break; }
+        if (field_idx == 4) {
+            dow_field = field;
+            break;
+        }
         field_idx += 1;
     }
 
@@ -3170,7 +3194,10 @@ fn formatCronTimeCst(expression: []const u8, buf: []u8) []const u8 {
     while (it.next()) |field| {
         if (field.len == 0) continue;
         if (field_idx == 0) min_field = field;
-        if (field_idx == 1) { hour_field = field; break; }
+        if (field_idx == 1) {
+            hour_field = field;
+            break;
+        }
         field_idx += 1;
     }
 
@@ -3200,6 +3227,20 @@ fn formatCstTime(cst_secs: i64, buf: []u8) []const u8 {
         day_seconds.getMinutesIntoHour(),
     }) catch return "??:??";
     return buf[0..len.len];
+}
+
+/// Format a timezone offset (in seconds) into a label like "UTC+8", "UTC-5", "UTC".
+fn formatTzLabel(tz_offset_secs: i64) []const u8 {
+    if (tz_offset_secs == 0) return "UTC";
+    if (tz_offset_secs == 8 * 3600) return "CST";
+    if (tz_offset_secs == -5 * 3600) return "EST";
+    if (tz_offset_secs == -8 * 3600) return "PST";
+    if (tz_offset_secs == -6 * 3600) return "CST-US";
+    if (tz_offset_secs == -7 * 3600) return "MST";
+    if (tz_offset_secs == 9 * 3600) return "JST";
+    if (tz_offset_secs == 5 * 3600 + 1800) return "IST";
+    // For unlisted offsets, return a generic label.
+    return "LOCAL";
 }
 
 /// CLI: show scheduler daemon status and diagnostics.
@@ -3251,7 +3292,7 @@ pub fn cliStatus(allocator: std.mem.Allocator) !void {
 }
 
 /// CLI: add a recurring cron job.
-pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: []const u8) !void {
+pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: []const u8, tz_offset_s: i32) !void {
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
         var body_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -3270,6 +3311,10 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
         var temp = CronScheduler.init(allocator, 65535, true);
         defer temp.deinit();
         const job = temp.addJob(expression, command) catch break :db_blk;
+        job.tz_offset_s = tz_offset_s;
+        if (tz_offset_s != 0) {
+            job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
+        }
         const db = openCronDb(allocator) catch break :db_blk;
         defer _ = c.sqlite3_close(db);
         ensureCronTable(db) catch break :db_blk;
@@ -3280,6 +3325,7 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
         log.info("  Expr: {s}", .{job.expression});
         log.info("  Next: {d}", .{job.next_run_secs});
         log.info("  Cmd : {s}", .{job.command});
+        if (tz_offset_s != 0) log.info("  TZ  : {d}s", .{tz_offset_s});
         return;
     }
 
@@ -3288,16 +3334,21 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
     try loadJobs(&scheduler);
 
     const job = try scheduler.addJob(expression, command);
+    job.tz_offset_s = tz_offset_s;
+    if (tz_offset_s != 0) {
+        job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
+    }
     try saveJobs(&scheduler);
 
     log.info("Added cron job {s}", .{job.id});
     log.info("  Expr: {s}", .{job.expression});
     log.info("  Next: {d}", .{job.next_run_secs});
     log.info("  Cmd : {s}", .{job.command});
+    if (tz_offset_s != 0) log.info("  TZ  : {d}s", .{tz_offset_s});
 }
 
 /// CLI: add a recurring agent job.
-pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig) !void {
+pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig, tz_offset_s: i32) !void {
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
         // Build JSON body, escaping string values through json_util
@@ -3340,6 +3391,10 @@ pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prom
         var temp = CronScheduler.init(allocator, 65535, true);
         defer temp.deinit();
         const job = temp.addAgentJob(expression, prompt, model, delivery) catch break :db_blk;
+        job.tz_offset_s = tz_offset_s;
+        if (tz_offset_s != 0) {
+            job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
+        }
         const db = openCronDb(allocator) catch break :db_blk;
         defer _ = c.sqlite3_close(db);
         ensureCronTable(db) catch break :db_blk;
@@ -3349,6 +3404,7 @@ pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prom
         log.info("  Expr : {s}", .{job.expression});
         log.info("  Type : {s}", .{job.job_type.asStr()});
         if (job.model) |m| log.info("  Model: {s}", .{m});
+        if (tz_offset_s != 0) log.info("  TZ   : {d}s", .{tz_offset_s});
         return;
     }
 
@@ -3357,21 +3413,30 @@ pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prom
     try loadJobs(&scheduler);
 
     const job = try scheduler.addAgentJob(expression, prompt, model, delivery);
+    job.tz_offset_s = tz_offset_s;
+    if (tz_offset_s != 0) {
+        job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
+    }
     try saveJobs(&scheduler);
 
     log.info("Added agent cron job {s}", .{job.id});
     log.info("  Expr : {s}", .{job.expression});
     log.info("  Type : {s}", .{job.job_type.asStr()});
     if (job.model) |m| log.info("  Model: {s}", .{m});
+    if (tz_offset_s != 0) log.info("  TZ   : {d}s", .{tz_offset_s});
 }
 
 /// CLI: add a recurring skill job (job_type=skill).
 /// DB-direct — does not route through the gateway HTTP API.
-pub fn cliAddSkillJob(allocator: std.mem.Allocator, expression: []const u8, skill_name: []const u8, skill_args: ?[]const u8, delivery: DeliveryConfig, timeout_secs: ?u32) !void {
+pub fn cliAddSkillJob(allocator: std.mem.Allocator, expression: []const u8, skill_name: []const u8, skill_args: ?[]const u8, delivery: DeliveryConfig, timeout_secs: ?u32, tz_offset_s: i32) !void {
     if (build_options.enable_sqlite) db_blk: {
         var temp = CronScheduler.init(allocator, 65535, true);
         defer temp.deinit();
         const job = temp.addSkillJob(expression, skill_name, skill_args, delivery, timeout_secs) catch break :db_blk;
+        job.tz_offset_s = tz_offset_s;
+        if (tz_offset_s != 0) {
+            job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
+        }
         const db = openCronDb(allocator) catch break :db_blk;
         defer _ = c.sqlite3_close(db);
         ensureCronTable(db) catch break :db_blk;
@@ -3381,6 +3446,7 @@ pub fn cliAddSkillJob(allocator: std.mem.Allocator, expression: []const u8, skil
         log.info("  Expr : {s}", .{job.expression});
         log.info("  Skill: {s}", .{skill_name});
         if (skill_args) |sa| log.info("  Args : {s}", .{sa});
+        if (tz_offset_s != 0) log.info("  TZ   : {d}s", .{tz_offset_s});
         return;
     }
 
@@ -3389,12 +3455,17 @@ pub fn cliAddSkillJob(allocator: std.mem.Allocator, expression: []const u8, skil
     try loadJobs(&scheduler);
 
     const job = try scheduler.addSkillJob(expression, skill_name, skill_args, delivery, timeout_secs);
+    job.tz_offset_s = tz_offset_s;
+    if (tz_offset_s != 0) {
+        job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
+    }
     try saveJobs(&scheduler);
 
     log.info("Added skill cron job {s}", .{job.id});
     log.info("  Expr : {s}", .{job.expression});
     log.info("  Skill: {s}", .{skill_name});
     if (skill_args) |sa| log.info("  Args : {s}", .{sa});
+    if (tz_offset_s != 0) log.info("  TZ   : {d}s", .{tz_offset_s});
 }
 
 /// CLI: add a one-shot delayed task.
@@ -3690,6 +3761,7 @@ pub fn cliUpdateJob(
     prompt: ?[]const u8,
     model: ?[]const u8,
     enabled: ?bool,
+    tz_offset_s: ?i32,
 ) !void {
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
@@ -3717,6 +3789,11 @@ pub fn cliUpdateJob(
             body_buf.appendSlice(allocator, ",\"enabled\":") catch {};
             body_buf.appendSlice(allocator, if (ena) "true" else "false") catch {};
         }
+        if (tz_offset_s) |tz| {
+            var tz_buf: [32]u8 = undefined;
+            const tz_str = std.fmt.bufPrint(&tz_buf, ",\"tz_offset_s\":{d}", .{tz}) catch "";
+            body_buf.appendSlice(allocator, tz_str) catch {};
+        }
         body_buf.appendSlice(allocator, "}") catch {};
         if (gatewayPost(allocator, url, "/cron/update", body_buf.items)) return;
     }
@@ -3733,6 +3810,7 @@ pub fn cliUpdateJob(
         .prompt = prompt,
         .model = model,
         .enabled = enabled,
+        .tz_offset_s = tz_offset_s,
     };
     if (scheduler.updateJob(allocator, id, patch)) {
         // If SQLite is enabled, write only the updated row directly to the DB
@@ -3912,6 +3990,7 @@ pub fn cliExportSeed(allocator: std.mem.Allocator) !void {
         if (job.delivery.account_id) |a| try w.print(",\"delivery_account_id\":\"{s}\"", .{a});
         if (job.delivery.best_effort) try w.writeAll(",\"delivery_best_effort\":true");
         if (job.session_target != .isolated) try w.print(",\"session_target\":\"{s}\"", .{job.session_target.asStr()});
+        if (job.tz_offset_s != 0) try w.print(",\"tz_offset_s\":{d}", .{job.tz_offset_s});
         try w.writeAll("}");
         count += 1;
     }
@@ -4011,6 +4090,12 @@ pub fn cliInitSeed(allocator: std.mem.Allocator) !void {
             else => null,
         } else null;
 
+        // Read optional tz_offset_s from seed (default 0 = UTC).
+        const seed_tz_offset: i32 = if (obj.get("tz_offset_s")) |v| switch (v) {
+            .integer => |i| @intCast(i),
+            else => 0,
+        } else 0;
+
         const job = switch (jtype) {
             .skill => temp.addSkillJob(
                 expression,
@@ -4030,6 +4115,12 @@ pub fn cliInitSeed(allocator: std.mem.Allocator) !void {
                 jsonStr(obj, "command") orelse continue,
             ) catch continue,
         };
+
+        // Apply timezone offset and recalculate next_run_secs with it.
+        job.tz_offset_s = seed_tz_offset;
+        if (seed_tz_offset != 0) {
+            job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), seed_tz_offset) catch job.next_run_secs;
+        }
 
         _ = dbSaveJob(db, job) catch continue;
         count += 1;
@@ -4154,7 +4245,7 @@ pub fn dbTickAndEnqueue(db_path: [:0]const u8, allocator: std.mem.Allocator, now
 
     // SELECT jobs that are due and enabled.
     const select_sql =
-        "SELECT id, expression, one_shot FROM cron_jobs " ++
+        "SELECT id, expression, one_shot, tz_offset_s FROM cron_jobs " ++
         "WHERE enabled=1 AND paused=0 AND next_run_secs <= ?1";
 
     var stmt: ?*c.sqlite3_stmt = null;
@@ -4175,6 +4266,7 @@ pub fn dbTickAndEnqueue(db_path: [:0]const u8, allocator: std.mem.Allocator, now
         const id_ptr = c.sqlite3_column_text(stmt, 0);
         const expr_ptr = c.sqlite3_column_text(stmt, 1);
         const one_shot_val = c.sqlite3_column_int(stmt, 2);
+        const tz_offset_val: i32 = @intCast(c.sqlite3_column_int(stmt, 3));
 
         if (id_ptr == null or expr_ptr == null) continue;
 
@@ -4204,7 +4296,7 @@ pub fn dbTickAndEnqueue(db_path: [:0]const u8, allocator: std.mem.Allocator, now
                 _ = c.sqlite3_finalize(upd_stmt);
             }
         } else {
-            const next_run = nextRunForCronExpression(expr_str, now) catch now + 60;
+            const next_run = nextRunForCronExpressionTz(expr_str, now, tz_offset_val) catch now + 60;
             const upd_sql = "UPDATE cron_jobs SET next_run_secs=?1 WHERE id=?2";
             var upd_stmt: ?*c.sqlite3_stmt = null;
             if (c.sqlite3_prepare_v2(db, upd_sql, -1, &upd_stmt, null) == c.SQLITE_OK) {
@@ -4780,6 +4872,52 @@ test "nextRunForCronExpression supports sunday aliases 0 and 7" {
 
 test "nextRunForCronExpression handles leap-day schedules beyond one year" {
     try std.testing.expectEqual(@as(i64, 68169600), try nextRunForCronExpression("0 0 29 2 *", 0));
+}
+
+test "nextRunForCronExpressionTz with UTC+8 shifts fire time" {
+    // "0 7 * * *" in UTC+8 means 07:00 local = 23:00 UTC previous day.
+    // From epoch 0, next run should be at 23:00 UTC on day 0 = 23*3600 = 82800.
+    // Actually: from_secs=0, expression "0 7 * * *" with tz=+8h (28800s).
+    // The function finds a UTC candidate where local_ts matches minute=0, hour=7.
+    // local_ts = candidate + 28800. For candidate=82800: local_ts=82800+28800=111600.
+    // 111600 / 3600 = 31 hours = 1 day 7 hours. Day 1, 07:00 local. That matches.
+    // But candidate=82800 should also be checked: 82800 = 23*3600 = 23:00 UTC day 0.
+    // With tz_offset=28800: local = 82800 + 28800 = 111600 = day 1 07:00. Matches!
+    // Wait - alignToNextMinute(0) = 60, first candidate is 60.
+    // For candidate=82800: local=111600 => day=1, hour=7, minute=0. Matches.
+    // Without tz offset (UTC): "0 7 * * *" from 0 => 25200 (7*3600).
+    const utc_next = try nextRunForCronExpression("0 7 * * *", 0);
+    try std.testing.expectEqual(@as(i64, 25200), utc_next); // 07:00 UTC
+
+    const tz8_next = try nextRunForCronExpressionTz("0 7 * * *", 0, 28800);
+    // 07:00 local in UTC+8 = 23:00 UTC previous day. From epoch 0, first match
+    // is when local time is 07:00, i.e., UTC candidate = 07:00 - 8:00 = -01:00 (invalid).
+    // Next is UTC candidate for day 0, 23:00 = 82800.
+    // local = 82800 + 28800 = 111600 = day 1, 07:00 local. Matches!
+    try std.testing.expectEqual(@as(i64, 82800), tz8_next); // 23:00 UTC = 07:00 CST
+}
+
+test "nextRunForCronExpressionTz with negative offset (UTC-5)" {
+    // "0 7 * * *" in UTC-5 means 07:00 local = 12:00 UTC.
+    // From epoch 0, next match: candidate where local = candidate - 18000 has hour=7, minute=0.
+    // candidate = 43200 (12:00 UTC): local = 43200 - 18000 = 25200 = 07:00. Matches!
+    const tz_neg5_next = try nextRunForCronExpressionTz("0 7 * * *", 0, -18000);
+    try std.testing.expectEqual(@as(i64, 43200), tz_neg5_next); // 12:00 UTC = 07:00 EST
+}
+
+test "nextRunForCronExpressionTz with zero offset equals UTC" {
+    const utc = try nextRunForCronExpression("*/5 * * * *", 0);
+    const tz0 = try nextRunForCronExpressionTz("*/5 * * * *", 0, 0);
+    try std.testing.expectEqual(utc, tz0);
+}
+
+test "CronJob tz_offset_s defaults to zero" {
+    const job = CronJob{
+        .id = "test",
+        .expression = "* * * * *",
+        .command = "echo",
+    };
+    try std.testing.expectEqual(@as(i32, 0), job.tz_offset_s);
 }
 
 test "CronScheduler add and list" {

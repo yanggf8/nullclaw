@@ -107,6 +107,7 @@ pub const CronJobPatch = struct {
     delivery_account_id: ?[]const u8 = null,
     timeout_secs: ?u32 = null,
     next_run_secs: ?i64 = null,
+    tz_offset_s: ?i32 = null,
 };
 
 /// A scheduled cron job — the full persistent record.
@@ -132,6 +133,7 @@ pub const CronJob = struct {
     created_at_s: i64 = 0,
     last_output: ?[]const u8 = null,
     delivery: DeliveryConfig = .{},
+    tz_offset_s: i32 = 0,
 };
 
 /// Immutable execution snapshot returned by CronBackend.dequeue().
@@ -186,6 +188,7 @@ pub const CronJobSummary = struct {
     timeout_secs: ?u32,
     skill_name: ?[]const u8 = null,
     skill_args: ?[]const u8 = null,
+    tz_offset_s: i32 = 0,
 };
 
 /// Parameters for adding a new job. All strings are caller-owned slices.
@@ -208,4 +211,5 @@ pub const NewJobSpec = struct {
     /// When non-zero, use this as next_run_secs instead of computing from expression.
     /// Required for @once: delay expressions where expression is not a valid cron pattern.
     next_run_secs_override: i64 = 0,
+    tz_offset_s: i32 = 0,
 };

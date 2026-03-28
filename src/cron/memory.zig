@@ -85,7 +85,7 @@ pub const MemoryCronBackend = struct {
                 job.next_run_secs = 0;
                 job.paused = true;
             } else {
-                job.next_run_secs = cron.nextRunForCronExpression(job.expression, now) catch now + 60;
+                job.next_run_secs = cron.nextRunForCronExpressionTz(job.expression, now, job.tz_offset_s) catch now + 60;
             }
         }
         return enqueued;
@@ -119,6 +119,7 @@ pub const MemoryCronBackend = struct {
             .to_owned = spec.delivery.to != null,
         };
         if (spec.created_at_s != 0) job_ptr.created_at_s = spec.created_at_s;
+        job_ptr.tz_offset_s = spec.tz_offset_s;
 
         return copyJobToTypes(allocator, job_ptr.*);
     }
@@ -164,6 +165,7 @@ pub const MemoryCronBackend = struct {
             .delivery_account_id = patch.delivery_account_id,
             .timeout_secs = patch.timeout_secs,
             .next_run_secs = patch.next_run_secs,
+            .tz_offset_s = patch.tz_offset_s,
         };
         return self.sched.updateJob(self.allocator, id, legacy_patch);
     }
@@ -200,6 +202,7 @@ pub const MemoryCronBackend = struct {
                 .timeout_secs = job.timeout_secs,
                 .skill_name = job.skill_name,
                 .skill_args = job.skill_args,
+                .tz_offset_s = job.tz_offset_s,
             };
             _ = allocator; // visitor owns any copies it needs
             try visitor.visit(visitor.ptr, summary);
@@ -393,6 +396,7 @@ fn copyJobToTypes(allocator: std.mem.Allocator, job: cron.CronJob) !types.CronJo
         .last_status = if (job.last_status) |s| try allocator.dupe(u8, s) else null,
         .last_output = if (job.last_output) |o| try allocator.dupe(u8, o) else null,
         .created_at_s = job.created_at_s,
+        .tz_offset_s = job.tz_offset_s,
     };
 }
 

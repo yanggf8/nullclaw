@@ -834,12 +834,14 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 const CronAddAgentOptions = struct {
     model: ?[]const u8 = null,
     delivery: yc.cron.DeliveryConfig = .{},
+    tz_offset_s: i32 = 0,
 };
 
 const CronAddSkillOptions = struct {
     skill_args: ?[]const u8 = null,
     deliver_to: ?[]const u8 = null,
     timeout_secs: ?u32 = null,
+    tz_offset_s: i32 = 0,
 };
 
 fn parseCronAddSkillOptions(allocator: std.mem.Allocator, sub_args: []const []const u8) CronAddSkillOptions {
@@ -859,6 +861,9 @@ fn parseCronAddSkillOptions(allocator: std.mem.Allocator, sub_args: []const []co
             i += 1;
         } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--timeout")) {
             options.timeout_secs = std.fmt.parseInt(u32, sub_args[i + 1], 10) catch null;
+            i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--tz")) {
+            options.tz_offset_s = parseTzOffset(sub_args[i + 1]);
             i += 1;
         } else {
             if (args_buf.items.len > 0) args_buf.appendSlice(allocator, " ") catch {};
@@ -892,9 +897,20 @@ fn parseCronAddAgentOptions(sub_args: []const []const u8) CronAddAgentOptions {
         } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--to")) {
             options.delivery.to = sub_args[i + 1];
             i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--tz")) {
+            options.tz_offset_s = parseTzOffset(sub_args[i + 1]);
+            i += 1;
         }
     }
     return options;
+}
+
+/// Parse a timezone offset string like "+8", "-5", "0" into seconds.
+fn parseTzOffset(raw: []const u8) i32 {
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    if (trimmed.len == 0) return 0;
+    const hours = std.fmt.parseInt(i32, trimmed, 10) catch return 0;
+    return hours * 3600;
 }
 
 fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
@@ -953,17 +969,27 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliSchedule(allocator, hours, show_all, show_today);
     } else if (std.mem.eql(u8, subcmd, "add")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron add <expression> <command>\n", .{});
+            std.debug.print("Usage: nullclaw cron add <expression> <command> [--tz <offset>]\n", .{});
             std.process.exit(1);
         }
-        try yc.cron.cliAddJob(allocator, sub_args[1], sub_args[2]);
+        var add_tz: i32 = 0;
+        {
+            var ai: usize = 3;
+            while (ai < sub_args.len) : (ai += 1) {
+                if (ai + 1 < sub_args.len and std.mem.eql(u8, sub_args[ai], "--tz")) {
+                    add_tz = parseTzOffset(sub_args[ai + 1]);
+                    ai += 1;
+                }
+            }
+        }
+        try yc.cron.cliAddJob(allocator, sub_args[1], sub_args[2], add_tz);
     } else if (std.mem.eql(u8, subcmd, "add-agent")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--account <id>] [--to <id>]\n", .{});
             std.process.exit(1);
         }
         const options = parseCronAddAgentOptions(sub_args);
-        try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], options.model, options.delivery);
+        try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], options.model, options.delivery, options.tz_offset_s);
     } else if (std.mem.eql(u8, subcmd, "add-skill")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron add-skill <expression> <skill> [args...] [--deliver-to <id>] [--timeout <secs>]\n", .{});
@@ -976,7 +1002,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             .to = dt,
             .best_effort = true,
         } else .{};
-        try yc.cron.cliAddSkillJob(allocator, sub_args[1], sub_args[2], options.skill_args, delivery, options.timeout_secs orelse 120);
+        try yc.cron.cliAddSkillJob(allocator, sub_args[1], sub_args[2], options.skill_args, delivery, options.timeout_secs orelse 120, options.tz_offset_s);
     } else if (std.mem.eql(u8, subcmd, "once")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron once <delay> <command>\n", .{});
@@ -1023,7 +1049,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliRunJob(allocator, sub_args[1]);
     } else if (std.mem.eql(u8, subcmd, "update")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <prompt>] [--model <model>] [--enable] [--disable]\n", .{});
+            std.debug.print("Usage: nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <prompt>] [--model <model>] [--enable] [--disable] [--tz <offset>]\n", .{});
             std.process.exit(1);
         }
         const id = sub_args[1];
@@ -1032,6 +1058,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         var prompt: ?[]const u8 = null;
         var model: ?[]const u8 = null;
         var enabled: ?bool = null;
+        var tz_offset_s: ?i32 = null;
         var i: usize = 2;
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--expression") and i + 1 < sub_args.len) {
@@ -1050,9 +1077,12 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 enabled = true;
             } else if (std.mem.eql(u8, sub_args[i], "--disable")) {
                 enabled = false;
+            } else if (std.mem.eql(u8, sub_args[i], "--tz") and i + 1 < sub_args.len) {
+                i += 1;
+                tz_offset_s = parseTzOffset(sub_args[i]);
             }
         }
-        try yc.cron.cliUpdateJob(allocator, id, expression, command, prompt, model, enabled);
+        try yc.cron.cliUpdateJob(allocator, id, expression, command, prompt, model, enabled, tz_offset_s);
     } else if (std.mem.eql(u8, subcmd, "runs")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron runs <id>\n", .{});
