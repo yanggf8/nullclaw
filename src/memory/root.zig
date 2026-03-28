@@ -1179,6 +1179,17 @@ pub fn initRuntime(
         }
     }
 
+    // ── Wire embedder into LanceDb backend ──
+    // The embed_provider is constructed in the vec_plane block above, after
+    // the backend instance.  Patch it into the LanceDb struct so its recall
+    // path can do semantic search instead of keyword-only fallback.
+    if (build_options.enable_memory_lancedb and embed_provider != null and
+        std.mem.eql(u8, config.backend, "lancedb"))
+    {
+        const ldb: *LanceDbMemory = @ptrCast(@alignCast(instance.memory.ptr));
+        ldb.embedder = embed_provider;
+    }
+
     // ── Lifecycle: hygiene ──
     if (config.lifecycle.hygiene_enabled) {
         var preserve_sync_ctx = HygienePreserveSyncCtx{
