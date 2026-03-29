@@ -3643,6 +3643,11 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
         json_util.appendJsonKeyValue(&body_buf, allocator, "expression", expression) catch {};
         body_buf.appendSlice(allocator, ",") catch {};
         json_util.appendJsonKeyValue(&body_buf, allocator, "command", command) catch {};
+        if (tz_offset_s != 0) {
+            var tz_buf: [32]u8 = undefined;
+            const tz_str = std.fmt.bufPrint(&tz_buf, ",\"tz_offset_s\":{d}", .{tz_offset_s}) catch "";
+            body_buf.appendSlice(allocator, tz_str) catch {};
+        }
         body_buf.appendSlice(allocator, "}") catch {};
         if (gatewayPost(allocator, url, "/cron/add", body_buf.items)) return;
     }
@@ -3747,6 +3752,11 @@ pub fn cliAddAgentJob(
         }
         if (!enriched_delivery.best_effort) {
             body_buf.appendSlice(allocator, ",\"delivery_best_effort\":false") catch {};
+        }
+        if (tz_offset_s != 0) {
+            var tz_buf: [32]u8 = undefined;
+            const tz_str = std.fmt.bufPrint(&tz_buf, ",\"tz_offset_s\":{d}", .{tz_offset_s}) catch "";
+            body_buf.appendSlice(allocator, tz_str) catch {};
         }
         body_buf.appendSlice(allocator, "}") catch {};
         if (body_buf.items.len > 2) {

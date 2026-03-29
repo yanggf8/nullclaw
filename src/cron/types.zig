@@ -114,6 +114,7 @@ pub const CronJobPatch = struct {
     timeout_secs: ?u32 = null,
     next_run_secs: ?i64 = null,
     tz_offset_s: ?i32 = null,
+    session_target: ?SessionTarget = null,
 };
 
 /// A scheduled cron job — the full persistent record.

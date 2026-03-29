@@ -519,6 +519,17 @@ fn dbApplyPatch(db: *c.sqlite3, id: []const u8, patch: types.CronJobPatch) !void
             _ = c.sqlite3_finalize(s);
         }
     }
+    if (patch.session_target) |st| {
+        const st_str = st.asStr();
+        const sql = "UPDATE cron_jobs SET session_target=?1 WHERE id=?2";
+        var s: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
+            _ = c.sqlite3_bind_text(s, 1, st_str.ptr, @intCast(st_str.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
+            _ = c.sqlite3_step(s);
+            _ = c.sqlite3_finalize(s);
+        }
+    }
 }
 
 /// Load a full CronJob by ID (includes all columns + last_output).

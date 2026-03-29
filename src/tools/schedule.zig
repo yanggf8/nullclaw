@@ -257,16 +257,22 @@ pub const ScheduleTool = struct {
                 var backend = be.backend();
                 var job_arena = std.heap.ArenaAllocator.init(allocator);
                 defer job_arena.deinit();
+                const is_agent = prompt != null;
                 const job = backend.add(job_arena.allocator(), .{
                     .expression = expression,
-                    .command = command orelse "",
+                    .job_type = if (is_agent) .agent else .shell,
+                    .command = if (is_agent) (prompt orelse "") else (command orelse ""),
+                    .prompt = prompt,
+                    .model = model,
+                    .session_target = @enumFromInt(@intFromEnum(session_target)),
                     .delivery = db_delivery,
                 }) catch |err| {
                     const msg = try std.fmt.allocPrint(allocator, "Failed to create job: {s}", .{@errorName(err)});
                     return ToolResult{ .success = false, .output = "", .error_msg = msg };
                 };
-                const msg = try std.fmt.allocPrint(allocator, "Created job {s} | {s} | cmd: {s}", .{
-                    job.id, job.expression, job.command,
+                const label = if (is_agent) "Created agent job" else "Created job";
+                const msg = try std.fmt.allocPrint(allocator, "{s} {s} | {s} | cmd: {s}", .{
+                    label, job.id, job.expression, job.command,
                 });
                 return ToolResult{ .success = true, .output = msg };
             }
@@ -386,9 +392,14 @@ pub const ScheduleTool = struct {
                 defer job_arena.deinit();
                 const now = std.time.timestamp();
                 const delay_secs = cron.parseDuration(delay) catch 60;
+                const is_agent_once = prompt != null;
                 const job = backend.add(job_arena.allocator(), .{
                     .expression = "@once",
-                    .command = command orelse "",
+                    .job_type = if (is_agent_once) .agent else .shell,
+                    .command = if (is_agent_once) (prompt orelse "") else (command orelse ""),
+                    .prompt = prompt,
+                    .model = model,
+                    .session_target = @enumFromInt(@intFromEnum(session_target)),
                     .one_shot = true,
                     .delete_after_run = true,
                     .next_run_secs_override = now + delay_secs,

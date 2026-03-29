@@ -2807,6 +2807,10 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
         if (v <= 0) break :blk null;
         break :blk @intCast(v);
     };
+    const tz_offset_s_add: i32 = blk: {
+        const v = jsonIntField(body, "tz_offset_s") orelse break :blk 0;
+        break :blk @intCast(v);
+    };
 
     // ── DB-direct path ────────────────────────────────────────────────
     if (ctx.state.cron_db_backend) |*be| {
@@ -2877,7 +2881,9 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
             .enabled = enabled_add_opt orelse true,
             .timeout_secs = timeout_secs_add,
             .delivery = db_delivery,
+            .session_target = @enumFromInt(@intFromEnum(session_target)),
             .next_run_secs_override = next_run_override,
+            .tz_offset_s = tz_offset_s_add,
         };
 
         const job = be.backend().add(ctx.req_allocator, spec) catch |err| {
@@ -3039,6 +3045,14 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
     }
 
     job_ptr.session_target = session_target;
+    if (tz_offset_s_add != 0) {
+        job_ptr.tz_offset_s = tz_offset_s_add;
+        job_ptr.next_run_secs = cron_mod.nextRunForCronExpressionTz(
+            job_ptr.expression,
+            std.time.timestamp(),
+            tz_offset_s_add,
+        ) catch job_ptr.next_run_secs;
+    }
     cron_mod.saveJobs(sched) catch |err| {
         std.log.scoped(.gateway).warn("cron add persist failed: {s}", .{@errorName(err)});
         ctx.response_status = "500 Internal Server Error";
@@ -3330,6 +3344,7 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
             .timeout_secs = timeout_secs_opt,
             .next_run_secs = next_run_secs_opt,
             .tz_offset_s = tz_offset_s_opt,
+            .session_target = if (session_target) |st| @as(cron_backend_mod.SessionTarget, @enumFromInt(@intFromEnum(st))) else null,
         };
         const found = be.backend().update(id, patch) catch false;
         if (!found) {
