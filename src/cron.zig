@@ -4482,7 +4482,7 @@ pub fn cliInitSeed(allocator: std.mem.Allocator) !void {
     // DESTRUCTIVE: init-seed replaces ALL jobs. Use only for fresh setup.
     log.warn("init-seed: WIPING all existing jobs and run queue", .{});
     _ = c.sqlite3_exec(db, "DELETE FROM cron_jobs", null, null, null);
-    _ = c.sqlite3_exec(db, "DELETE FROM cron_queue", null, null, null);
+    _ = c.sqlite3_exec(db, "DELETE FROM cron_run_queue", null, null, null);
 
     var count: usize = 0;
     for (parsed.value.array.items) |item| {

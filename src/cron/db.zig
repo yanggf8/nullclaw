@@ -127,7 +127,12 @@ pub const DbCronBackend = struct {
                 .channel = if (spec.delivery.channel) |ch| try allocator.dupe(u8, ch) else null,
                 .account_id = if (spec.delivery.account_id) |a| try allocator.dupe(u8, a) else null,
                 .to = if (spec.delivery.to) |t| try allocator.dupe(u8, t) else null,
+                .peer_kind = spec.delivery.peer_kind,
+                .peer_id = if (spec.delivery.peer_id) |p| try allocator.dupe(u8, p) else null,
+                .thread_id = if (spec.delivery.thread_id) |t| try allocator.dupe(u8, t) else null,
                 .best_effort = spec.delivery.best_effort,
+                .peer_id_owned = spec.delivery.peer_id != null,
+                .thread_id_owned = spec.delivery.thread_id != null,
             },
             .next_run_secs = next_run,
             .created_at_s = created_at,
@@ -811,10 +816,15 @@ fn typesDelivery(d: cron.DeliveryConfig) types.DeliveryConfig {
         .channel = d.channel,
         .account_id = d.account_id,
         .to = d.to,
+        .peer_kind = d.peer_kind,
+        .peer_id = d.peer_id,
+        .thread_id = d.thread_id,
         .best_effort = d.best_effort,
         .channel_owned = d.channel_owned,
         .account_id_owned = d.account_id_owned,
         .to_owned = d.to_owned,
+        .peer_id_owned = d.peer_id_owned,
+        .thread_id_owned = d.thread_id_owned,
     };
 }
 
@@ -825,10 +835,15 @@ fn legacyDelivery(d: types.DeliveryConfig) cron.DeliveryConfig {
         .channel = d.channel,
         .account_id = d.account_id,
         .to = d.to,
+        .peer_kind = d.peer_kind,
+        .peer_id = d.peer_id,
+        .thread_id = d.thread_id,
         .best_effort = d.best_effort,
         .channel_owned = d.channel_owned,
         .account_id_owned = d.account_id_owned,
         .to_owned = d.to_owned,
+        .peer_id_owned = d.peer_id_owned,
+        .thread_id_owned = d.thread_id_owned,
     };
 }
 
@@ -841,8 +856,9 @@ fn dbSaveJobDirect(db: *c.sqlite3, job: *const cron.CronJob) !void {
         "next_run_secs, last_run_secs, last_status, paused, one_shot, " ++
         "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
         "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs, " ++
-        "delivery_best_effort, session_target, skill_name, skill_args, tz_offset_s) " ++
-        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)";
+        "delivery_best_effort, session_target, skill_name, skill_args, tz_offset_s, " ++
+        "delivery_peer_kind, delivery_peer_id, delivery_thread_id) " ++
+        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)";
     var stmt: ?*c.sqlite3_stmt = null;
     var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
     if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -877,6 +893,16 @@ fn dbSaveJobDirect(db: *c.sqlite3, job: *const cron.CronJob) !void {
     if (job.skill_name) |sn| _ = c.sqlite3_bind_text(stmt, 24, sn.ptr, @intCast(sn.len), SQLITE_STATIC) else _ = c.sqlite3_bind_null(stmt, 24);
     if (job.skill_args) |sa| _ = c.sqlite3_bind_text(stmt, 25, sa.ptr, @intCast(sa.len), SQLITE_STATIC) else _ = c.sqlite3_bind_null(stmt, 25);
     _ = c.sqlite3_bind_int(stmt, 26, job.tz_offset_s);
+    if (job.delivery.peer_kind) |pk| {
+        const pk_str = switch (pk) {
+            .direct => "direct",
+            .group => "group",
+            .channel => "channel",
+        };
+        _ = c.sqlite3_bind_text(stmt, 27, pk_str.ptr, @intCast(pk_str.len), SQLITE_STATIC);
+    } else _ = c.sqlite3_bind_null(stmt, 27);
+    if (job.delivery.peer_id) |pid| _ = c.sqlite3_bind_text(stmt, 28, pid.ptr, @intCast(pid.len), SQLITE_STATIC) else _ = c.sqlite3_bind_null(stmt, 28);
+    if (job.delivery.thread_id) |tid| _ = c.sqlite3_bind_text(stmt, 29, tid.ptr, @intCast(tid.len), SQLITE_STATIC) else _ = c.sqlite3_bind_null(stmt, 29);
 
     rc = c.sqlite3_step(stmt);
     if (rc != c.SQLITE_DONE) return error.StepFailed;

@@ -245,6 +245,9 @@ pub const ScheduleTool = struct {
                     .channel = delivery_channel,
                     .account_id = delivery_account_id,
                     .to = cid,
+                    .peer_kind = if (context_routing_allowed) (if (tls_schedule_peer_kind) |pk| @enumFromInt(@intFromEnum(pk)) else null) else null,
+                    .peer_id = if (context_routing_allowed) tls_schedule_peer_id else null,
+                    .thread_id = if (context_routing_allowed) tls_schedule_thread_id else null,
                     .best_effort = true,
                 }
             else
