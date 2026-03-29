@@ -321,6 +321,24 @@ pub const Config = struct {
         return null;
     }
 
+    /// Look up the configured API mode for a provider.
+    /// Returns .chat_completions if the provider is not configured.
+    pub fn getProviderApiMode(self: *const Config, name: []const u8) config_types.ProviderEntry.ApiMode {
+        for (self.providers) |e| {
+            if (provider_names.providerNamesMatch(e.name, name)) return e.api_mode;
+        }
+        return .chat_completions;
+    }
+
+    /// Look up whether this provider should set
+    /// `chat_template_kwargs.enable_thinking` from `reasoning_effort`.
+    pub fn getProviderChatTemplateEnableThinkingParam(self: *const Config, name: []const u8) bool {
+        for (self.providers) |e| {
+            if (provider_names.providerNamesMatch(e.name, name)) return e.chat_template_enable_thinking_param;
+        }
+        return false;
+    }
+
     /// Look up the optional streaming prompt byte limit for a provider.
     /// Returns null if provider is not in the list or has no limit set (no limit = always stream).
     pub fn getProviderMaxStreamingPromptBytes(self: *const Config, name: []const u8) ?usize {
@@ -882,6 +900,20 @@ pub const Config = struct {
                         has_field = true;
                     }
                 }
+                if (comptime @hasField(ProviderEntry, "api_mode")) {
+                    if (entry.api_mode != .chat_completions) {
+                        if (has_field) try w.print(", ", .{});
+                        try w.print("\"api_mode\": \"{s}\"", .{entry.api_mode.toSlice()});
+                        has_field = true;
+                    }
+                }
+                if (comptime @hasField(ProviderEntry, "chat_template_enable_thinking_param")) {
+                    if (entry.chat_template_enable_thinking_param) {
+                        if (has_field) try w.print(", ", .{});
+                        try w.print("\"chat_template_enable_thinking_param\": true", .{});
+                        has_field = true;
+                    }
+                }
                 if (comptime @hasField(ProviderEntry, "max_streaming_prompt_bytes")) {
                     if (entry.max_streaming_prompt_bytes) |mb| {
                         if (has_field) try w.print(", ", .{});
@@ -1206,6 +1238,7 @@ pub const Config = struct {
         InvalidHttpSearchBaseUrl,
         InvalidHttpSearchProvider,
         InvalidHttpSearchFallbackProvider,
+        InvalidProviderApiMode,
         InvalidMcpTransport,
         MissingMcpCommand,
         MissingMcpHttpUrl,
@@ -1280,6 +1313,11 @@ pub const Config = struct {
         }
         if (!config_types.HttpRequestConfig.isValidSearchProviderName(self.http_request.search_provider)) {
             return ValidationError.InvalidHttpSearchProvider;
+        }
+        for (self.providers) |provider| {
+            if (provider.api_mode == .invalid) {
+                return ValidationError.InvalidProviderApiMode;
+            }
         }
         for (self.http_request.search_fallback_providers) |provider| {
             if (!config_types.HttpRequestConfig.isValidSearchFallbackProviderName(provider)) {
@@ -1409,6 +1447,7 @@ pub const Config = struct {
             ValidationError.InvalidHttpSearchBaseUrl => std.debug.print("Config error: http_request.search_base_url must be https://host[/search] or local http://host[:port][/search] (no query/fragment).\n", .{}),
             ValidationError.InvalidHttpSearchProvider => std.debug.print("Config error: http_request.search_provider must be one of: auto, searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina.\n", .{}),
             ValidationError.InvalidHttpSearchFallbackProvider => std.debug.print("Config error: http_request.search_fallback_providers entries must be valid providers and cannot be 'auto'.\n", .{}),
+            ValidationError.InvalidProviderApiMode => std.debug.print("Config error: models.providers.<name>.api_mode must be 'chat_completions' or 'responses'.\n", .{}),
             ValidationError.InvalidMcpTransport => std.debug.print("Config error: mcp_servers.<name>.transport must be 'stdio' or 'http'.\n", .{}),
             ValidationError.MissingMcpCommand => std.debug.print("Config error: mcp_servers.<name>.command is required when transport='stdio'.\n", .{}),
             ValidationError.MissingMcpHttpUrl => std.debug.print("Config error: mcp_servers.<name>.url is required when transport='http'.\n", .{}),
@@ -4599,6 +4638,27 @@ test "parseJson reads max_streaming_prompt_bytes from provider config" {
     try std.testing.expectEqual(@as(?usize, null), cfg.getProviderMaxStreamingPromptBytes("unknown"));
 }
 
+test "parseJson reads chat_template_enable_thinking_param from provider config" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"models":{"providers":{"custom:https://example.com/v1":{"api_key":"sk-test","chat_template_enable_thinking_param":true}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    defer {
+        for (cfg.providers) |e| {
+            allocator.free(e.name);
+            if (e.api_key) |k| allocator.free(k);
+            if (e.base_url) |b| allocator.free(b);
+            if (e.user_agent) |ua| allocator.free(ua);
+        }
+        allocator.free(cfg.providers);
+    }
+
+    try std.testing.expect(cfg.getProviderChatTemplateEnableThinkingParam("custom:https://example.com/v1"));
+    try std.testing.expect(!cfg.getProviderChatTemplateEnableThinkingParam("custom:https://other.example/v1"));
+}
+
 test "parseJson ignores negative max_streaming_prompt_bytes" {
     // A negative integer in the JSON should not crash and should leave the
     // field at its default (null).
@@ -4680,6 +4740,62 @@ test "save omits max_streaming_prompt_bytes when null" {
 
     // When null the field should be absent from the JSON (no "max_streaming").
     try std.testing.expect(std.mem.indexOf(u8, content, "max_streaming_prompt_bytes") == null);
+}
+
+test "save writes provider api_mode when responses" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{ .name = "sub2api", .api_key = "sk-test", .api_mode = .responses },
+    };
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"api_mode\": \"responses\"") != null);
+}
+
+test "save writes chat_template_enable_thinking_param when true" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{ .name = "custom:https://example.com/v1", .api_key = "sk-test", .chat_template_enable_thinking_param = true },
+    };
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"chat_template_enable_thinking_param\": true") != null);
 }
 
 test "save and parseJson round-trip max_streaming_prompt_bytes" {
@@ -4858,6 +4974,46 @@ test "provider config lookups match canonical aliases" {
     try std.testing.expectEqualStrings("nullclaw-test/1.0", cfg.getProviderUserAgent("azure_openai").?);
 }
 
+test "provider config parse reads api_mode responses" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"agents":{"defaults":{"model":{"primary":"sub2api/gpt-5.4"}}},"models":{"providers":{"sub2api":{"api_key":"sk-test","api_mode":"responses"}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    defer {
+        allocator.free(cfg.default_provider);
+        allocator.free(cfg.default_model.?);
+        for (cfg.providers) |e| {
+            allocator.free(e.name);
+            if (e.api_key) |k| allocator.free(k);
+            if (e.base_url) |b| allocator.free(b);
+            if (e.user_agent) |ua| allocator.free(ua);
+        }
+        allocator.free(cfg.providers);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    try std.testing.expectEqual(config_types.ProviderEntry.ApiMode.responses, cfg.providers[0].api_mode);
+    try std.testing.expectEqual(config_types.ProviderEntry.ApiMode.responses, cfg.getProviderApiMode("sub2api"));
+}
+
+test "validate rejects invalid provider api_mode" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+        .default_provider = "sub2api",
+        .default_model = "gpt-5.4",
+        .providers = &.{.{
+            .name = "sub2api",
+            .api_mode = .invalid,
+        }},
+    };
+
+    try std.testing.expectError(Config.ValidationError.InvalidProviderApiMode, cfg.validate());
+}
+
 test "providers defaults to empty" {
     const cfg = Config{
         .workspace_dir = "/tmp/yc",
@@ -4892,6 +5048,42 @@ test "getProviderMaxStreamingPromptBytes: null when not set and when provider mi
     try std.testing.expectEqual(@as(?usize, 524288), cfg.getProviderMaxStreamingPromptBytes("groq"));
     // Unknown provider returns null.
     try std.testing.expectEqual(@as(?usize, null), cfg.getProviderMaxStreamingPromptBytes("unknown"));
+}
+
+test "getProviderApiMode defaults to chat_completions" {
+    const entries = [_]ProviderEntry{
+        .{
+            .name = "sub2api",
+            .api_key = "key",
+            .api_mode = .responses,
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .providers = &entries,
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectEqual(config_types.ProviderEntry.ApiMode.responses, cfg.getProviderApiMode("sub2api"));
+    try std.testing.expectEqual(config_types.ProviderEntry.ApiMode.chat_completions, cfg.getProviderApiMode("unknown"));
+}
+
+test "getProviderChatTemplateEnableThinkingParam defaults to false" {
+    const entries = [_]ProviderEntry{
+        .{
+            .name = "custom:https://example.com/v1",
+            .api_key = "key",
+            .chat_template_enable_thinking_param = true,
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .providers = &entries,
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expect(cfg.getProviderChatTemplateEnableThinkingParam("custom:https://example.com/v1"));
+    try std.testing.expect(!cfg.getProviderChatTemplateEnableThinkingParam("custom:https://other.example/v1"));
 }
 
 test "audio_media defaults" {

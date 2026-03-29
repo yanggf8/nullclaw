@@ -1,6 +1,7 @@
 //! Pure domain types for the cron subsystem. No storage, no I/O, no SQLite.
 //! These types are shared by CronBackend implementations and all callers.
 const std = @import("std");
+const agent_routing = @import("../agent_routing.zig");
 
 pub const JobType = enum {
     shell,
@@ -75,10 +76,15 @@ pub const DeliveryConfig = struct {
     channel: ?[]const u8 = null,
     account_id: ?[]const u8 = null,
     to: ?[]const u8 = null,
+    peer_kind: ?agent_routing.ChatType = null,
+    peer_id: ?[]const u8 = null,
+    thread_id: ?[]const u8 = null,
     best_effort: bool = false,
     channel_owned: bool = false,
     account_id_owned: bool = false,
     to_owned: bool = false,
+    peer_id_owned: bool = false,
+    thread_id_owned: bool = false,
 };
 
 pub const CronRun = struct {

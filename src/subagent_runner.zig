@@ -58,16 +58,19 @@ pub fn runTaskWithTools(
     const provider_base_url = if (provider_entry) |entry| entry.base_url else null;
     const provider_native_tools = if (provider_entry) |entry| entry.native_tools else true;
     const provider_user_agent = if (provider_entry) |entry| entry.user_agent else null;
+    const provider_api_mode = if (provider_entry) |entry| entry.api_mode else .chat_completions;
     const provider_max_streaming_prompt_bytes = if (provider_entry) |entry| entry.max_streaming_prompt_bytes else null;
 
-    var provider_holder = providers.ProviderHolder.fromConfig(
+    var provider_holder = providers.ProviderHolder.fromConfigWithApiMode(
         allocator,
         request.default_provider,
         request.api_key,
         provider_base_url,
         provider_native_tools,
         provider_user_agent,
+        provider_api_mode,
         provider_max_streaming_prompt_bytes,
+        if (provider_entry) |entry| entry.chat_template_enable_thinking_param else false,
     );
     defer provider_holder.deinit();
 
@@ -213,6 +216,22 @@ test "findProviderEntry returns null max_streaming_prompt_bytes when not configu
     };
     const found = findProviderEntry("openai", &entries) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(?usize, null), found.max_streaming_prompt_bytes);
+}
+
+test "findProviderEntry threads api_mode from entry" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "sub2api", .api_key = "sk-test", .api_mode = .responses },
+    };
+    const found = findProviderEntry("sub2api", &entries) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(config_types.ProviderEntry.ApiMode.responses, found.api_mode);
+}
+
+test "findProviderEntry threads chat_template_enable_thinking_param from entry" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "custom:https://example.com/v1", .api_key = "sk-test", .chat_template_enable_thinking_param = true },
+    };
+    const found = findProviderEntry("custom:https://example.com/v1", &entries) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(found.chat_template_enable_thinking_param);
 }
 
 test "findProviderEntry returns null when provider not in list" {

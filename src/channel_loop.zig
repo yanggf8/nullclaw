@@ -43,11 +43,14 @@ fn setScheduleToolContext(
     channel: ?[]const u8,
     account_id: ?[]const u8,
     chat_id: ?[]const u8,
+    peer_kind: ?agent_routing.ChatType,
+    peer_id: ?[]const u8,
+    thread_id: ?[]const u8,
 ) void {
     for (tools) |tool| {
         if (std.mem.eql(u8, tool.name(), "schedule")) {
             const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
-            schedule_tool.setContext(channel, account_id, chat_id);
+            schedule_tool.setContext(channel, account_id, chat_id, peer_kind, peer_id, thread_id);
             break;
         }
     }
@@ -59,6 +62,61 @@ fn setScheduleToolContext(
 
 fn shouldSuppressGroupReply(is_group: bool, reply: []const u8) bool {
     return is_group and std.mem.indexOf(u8, reply, "[NO_REPLY]") != null;
+}
+
+fn detailedProviderErrorForDisplay(
+    allocator: std.mem.Allocator,
+    err: anyerror,
+) !?[]u8 {
+    switch (err) {
+        error.ApiError, error.ProviderError, error.AllProvidersFailed => {},
+        else => return null,
+    }
+
+    const detail = try providers.snapshotLastApiErrorDetail(allocator);
+    if (detail) |owned| {
+        defer allocator.free(owned);
+        if (owned.len == 0) return null;
+        const formatted = try std.fmt.allocPrint(allocator, "Provider API error: {s}", .{owned});
+        return formatted;
+    }
+    return null;
+}
+
+fn logAgentProcessingError(
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    err: anyerror,
+) void {
+    const detail = providers.snapshotLastApiErrorDetail(allocator) catch null;
+    if (detail) |owned| {
+        defer allocator.free(owned);
+        if (owned.len > 0) {
+            log.err("{s}: {} ({s})", .{ prefix, err, owned });
+            return;
+        }
+    }
+    log.err("{s}: {}", .{ prefix, err });
+}
+
+fn defaultAgentErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
+        error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
+        error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
+        error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
+        error.OutOfMemory => "Out of memory.",
+        else => "An error occurred. Try again or /new for a fresh session.",
+    };
+}
+
+fn compactAgentErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
+        error.NoResponseContent => "Model returned an empty response. Please try again.",
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError, error.AllProvidersFailed, error.OutOfMemory => defaultAgentErrorMessage(err),
+        else => "An error occurred. Try again.",
+    };
 }
 
 const TelegramSessionTarget = struct {
@@ -747,8 +805,24 @@ fn processTelegramMessage(
     }
 
     // Set ScheduleTool context for delivery.
-    setScheduleToolContext(runtime.tools, "telegram", tg_ptr.account_id, sender);
-    defer setScheduleToolContext(runtime.tools, null, null, null);
+    var schedule_thread_buf: [32]u8 = undefined;
+    const schedule_thread_id = if (is_group)
+        if (telegram.targetThreadId(sender)) |thread_id|
+            std.fmt.bufPrint(&schedule_thread_buf, "{d}", .{thread_id}) catch null
+        else
+            null
+    else
+        null;
+    setScheduleToolContext(
+        runtime.tools,
+        "telegram",
+        tg_ptr.account_id,
+        sender,
+        if (is_group) .group else .direct,
+        if (is_group) telegram.targetChatId(sender) else sender,
+        schedule_thread_id,
+    );
+    defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
 
     // Build conversation context for Telegram
     const conversation_context = buildConversationContext(.{
@@ -768,16 +842,11 @@ fn processTelegramMessage(
 
     tg_ptr.setTaskReaction(sender, message_id, .running);
     const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink) catch |err| {
-        log.err("Agent error: {}", .{err});
+        logAgentProcessingError(allocator, "Agent error", err);
         tg_ptr.setTaskReaction(sender, message_id, .failed);
-        const err_msg: []const u8 = switch (err) {
-            error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-            error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
-            error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
-            error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-            error.OutOfMemory => "Out of memory.",
-            else => "An error occurred. Try again or /new for a fresh session.",
-        };
+        const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+        defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+        const err_msg = owned_err_msg orelse defaultAgentErrorMessage(err);
         tg_ptr.sendMessageWithReply(sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
         return;
     };
@@ -1555,8 +1624,16 @@ pub fn runSignalLoop(
 
         for (messages) |msg| {
             const schedule_chat_id = msg.reply_target orelse msg.sender;
-            setScheduleToolContext(runtime.tools, "signal", sg_ptr.account_id, schedule_chat_id);
-            defer setScheduleToolContext(runtime.tools, null, null, null);
+            setScheduleToolContext(
+                runtime.tools,
+                "signal",
+                sg_ptr.account_id,
+                schedule_chat_id,
+                if (msg.is_group) .group else .direct,
+                if (msg.is_group) signalGroupPeerId(msg.reply_target) else msg.sender,
+                null,
+            );
+            defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
 
             // Session key — always resolve through agent routing (falls back on errors)
             var key_buf: [128]u8 = undefined;
@@ -1600,15 +1677,10 @@ pub fn runSignalLoop(
             });
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
-                log.err("Signal agent error: {}", .{err});
-                const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
-                    error.NoResponseContent => "Model returned an empty response. Please try again.",
-                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again.",
-                };
+                logAgentProcessingError(allocator, "Signal agent error", err);
+                const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+                defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+                const err_msg = owned_err_msg orelse compactAgentErrorMessage(err);
                 if (msg.reply_target) |target| {
                     sg_ptr.sendMessage(target, err_msg, &.{}) catch |send_err| log.err("failed to send signal error reply: {}", .{send_err});
                 }
@@ -1795,8 +1867,16 @@ pub fn runMatrixLoop(
 
         for (messages) |msg| {
             const schedule_chat_id = msg.reply_target orelse msg.sender;
-            setScheduleToolContext(runtime.tools, "matrix", mx_ptr.account_id, schedule_chat_id);
-            defer setScheduleToolContext(runtime.tools, null, null, null);
+            setScheduleToolContext(
+                runtime.tools,
+                "matrix",
+                mx_ptr.account_id,
+                schedule_chat_id,
+                if (msg.is_group) .group else .direct,
+                if (msg.is_group) matrixRoomPeerId(msg.reply_target) else msg.sender,
+                null,
+            );
+            defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
 
             var key_buf: [192]u8 = undefined;
             const room_peer_id = matrixRoomPeerId(msg.reply_target);
@@ -1834,15 +1914,10 @@ pub fn runMatrixLoop(
             });
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
-                log.err("Matrix agent error: {}", .{err});
-                const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
-                    error.NoResponseContent => "Model returned an empty response. Please try again.",
-                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again.",
-                };
+                logAgentProcessingError(allocator, "Matrix agent error", err);
+                const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+                defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+                const err_msg = owned_err_msg orelse compactAgentErrorMessage(err);
                 mx_ptr.sendMessage(typing_target, err_msg) catch |send_err| log.err("failed to send matrix error reply: {}", .{send_err});
                 continue;
             };
@@ -1935,8 +2010,16 @@ pub fn runMaxLoop(
 
         for (messages) |msg| {
             const reply_target = msg.reply_target orelse msg.sender;
-            setScheduleToolContext(runtime.tools, "max", mx_ptr.account_id, reply_target);
-            defer setScheduleToolContext(runtime.tools, null, null, null);
+            setScheduleToolContext(
+                runtime.tools,
+                "max",
+                mx_ptr.account_id,
+                reply_target,
+                if (msg.is_group) .group else .direct,
+                if (msg.is_group) reply_target else msg.sender,
+                null,
+            );
+            defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
             max_mod.setInteractiveOwnerContext(msg.sender);
             defer max_mod.setInteractiveOwnerContext(null);
 
@@ -1981,15 +2064,10 @@ pub fn runMaxLoop(
             const sink = mx_ptr.makeSink(&stream_ctx);
 
             const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink) catch |err| {
-                log.err("Max agent error: {}", .{err});
-                const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
-                    error.NoResponseContent => "Model returned an empty response. Please try again.",
-                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again.",
-                };
+                logAgentProcessingError(allocator, "Max agent error", err);
+                const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+                defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+                const err_msg = owned_err_msg orelse compactAgentErrorMessage(err);
                 mx_ptr.sendMessage(reply_target, err_msg) catch |send_err| log.err("failed to send max error reply: {}", .{send_err});
                 continue;
             };
@@ -2399,6 +2477,32 @@ test "telegram update offset store roundtrip" {
     try saveTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token", 777);
     const restored = loadTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token");
     try std.testing.expectEqual(@as(?i64, 777), restored);
+}
+
+test "detailedProviderErrorForDisplay surfaces sanitized provider detail" {
+    const allocator = std.testing.allocator;
+    providers.clearLastApiErrorDetail();
+    defer providers.clearLastApiErrorDetail();
+
+    providers.setLastApiErrorDetail("compatible", "status=429 message=Rate limit exceeded");
+    const msg = (try detailedProviderErrorForDisplay(allocator, error.ApiError)).?;
+    defer allocator.free(msg);
+
+    try std.testing.expectEqualStrings("Provider API error: compatible: status=429 message=Rate limit exceeded", msg);
+}
+
+test "detailedProviderErrorForDisplay ignores non-provider errors" {
+    const allocator = std.testing.allocator;
+    providers.clearLastApiErrorDetail();
+    defer providers.clearLastApiErrorDetail();
+
+    providers.setLastApiErrorDetail("compatible", "status=429 message=Rate limit exceeded");
+    try std.testing.expect((try detailedProviderErrorForDisplay(allocator, error.OutOfMemory)) == null);
+}
+
+test "compactAgentErrorMessage keeps non-telegram fallback concise" {
+    // Regression: Signal/Matrix/Max should not inherit Telegram's `/new` guidance for generic failures.
+    try std.testing.expectEqualStrings("An error occurred. Try again.", compactAgentErrorMessage(error.Unexpected));
 }
 
 test "telegram update offset store returns null for mismatched bot id" {

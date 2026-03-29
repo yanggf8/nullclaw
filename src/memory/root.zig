@@ -342,6 +342,7 @@ pub const prompt_bootstrap_docs = [_]PromptBootstrapDoc{
     .{ .filename = "AGENTS.md", .memory_key = "__bootstrap.prompt.AGENTS.md" },
     .{ .filename = "SOUL.md", .memory_key = "__bootstrap.prompt.SOUL.md" },
     .{ .filename = "TOOLS.md", .memory_key = "__bootstrap.prompt.TOOLS.md" },
+    .{ .filename = "CONFIG.md", .memory_key = "__bootstrap.prompt.CONFIG.md" },
     .{ .filename = "IDENTITY.md", .memory_key = "__bootstrap.prompt.IDENTITY.md" },
     .{ .filename = "USER.md", .memory_key = "__bootstrap.prompt.USER.md" },
     .{ .filename = "HEARTBEAT.md", .memory_key = "__bootstrap.prompt.HEARTBEAT.md" },

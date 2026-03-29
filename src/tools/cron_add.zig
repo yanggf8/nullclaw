@@ -229,7 +229,7 @@ test "cron_add schema has command" {
 }
 
 test "cron_add gateway request body preserves delay and command" {
-    const body = try cron_gateway.buildAddBody(std.testing.allocator, null, "30m", "echo later", null, null, null);
+    const body = try cron_gateway.buildAddBody(std.testing.allocator, null, "30m", "echo later", null, null, null, null);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});

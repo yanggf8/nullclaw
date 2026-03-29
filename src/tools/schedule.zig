@@ -7,6 +7,7 @@ const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
 const cron_types = @import("../cron/types.zig");
 const cron_backend_mod = @import("../cron/root.zig");
+const agent_routing = @import("../agent_routing.zig");
 const cron_add = @import("cron_add.zig");
 const loadScheduler = cron_add.loadScheduler;
 const loadDbBackend = cron_add.loadDbBackend;
@@ -16,24 +17,38 @@ const cron_gateway = @import("cron_gateway.zig"); // used by tests
 threadlocal var tls_schedule_channel: ?[]const u8 = null;
 threadlocal var tls_schedule_account_id: ?[]const u8 = null;
 threadlocal var tls_schedule_chat_id: ?[]const u8 = null;
+threadlocal var tls_schedule_peer_kind: ?agent_routing.ChatType = null;
+threadlocal var tls_schedule_peer_id: ?[]const u8 = null;
+threadlocal var tls_schedule_thread_id: ?[]const u8 = null;
 
 /// Schedule tool — lets the agent manage recurring and one-shot scheduled tasks.
 /// Delegates to the CronScheduler from the cron module for persistent job management.
 pub const ScheduleTool = struct {
     pub const tool_name = "schedule";
-    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Optional delivery params: channel, account_id, chat_id.";
+    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Use 'command' for shell jobs or 'prompt' (with optional 'model') for agent jobs. Optional delivery params: channel, account_id, chat_id. Set session_target to 'main' for agent jobs to route results through the main agent.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"id":{"type":"string","description":"Task ID"},"channel":{"type":"string","description":"Delivery channel for notifications (e.g. telegram, signal, matrix)"},"account_id":{"type":"string","description":"Optional channel account ID for multi-account routing"},"chat_id":{"type":"string","description":"Chat ID for delivery notification"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"prompt":{"type":"string","description":"Agent prompt for an agent job"},"model":{"type":"string","description":"Optional model override for agent jobs"},"id":{"type":"string","description":"Task ID"},"channel":{"type":"string","description":"Delivery channel for notifications (e.g. telegram, signal, matrix)"},"account_id":{"type":"string","description":"Optional channel account ID for multi-account routing"},"chat_id":{"type":"string","description":"Chat ID for delivery notification"},"session_target":{"type":"string","enum":["isolated","main"],"description":"Routing mode for agent jobs: 'isolated' (default) delivers raw output directly; 'main' routes through the main agent session for contextualised responses"}},"required":["action"]}
     ;
 
     const vtable = root.ToolVTable(@This());
 
     /// Set the context for the current turn (called before agent.turn).
-    pub fn setContext(self: *ScheduleTool, channel: ?[]const u8, account_id: ?[]const u8, chat_id: ?[]const u8) void {
+    pub fn setContext(
+        self: *ScheduleTool,
+        channel: ?[]const u8,
+        account_id: ?[]const u8,
+        chat_id: ?[]const u8,
+        peer_kind: ?agent_routing.ChatType,
+        peer_id: ?[]const u8,
+        thread_id: ?[]const u8,
+    ) void {
         _ = self;
         tls_schedule_channel = channel;
         tls_schedule_account_id = account_id;
         tls_schedule_chat_id = chat_id;
+        tls_schedule_peer_kind = peer_kind;
+        tls_schedule_peer_id = peer_id;
+        tls_schedule_thread_id = thread_id;
     }
 
     pub fn tool(self: *ScheduleTool) Tool {
@@ -51,6 +66,11 @@ pub const ScheduleTool = struct {
         const explicit_channel = root.getString(args, "channel");
         const explicit_account_id = root.getString(args, "account_id");
         const explicit_chat_id = root.getString(args, "chat_id");
+        const session_target = if (root.getString(args, "session_target")) |st|
+            cron.SessionTarget.parseStrict(st) catch
+                return ToolResult.fail("Invalid 'session_target' parameter: expected 'isolated' or 'main'")
+        else
+            cron.SessionTarget.isolated;
 
         // Prefer explicit args; otherwise use per-thread context injected by channel_loop.
         const chat_id = explicit_chat_id orelse tls_schedule_chat_id;
@@ -206,13 +226,21 @@ pub const ScheduleTool = struct {
         }
 
         if (std.mem.eql(u8, action, "create") or std.mem.eql(u8, action, "add")) {
-            const command = root.getString(args, "command") orelse
-                return ToolResult.fail("Missing 'command' parameter");
+            const command = root.getString(args, "command");
+            const prompt = root.getString(args, "prompt");
+            const model = root.getString(args, "model");
             const expression = root.getString(args, "expression") orelse
                 return ToolResult.fail("Missing 'expression' parameter for cron job");
+            if (command == null and prompt == null)
+                return ToolResult.fail("Missing 'command' or 'prompt' parameter");
+            if (command != null and prompt != null)
+                return ToolResult.fail("Provide either 'command' or 'prompt', not both");
+            if (prompt == null and session_target != .isolated)
+                return ToolResult.fail("session_target is only supported for agent jobs created with 'prompt'");
 
-            const delivery = if (chat_id) |cid|
-                cron_types.DeliveryConfig{
+            const context_routing_allowed = explicit_channel == null and explicit_account_id == null and explicit_chat_id == null;
+            const db_delivery = if (chat_id) |cid|
+                cron_backend_mod.DeliveryConfig{
                     .mode = .always,
                     .channel = delivery_channel,
                     .account_id = delivery_account_id,
@@ -220,7 +248,7 @@ pub const ScheduleTool = struct {
                     .best_effort = true,
                 }
             else
-                cron_types.DeliveryConfig{};
+                cron_backend_mod.DeliveryConfig{};
 
             // DB-direct path
             if (loadDbBackend(allocator)) |be_val| {
@@ -231,8 +259,8 @@ pub const ScheduleTool = struct {
                 defer job_arena.deinit();
                 const job = backend.add(job_arena.allocator(), .{
                     .expression = expression,
-                    .command = command,
-                    .delivery = delivery,
+                    .command = command orelse "",
+                    .delivery = db_delivery,
                 }) catch |err| {
                     const msg = try std.fmt.allocPrint(allocator, "Failed to create job: {s}", .{@errorName(err)});
                     return ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -248,42 +276,98 @@ pub const ScheduleTool = struct {
             };
             defer scheduler.deinit();
 
-            const job = scheduler.addJob(expression, command) catch |err| {
-                const msg = try std.fmt.allocPrint(allocator, "Failed to create job: {s}", .{@errorName(err)});
-                return ToolResult{ .success = false, .output = "", .error_msg = msg };
-            };
-
-            // Set delivery config if chat_id is provided
-            if (chat_id) |cid| {
-                job.delivery = .{
+            const legacy_delivery = if (chat_id) |cid|
+                cron.DeliveryConfig{
                     .mode = .always,
-                    .channel = try allocator.dupe(u8, delivery_channel),
-                    .account_id = if (delivery_account_id) |aid| try allocator.dupe(u8, aid) else null,
-                    .to = try allocator.dupe(u8, cid),
-                    .channel_owned = true,
-                    .account_id_owned = delivery_account_id != null,
-                    .to_owned = true,
+                    .channel = delivery_channel,
+                    .account_id = delivery_account_id,
+                    .to = cid,
+                    .peer_kind = if (context_routing_allowed) tls_schedule_peer_kind else null,
+                    .peer_id = if (context_routing_allowed) tls_schedule_peer_id else null,
+                    .thread_id = if (context_routing_allowed) tls_schedule_thread_id else null,
+                    .best_effort = true,
+                }
+            else
+                cron.DeliveryConfig{};
+
+            const job = if (prompt) |job_prompt|
+                scheduler.addAgentJob(expression, job_prompt, model, legacy_delivery) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to create agent job: {s}", .{@errorName(err)});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                }
+            else
+                scheduler.addJob(expression, command.?) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to create job: {s}", .{@errorName(err)});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
                 };
+
+            if (prompt != null) {
+                job.session_target = session_target;
+            }
+
+            // Shell jobs duplicate delivery routing locally because addJob() has no delivery parameter.
+            if (prompt == null) {
+                if (chat_id) |cid| {
+                    const owned_peer_id = if (context_routing_allowed and tls_schedule_peer_id != null)
+                        try allocator.dupe(u8, tls_schedule_peer_id.?)
+                    else
+                        null;
+                    errdefer if (owned_peer_id) |value| allocator.free(value);
+                    const owned_thread_id = if (context_routing_allowed and tls_schedule_thread_id != null)
+                        try allocator.dupe(u8, tls_schedule_thread_id.?)
+                    else
+                        null;
+                    errdefer if (owned_thread_id) |value| allocator.free(value);
+                    job.delivery = cron.enrichDeliveryRouting(.{
+                        .mode = .always,
+                        .channel = try allocator.dupe(u8, delivery_channel),
+                        .account_id = if (delivery_account_id) |aid| try allocator.dupe(u8, aid) else null,
+                        .to = try allocator.dupe(u8, cid),
+                        .peer_kind = if (context_routing_allowed) tls_schedule_peer_kind else null,
+                        .peer_id = owned_peer_id,
+                        .thread_id = owned_thread_id,
+                        .channel_owned = true,
+                        .account_id_owned = delivery_account_id != null,
+                        .to_owned = true,
+                        .peer_id_owned = owned_peer_id != null,
+                        .thread_id_owned = owned_thread_id != null,
+                    });
+                }
             }
 
             if (try persistSchedulerOrFail(allocator, &scheduler)) |result| return result;
 
-            const msg = try std.fmt.allocPrint(allocator, "Created job {s} | {s} | cmd: {s}", .{
-                job.id,
-                job.expression,
-                job.command,
-            });
+            const msg = if (prompt) |job_prompt|
+                try std.fmt.allocPrint(allocator, "Created agent job {s} | {s} | prompt: {s}", .{
+                    job.id,
+                    job.expression,
+                    job_prompt,
+                })
+            else
+                try std.fmt.allocPrint(allocator, "Created job {s} | {s} | cmd: {s}", .{
+                    job.id,
+                    job.expression,
+                    job.command,
+                });
             return ToolResult{ .success = true, .output = msg };
         }
 
         if (std.mem.eql(u8, action, "once")) {
-            const command = root.getString(args, "command") orelse
-                return ToolResult.fail("Missing 'command' parameter");
+            const command = root.getString(args, "command");
+            const prompt = root.getString(args, "prompt");
+            const model = root.getString(args, "model");
             const delay = root.getString(args, "delay") orelse
                 return ToolResult.fail("Missing 'delay' parameter for one-shot task");
+            if (command == null and prompt == null)
+                return ToolResult.fail("Missing 'command' or 'prompt' parameter");
+            if (command != null and prompt != null)
+                return ToolResult.fail("Provide either 'command' or 'prompt', not both");
+            if (prompt == null and session_target != .isolated)
+                return ToolResult.fail("session_target is only supported for agent jobs created with 'prompt'");
 
-            const delivery = if (chat_id) |cid|
-                cron_types.DeliveryConfig{
+            const context_routing_allowed_once = explicit_channel == null and explicit_account_id == null and explicit_chat_id == null;
+            const db_delivery_once = if (chat_id) |cid|
+                cron_backend_mod.DeliveryConfig{
                     .mode = .always,
                     .channel = delivery_channel,
                     .account_id = delivery_account_id,
@@ -291,7 +375,7 @@ pub const ScheduleTool = struct {
                     .best_effort = true,
                 }
             else
-                cron_types.DeliveryConfig{};
+                cron_backend_mod.DeliveryConfig{};
 
             // DB-direct path
             if (loadDbBackend(allocator)) |be_val| {
@@ -304,11 +388,11 @@ pub const ScheduleTool = struct {
                 const delay_secs = cron.parseDuration(delay) catch 60;
                 const job = backend.add(job_arena.allocator(), .{
                     .expression = "@once",
-                    .command = command,
+                    .command = command orelse "",
                     .one_shot = true,
                     .delete_after_run = true,
                     .next_run_secs_override = now + delay_secs,
-                    .delivery = delivery,
+                    .delivery = db_delivery_once,
                 }) catch |err| {
                     const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot task: {s}", .{@errorName(err)});
                     return ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -324,31 +408,77 @@ pub const ScheduleTool = struct {
             };
             defer scheduler.deinit();
 
-            const job = scheduler.addOnce(delay, command) catch |err| {
-                const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot task: {s}", .{@errorName(err)});
-                return ToolResult{ .success = false, .output = "", .error_msg = msg };
-            };
+            const legacy_delivery_once = if (chat_id) |cid|
+                cron.DeliveryConfig{
+                    .mode = .always,
+                    .channel = delivery_channel,
+                    .account_id = delivery_account_id,
+                    .to = cid,
+                    .peer_kind = if (context_routing_allowed_once) tls_schedule_peer_kind else null,
+                    .peer_id = if (context_routing_allowed_once) tls_schedule_peer_id else null,
+                    .thread_id = if (context_routing_allowed_once) tls_schedule_thread_id else null,
+                    .best_effort = true,
+                }
+            else
+                cron.DeliveryConfig{};
 
-            // Set delivery config if chat_id is provided
-            if (chat_id) |cid| {
-                job.delivery = .{
+            const job = if (prompt) |job_prompt|
+                scheduler.addAgentOnce(delay, job_prompt, model, legacy_delivery_once) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot agent task: {s}", .{@errorName(err)});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                }
+            else
+                scheduler.addOnce(delay, command.?) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot task: {s}", .{@errorName(err)});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                };
+
+            if (prompt != null) {
+                job.session_target = session_target;
+            }
+
+            // Shell jobs duplicate delivery routing locally because addOnce() has no delivery parameter.
+            if (prompt == null) if (chat_id) |cid| {
+                const owned_peer_id = if (context_routing_allowed_once and tls_schedule_peer_id != null)
+                    try allocator.dupe(u8, tls_schedule_peer_id.?)
+                else
+                    null;
+                errdefer if (owned_peer_id) |value| allocator.free(value);
+                const owned_thread_id = if (context_routing_allowed_once and tls_schedule_thread_id != null)
+                    try allocator.dupe(u8, tls_schedule_thread_id.?)
+                else
+                    null;
+                errdefer if (owned_thread_id) |value| allocator.free(value);
+                job.delivery = cron.enrichDeliveryRouting(.{
                     .mode = .always,
                     .channel = try allocator.dupe(u8, delivery_channel),
                     .account_id = if (delivery_account_id) |aid| try allocator.dupe(u8, aid) else null,
                     .to = try allocator.dupe(u8, cid),
+                    .peer_kind = if (context_routing_allowed_once) tls_schedule_peer_kind else null,
+                    .peer_id = owned_peer_id,
+                    .thread_id = owned_thread_id,
                     .channel_owned = true,
                     .account_id_owned = delivery_account_id != null,
                     .to_owned = true,
-                };
-            }
+                    .peer_id_owned = owned_peer_id != null,
+                    .thread_id_owned = owned_thread_id != null,
+                });
+            };
 
             if (try persistSchedulerOrFail(allocator, &scheduler)) |result| return result;
 
-            const msg = try std.fmt.allocPrint(allocator, "Created one-shot task {s} | runs at {d} | cmd: {s}", .{
-                job.id,
-                job.next_run_secs,
-                job.command,
-            });
+            const msg = if (prompt) |job_prompt|
+                try std.fmt.allocPrint(allocator, "Created one-shot agent task {s} | runs at {d} | prompt: {s}", .{
+                    job.id,
+                    job.next_run_secs,
+                    job_prompt,
+                })
+            else
+                try std.fmt.allocPrint(allocator, "Created one-shot task {s} | runs at {d} | cmd: {s}", .{
+                    job.id,
+                    job.next_run_secs,
+                    job.command,
+                });
             return ToolResult{ .success = true, .output = msg };
         }
 
@@ -492,10 +622,24 @@ test "schedule create with expression" {
     }
 }
 
+test "schedule create supports agent jobs with session_target" {
+    var st = ScheduleTool{};
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"create\", \"expression\": \"*/5 * * * *\", \"prompt\": \"Summarize release status\", \"model\": \"glm-cn/glm-5-turbo\", \"session_target\": \"main\"}");
+    defer parsed.deinit();
+
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    if (result.success) {
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "Created agent job") != null);
+    }
+}
+
 test "schedule create rejects cross-channel override without explicit chat_id" {
     var st = ScheduleTool{};
-    st.setContext("telegram", "main", "chat-123");
-    defer st.setContext(null, null, null);
+    st.setContext("telegram", "main", "chat-123", .direct, "chat-123", null);
+    defer st.setContext(null, null, null, null, null, null);
 
     const t = st.tool();
     const parsed = try root.parseTestArgs("{\"action\": \"create\", \"expression\": \"*/5 * * * *\", \"command\": \"echo hello\", \"channel\": \"signal\"}");
@@ -505,6 +649,17 @@ test "schedule create rejects cross-channel override without explicit chat_id" {
 
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "chat_id") != null);
+}
+
+test "schedule create rejects invalid session_target" {
+    var st = ScheduleTool{};
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"create\", \"expression\": \"*/5 * * * *\", \"prompt\": \"Summarize\", \"session_target\": \"primary\"}");
+    defer parsed.deinit();
+
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "session_target") != null);
 }
 
 // ── Additional schedule tests ───────────────────────────────────
@@ -635,7 +790,8 @@ test "schedule create missing command" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "command") != null or
+        std.mem.indexOf(u8, result.error_msg.?, "prompt") != null);
 }
 
 test "schedule create missing expression" {
@@ -656,6 +812,16 @@ test "schedule once missing delay" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "delay") != null);
+}
+
+test "schedule rejects session_target for shell jobs" {
+    var st = ScheduleTool{};
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"create\", \"expression\": \"* * * * *\", \"command\": \"echo hi\", \"session_target\": \"main\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "session_target") != null);
 }
 
 test "schedule pause requires id" {

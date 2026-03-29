@@ -2253,6 +2253,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         if (val.object.get("user_agent")) |ua| {
                             if (ua == .string) pe.user_agent = try self.allocator.dupe(u8, ua.string);
                         }
+                        if (val.object.get("api_mode")) |am| {
+                            if (am == .string) pe.api_mode = types.ProviderEntry.ApiMode.parse(am.string);
+                        }
+                        if (val.object.get("chat_template_enable_thinking_param")) |ctp| {
+                            if (ctp == .bool) pe.chat_template_enable_thinking_param = ctp.bool;
+                        }
                         if (val.object.get("max_streaming_prompt_bytes")) |mb| {
                             if (mb == .integer and mb.integer >= 0) pe.max_streaming_prompt_bytes = @intCast(mb.integer);
                         }

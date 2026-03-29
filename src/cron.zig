@@ -5,6 +5,9 @@ const platform = @import("platform.zig");
 const bus = @import("bus.zig");
 const fs_compat = @import("fs_compat.zig");
 const json_util = @import("json_util.zig");
+const agent_routing = @import("agent_routing.zig");
+const telegram = @import("channels/telegram.zig");
+const signal = @import("channels/signal.zig");
 const Config = @import("config.zig").Config;
 
 const sqlite_mod = if (build_options.enable_sqlite)
@@ -51,6 +54,12 @@ pub const SessionTarget = enum {
         if (std.ascii.eqlIgnoreCase(raw, "main")) return .main;
         return .isolated;
     }
+
+    pub fn parseStrict(raw: []const u8) !SessionTarget {
+        if (std.ascii.eqlIgnoreCase(raw, "isolated")) return .isolated;
+        if (std.ascii.eqlIgnoreCase(raw, "main")) return .main;
+        return error.InvalidSessionTarget;
+    }
 };
 
 pub const ScheduleKind = enum { cron, at, every };
@@ -89,11 +98,66 @@ pub const DeliveryConfig = struct {
     channel: ?[]const u8 = null,
     account_id: ?[]const u8 = null,
     to: ?[]const u8 = null,
-    best_effort: bool = false,
+    peer_kind: ?agent_routing.ChatType = null,
+    peer_id: ?[]const u8 = null,
+    thread_id: ?[]const u8 = null,
+    best_effort: bool = true,
     channel_owned: bool = false,
     account_id_owned: bool = false,
     to_owned: bool = false,
+    peer_id_owned: bool = false,
+    thread_id_owned: bool = false,
 };
+
+fn chatTypeAsStr(kind: agent_routing.ChatType) []const u8 {
+    return switch (kind) {
+        .direct => "direct",
+        .group => "group",
+        .channel => "channel",
+    };
+}
+
+fn parseChatType(raw: []const u8) ?agent_routing.ChatType {
+    if (std.mem.eql(u8, raw, "direct")) return .direct;
+    if (std.mem.eql(u8, raw, "group")) return .group;
+    if (std.mem.eql(u8, raw, "channel")) return .channel;
+    return null;
+}
+
+pub fn enrichDeliveryRouting(delivery: DeliveryConfig) DeliveryConfig {
+    var enriched = delivery;
+    const channel = enriched.channel orelse return enriched;
+    const target = enriched.to orelse return enriched;
+
+    if (std.mem.eql(u8, channel, "telegram")) {
+        const base_chat_id = telegram.targetChatId(target);
+        if (enriched.peer_id == null) enriched.peer_id = base_chat_id;
+        if (enriched.peer_kind == null) {
+            enriched.peer_kind = if (telegram.targetThreadId(target) != null or
+                (base_chat_id.len > 0 and base_chat_id[0] == '-'))
+                .group
+            else
+                .direct;
+        }
+        return enriched;
+    }
+
+    if (std.mem.eql(u8, channel, "signal")) {
+        if (enriched.peer_id == null) enriched.peer_id = signal.signalGroupPeerId(target);
+        if (enriched.peer_kind == null) {
+            enriched.peer_kind = if (std.mem.startsWith(u8, target, signal.GROUP_TARGET_PREFIX))
+                .group
+            else
+                .direct;
+        }
+        return enriched;
+    }
+
+    if (enriched.peer_kind != null and enriched.peer_id == null) {
+        enriched.peer_id = target;
+    }
+    return enriched;
+}
 
 pub const CronRun = struct {
     id: u64,
@@ -122,6 +186,7 @@ pub const CronJobPatch = struct {
     timeout_secs: ?u32 = null,
     next_run_secs: ?i64 = null,
     tz_offset_s: ?i32 = null,
+    session_target: ?SessionTarget = null,
 };
 
 /// A scheduled cron job.
@@ -477,6 +542,12 @@ pub const CronScheduler = struct {
         if (job.delivery.to_owned) {
             if (job.delivery.to) |to| self.allocator.free(to);
         }
+        if (job.delivery.peer_id_owned) {
+            if (job.delivery.peer_id) |peer_id| self.allocator.free(peer_id);
+        }
+        if (job.delivery.thread_id_owned) {
+            if (job.delivery.thread_id) |thread_id| self.allocator.free(thread_id);
+        }
     }
 
     pub fn deinit(self: *CronScheduler) void {
@@ -587,9 +658,14 @@ pub const CronScheduler = struct {
                 .channel = if (delivery.channel) |ch| try self.allocator.dupe(u8, ch) else null,
                 .account_id = if (delivery.account_id) |aid| try self.allocator.dupe(u8, aid) else null,
                 .to = if (delivery.to) |t| try self.allocator.dupe(u8, t) else null,
+                .peer_kind = delivery.peer_kind,
+                .peer_id = if (delivery.peer_id) |p| try self.allocator.dupe(u8, p) else null,
+                .thread_id = if (delivery.thread_id) |t| try self.allocator.dupe(u8, t) else null,
                 .channel_owned = delivery.channel != null,
                 .account_id_owned = delivery.account_id != null,
                 .to_owned = delivery.to != null,
+                .peer_id_owned = delivery.peer_id != null,
+                .thread_id_owned = delivery.thread_id != null,
                 .best_effort = delivery.best_effort,
             },
         });
@@ -622,9 +698,14 @@ pub const CronScheduler = struct {
                 .channel = if (delivery.channel) |ch| try self.allocator.dupe(u8, ch) else null,
                 .account_id = if (delivery.account_id) |aid| try self.allocator.dupe(u8, aid) else null,
                 .to = if (delivery.to) |t| try self.allocator.dupe(u8, t) else null,
+                .peer_kind = delivery.peer_kind,
+                .peer_id = if (delivery.peer_id) |peer_id| try self.allocator.dupe(u8, peer_id) else null,
+                .thread_id = if (delivery.thread_id) |thread_id| try self.allocator.dupe(u8, thread_id) else null,
                 .channel_owned = delivery.channel != null,
                 .account_id_owned = delivery.account_id != null,
                 .to_owned = delivery.to != null,
+                .peer_id_owned = delivery.peer_id != null,
+                .thread_id_owned = delivery.thread_id != null,
                 .best_effort = delivery.best_effort,
             },
         });
@@ -633,7 +714,7 @@ pub const CronScheduler = struct {
     }
 
     /// Add a one-shot delayed agent task.
-    pub fn addAgentOnce(self: *CronScheduler, delay: []const u8, prompt: []const u8, model: ?[]const u8) !*CronJob {
+    pub fn addAgentOnce(self: *CronScheduler, delay: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig) !*CronJob {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
 
         const delay_secs = try parseDuration(delay);
@@ -654,6 +735,21 @@ pub const CronScheduler = struct {
             .job_type = .agent,
             .prompt = try self.allocator.dupe(u8, prompt),
             .model = if (model) |m| try self.allocator.dupe(u8, m) else null,
+            .delivery = .{
+                .mode = delivery.mode,
+                .channel = if (delivery.channel) |ch| try self.allocator.dupe(u8, ch) else null,
+                .account_id = if (delivery.account_id) |aid| try self.allocator.dupe(u8, aid) else null,
+                .to = if (delivery.to) |t| try self.allocator.dupe(u8, t) else null,
+                .peer_kind = delivery.peer_kind,
+                .peer_id = if (delivery.peer_id) |peer_id| try self.allocator.dupe(u8, peer_id) else null,
+                .thread_id = if (delivery.thread_id) |thread_id| try self.allocator.dupe(u8, thread_id) else null,
+                .channel_owned = delivery.channel != null,
+                .account_id_owned = delivery.account_id != null,
+                .to_owned = delivery.to != null,
+                .peer_id_owned = delivery.peer_id != null,
+                .thread_id_owned = delivery.thread_id != null,
+                .best_effort = delivery.best_effort,
+            },
         });
 
         return &self.jobs.items[self.jobs.items.len - 1];
@@ -771,6 +867,9 @@ pub const CronScheduler = struct {
         }
         if (patch.next_run_secs) |nrs| {
             job.next_run_secs = nrs;
+        }
+        if (patch.session_target) |st| {
+            job.session_target = st;
         }
         return true;
     }
@@ -961,7 +1060,11 @@ pub const CronScheduler = struct {
                         job.last_output = self.allocator.dupe(u8, agent_output) catch null;
 
                         if (out_bus) |b| {
-                            _ = deliverResult(self.allocator, job.delivery, agent_output, true, b) catch {};
+                            if (job.session_target == .main) {
+                                _ = deliverViaMainAgent(self.allocator, job.delivery, agent_output, true, b, job.name orelse job.id) catch {};
+                            } else {
+                                _ = deliverResult(self.allocator, job.delivery, agent_output, true, b) catch {};
+                            }
                         }
                     } else {
                         const exec_result = runAgentJob(self.allocator, self.shell_cwd, agent_output, job.model, self.agent_timeout_secs) catch |err| {
@@ -980,7 +1083,11 @@ pub const CronScheduler = struct {
                         job.last_status = if (exec_result.success) "ok" else "error";
                         if (job.last_output) |old| self.allocator.free(old);
                         if (out_bus) |b| {
-                            _ = deliverResult(self.allocator, job.delivery, exec_result.output, exec_result.success, b) catch {};
+                            if (job.session_target == .main) {
+                                _ = deliverViaMainAgent(self.allocator, job.delivery, exec_result.output, exec_result.success, b, job.name orelse job.id) catch {};
+                            } else {
+                                _ = deliverResult(self.allocator, job.delivery, exec_result.output, exec_result.success, b) catch {};
+                            }
                         }
 
                         job.last_output = if (exec_result.output.len > 0) exec_result.output else blk: {
@@ -1724,6 +1831,35 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             }
             break :blk null;
         };
+        const delivery_peer_kind = blk: {
+            if (obj.get("delivery_peer_kind")) |v| {
+                if (v == .string) break :blk parseChatType(v.string);
+            }
+            break :blk null;
+        };
+        const delivery_peer_id = blk: {
+            if (obj.get("delivery_peer_id")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const delivery_thread_id = blk: {
+            if (obj.get("delivery_thread_id")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const session_target = blk: {
+            if (obj.get("session_target")) |v| {
+                if (v == .string) {
+                    break :blk switch (policy) {
+                        .best_effort => SessionTarget.parse(v.string),
+                        .strict => SessionTarget.parseStrict(v.string) catch return error.InvalidCronStoreFormat,
+                    };
+                }
+            }
+            break :blk SessionTarget.isolated;
+        };
 
         const last_output_json: ?[]const u8 = blk: {
             if (obj.get("last_output")) |v| {
@@ -1748,6 +1884,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .paused = paused,
             .one_shot = one_shot,
             .job_type = job_type,
+            .session_target = session_target,
             .prompt = if (prompt) |p| try scheduler.allocator.dupe(u8, p) else null,
             .model = if (model) |m| try scheduler.allocator.dupe(u8, m) else null,
             .skill_name = if (skill_name_raw) |sn| try scheduler.allocator.dupe(u8, sn) else null,
@@ -1761,9 +1898,14 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
                 .channel = if (delivery_channel) |ch| try scheduler.allocator.dupe(u8, ch) else null,
                 .account_id = if (delivery_account_id) |aid| try scheduler.allocator.dupe(u8, aid) else null,
                 .to = if (delivery_to) |t| try scheduler.allocator.dupe(u8, t) else null,
+                .peer_kind = delivery_peer_kind,
+                .peer_id = if (delivery_peer_id) |peer_id| try scheduler.allocator.dupe(u8, peer_id) else null,
+                .thread_id = if (delivery_thread_id) |thread_id| try scheduler.allocator.dupe(u8, thread_id) else null,
                 .channel_owned = delivery_channel != null,
                 .account_id_owned = delivery_account_id != null,
                 .to_owned = delivery_to != null,
+                .peer_id_owned = delivery_peer_id != null,
+                .thread_id_owned = delivery_thread_id != null,
             },
         });
     }
@@ -1954,6 +2096,10 @@ pub fn ensureCronTable(db: *c.sqlite3) !void {
     _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN skill_args TEXT", null, null, null);
     // Migration: add tz_offset_s column for per-job timezone offset (seconds, default 0 = UTC).
     _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN tz_offset_s INTEGER NOT NULL DEFAULT 0", null, null, null);
+    // Migration: add delivery routing columns for peer_kind/peer_id/thread_id.
+    _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN delivery_peer_kind TEXT", null, null, null);
+    _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN delivery_peer_id TEXT", null, null, null);
+    _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN delivery_thread_id TEXT", null, null, null);
     try ensureRunQueueTable(db);
 }
 
@@ -1965,8 +2111,9 @@ fn dbSaveJob(db: *c.sqlite3, job: *const CronJob) !void {
         "next_run_secs, last_run_secs, last_status, paused, one_shot, " ++
         "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
         "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs, " ++
-        "delivery_best_effort, session_target, skill_name, skill_args, tz_offset_s) " ++
-        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)";
+        "delivery_best_effort, session_target, skill_name, skill_args, tz_offset_s, " ++
+        "delivery_peer_kind, delivery_peer_id, delivery_thread_id) " ++
+        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)";
 
     var stmt: ?*c.sqlite3_stmt = null;
     var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
@@ -2050,6 +2197,26 @@ fn dbSaveJob(db: *c.sqlite3, job: *const CronJob) !void {
         _ = c.sqlite3_bind_null(stmt, 25);
     }
     _ = c.sqlite3_bind_int(stmt, 26, job.tz_offset_s);
+    if (job.delivery.peer_kind) |pk| {
+        const pk_str = switch (pk) {
+            .direct => "direct",
+            .group => "group",
+            .channel => "channel",
+        };
+        _ = c.sqlite3_bind_text(stmt, 27, pk_str.ptr, @intCast(pk_str.len), SQLITE_STATIC);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 27);
+    }
+    if (job.delivery.peer_id) |pid| {
+        _ = c.sqlite3_bind_text(stmt, 28, pid.ptr, @intCast(pid.len), SQLITE_STATIC);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 28);
+    }
+    if (job.delivery.thread_id) |tid| {
+        _ = c.sqlite3_bind_text(stmt, 29, tid.ptr, @intCast(tid.len), SQLITE_STATIC);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 29);
+    }
 
     rc = c.sqlite3_step(stmt);
     if (rc != c.SQLITE_DONE) return error.StepFailed;
@@ -2183,7 +2350,8 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
         "next_run_secs, last_run_secs, last_status, paused, one_shot, " ++
         "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
         "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs, " ++
-        "skill_name, skill_args, delivery_best_effort, tz_offset_s " ++
+        "skill_name, skill_args, delivery_best_effort, tz_offset_s, " ++
+        "session_target, delivery_peer_kind, delivery_peer_id, delivery_thread_id " ++
         "FROM cron_jobs ORDER BY rowid ASC";
 
     var stmt: ?*c.sqlite3_stmt = null;
@@ -2269,6 +2437,26 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
         const skill_args_opt = try dbColumnTextOpt(stmt, 22, allocator);
         const delivery_best_effort = c.sqlite3_column_int(stmt, 23) != 0;
         const tz_offset_s: i32 = @intCast(c.sqlite3_column_int(stmt, 24));
+        const session_target: SessionTarget = blk: {
+            const st_str = try dbColumnTextOpt(stmt, 25, allocator);
+            if (st_str) |s| {
+                defer allocator.free(s);
+                if (std.mem.eql(u8, s, "main")) break :blk .main;
+            }
+            break :blk .isolated;
+        };
+        const delivery_peer_kind: ?agent_routing.ChatType = blk: {
+            const pk_str = try dbColumnTextOpt(stmt, 26, allocator);
+            if (pk_str) |s| {
+                defer allocator.free(s);
+                if (std.mem.eql(u8, s, "direct")) break :blk .direct;
+                if (std.mem.eql(u8, s, "group")) break :blk .group;
+                if (std.mem.eql(u8, s, "channel")) break :blk .channel;
+            }
+            break :blk null;
+        };
+        const delivery_peer_id = try dbColumnTextOpt(stmt, 27, allocator);
+        const delivery_thread_id = try dbColumnTextOpt(stmt, 28, allocator);
 
         // Normalize last_status to a static literal ("ok"/"error"/null).
         // freeJobOwned does NOT free last_status, so we must never heap-allocate it.
@@ -2298,14 +2486,20 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
             .last_output = last_output_opt,
             .skill_name = skill_name_opt,
             .skill_args = skill_args_opt,
+            .session_target = session_target,
             .delivery = .{
                 .mode = delivery_mode,
                 .channel = delivery_channel,
                 .account_id = delivery_account_id,
                 .to = delivery_to,
+                .peer_kind = delivery_peer_kind,
+                .peer_id = delivery_peer_id,
+                .thread_id = delivery_thread_id,
                 .channel_owned = delivery_channel != null,
                 .account_id_owned = delivery_account_id != null,
                 .to_owned = delivery_to != null,
+                .peer_id_owned = delivery_peer_id != null,
+                .thread_id_owned = delivery_thread_id != null,
                 .best_effort = delivery_best_effort,
             },
             .tz_offset_s = tz_offset_s,
@@ -2364,6 +2558,131 @@ fn migrateJsonToDb(allocator: std.mem.Allocator, db: *c.sqlite3) void {
     defer allocator.free(migrated_path);
     std.fs.renameAbsolute(json_path, migrated_path) catch {};
     log.info("Migrated {d} cron jobs from cron.json to cron.db", .{temp.jobs.items.len});
+}
+
+fn buildCronMainAgentSessionKey(
+    allocator: std.mem.Allocator,
+    delivery: DeliveryConfig,
+    channel: []const u8,
+    chat_id: []const u8,
+) ![]const u8 {
+    if (delivery.account_id) |account_id| {
+        return std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ channel, account_id, chat_id });
+    }
+    return std.fmt.allocPrint(allocator, "{s}:{s}", .{ channel, chat_id });
+}
+
+fn buildCronMainAgentMetadata(
+    allocator: std.mem.Allocator,
+    delivery: DeliveryConfig,
+    channel: []const u8,
+    chat_id: []const u8,
+) !?[]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    const peer_kind = delivery.peer_kind orelse blk: {
+        const inferred = enrichDeliveryRouting(.{
+            .channel = channel,
+            .to = chat_id,
+        });
+        break :blk inferred.peer_kind;
+    };
+    const peer_id = delivery.peer_id orelse blk: {
+        const inferred = enrichDeliveryRouting(.{
+            .channel = channel,
+            .to = chat_id,
+        });
+        break :blk inferred.peer_id;
+    };
+    var inferred_thread_buf: [32]u8 = undefined;
+    const thread_id = delivery.thread_id orelse if (std.mem.eql(u8, channel, "telegram"))
+        if (telegram.targetThreadId(chat_id)) |thread|
+            std.fmt.bufPrint(&inferred_thread_buf, "{d}", .{thread}) catch null
+        else
+            null
+    else
+        null;
+
+    var wrote_field = false;
+    try buf.appendSlice(allocator, "{");
+    if (delivery.account_id) |account_id| {
+        try json_util.appendJsonKeyValue(&buf, allocator, "account_id", account_id);
+        wrote_field = true;
+    }
+    if (peer_kind) |kind| {
+        if (wrote_field) try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "peer_kind", chatTypeAsStr(kind));
+        wrote_field = true;
+    }
+    if (peer_id) |value| {
+        if (wrote_field) try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "peer_id", value);
+        wrote_field = true;
+    }
+    if (thread_id) |value| {
+        if (wrote_field) try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "thread_id", value);
+        wrote_field = true;
+    }
+    try buf.appendSlice(allocator, "}");
+
+    if (!wrote_field) {
+        buf.deinit(allocator);
+        return null;
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Route a cron agent result through the main agent session via the inbound bus.
+/// The main agent receives the output as a system message, processes it with its
+/// full context (soul, memory, skills), and delivers a contextualised response.
+pub fn deliverViaMainAgent(
+    allocator: std.mem.Allocator,
+    delivery: DeliveryConfig,
+    output: []const u8,
+    success: bool,
+    the_bus: *bus.Bus,
+    job_name: []const u8,
+) !bool {
+    // Apply the same filtering as deliverResult
+    if (delivery.mode == .none) return false;
+    const channel = delivery.channel orelse return false;
+    switch (delivery.mode) {
+        .none => return false,
+        .on_success => if (!success) return false,
+        .on_error => if (success) return false,
+        .always => {},
+    }
+    if (output.len == 0) return false;
+
+    const status_tag = if (success) "" else " [FAILED]";
+    const content = try std.fmt.allocPrint(
+        allocator,
+        "[Scheduled task '{s}'{s} completed]\n{s}",
+        .{ job_name, status_tag, output },
+    );
+    defer allocator.free(content);
+
+    const chat_id = delivery.to orelse "default";
+    const session_key = try buildCronMainAgentSessionKey(allocator, delivery, channel, chat_id);
+    defer allocator.free(session_key);
+    const metadata_json = try buildCronMainAgentMetadata(allocator, delivery, channel, chat_id);
+    defer if (metadata_json) |value| allocator.free(value);
+
+    const msg = if (metadata_json) |value|
+        try bus.makeInboundFull(allocator, channel, "system:cron", chat_id, content, session_key, &.{}, value)
+    else
+        try bus.makeInbound(allocator, channel, "system:cron", chat_id, content, session_key);
+    the_bus.publishInbound(msg) catch |err| {
+        if (delivery.best_effort) {
+            msg.deinit(allocator);
+            return false;
+        }
+        msg.deinit(allocator);
+        return err;
+    };
+    return true;
 }
 
 // ── JSON Persistence ─────────────────────────────────────────────
@@ -2503,6 +2822,8 @@ fn saveJobsToJson(scheduler: *const CronScheduler) !void {
         try buf.appendSlice(scheduler.allocator, ",");
         try json_util.appendJsonKey(&buf, scheduler.allocator, "delete_after_run");
         try buf.appendSlice(scheduler.allocator, if (job.delete_after_run) "true" else "false");
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "session_target", job.session_target.asStr());
 
         // Delivery config for notifications
         try buf.appendSlice(scheduler.allocator, ",");
@@ -2535,6 +2856,27 @@ fn saveJobsToJson(scheduler: *const CronScheduler) !void {
             var int_buf: [16]u8 = undefined;
             const text = std.fmt.bufPrint(&int_buf, "{d}", .{t}) catch unreachable;
             try buf.appendSlice(scheduler.allocator, text);
+        } else {
+            try buf.appendSlice(scheduler.allocator, "null");
+        }
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_peer_kind");
+        if (job.delivery.peer_kind) |peer_kind| {
+            try json_util.appendJsonString(&buf, scheduler.allocator, chatTypeAsStr(peer_kind));
+        } else {
+            try buf.appendSlice(scheduler.allocator, "null");
+        }
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_peer_id");
+        if (job.delivery.peer_id) |peer_id| {
+            try json_util.appendJsonString(&buf, scheduler.allocator, peer_id);
+        } else {
+            try buf.appendSlice(scheduler.allocator, "null");
+        }
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_thread_id");
+        if (job.delivery.thread_id) |thread_id| {
+            try json_util.appendJsonString(&buf, scheduler.allocator, thread_id);
         } else {
             try buf.appendSlice(scheduler.allocator, "null");
         }
@@ -3348,7 +3690,16 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
 }
 
 /// CLI: add a recurring agent job.
-pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig, tz_offset_s: i32) !void {
+pub fn cliAddAgentJob(
+    allocator: std.mem.Allocator,
+    expression: []const u8,
+    prompt: []const u8,
+    model: ?[]const u8,
+    session_target: SessionTarget,
+    delivery: DeliveryConfig,
+    tz_offset_s: i32,
+) !void {
+    const enriched_delivery = enrichDeliveryRouting(delivery);
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
         // Build JSON body, escaping string values through json_util
@@ -3362,23 +3713,39 @@ pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prom
             body_buf.appendSlice(allocator, ",") catch {};
             json_util.appendJsonKeyValue(&body_buf, allocator, "model", m) catch {};
         }
-        if (delivery.mode != .none) {
+        if (session_target != .isolated) {
             body_buf.appendSlice(allocator, ",") catch {};
-            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_mode", delivery.mode.asStr()) catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "session_target", session_target.asStr()) catch {};
         }
-        if (delivery.channel) |ch| {
+        if (enriched_delivery.mode != .none) {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_mode", enriched_delivery.mode.asStr()) catch {};
+        }
+        if (enriched_delivery.channel) |ch| {
             body_buf.appendSlice(allocator, ",") catch {};
             json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_channel", ch) catch {};
         }
-        if (delivery.account_id) |account_id| {
+        if (enriched_delivery.account_id) |account_id| {
             body_buf.appendSlice(allocator, ",") catch {};
             json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_account_id", account_id) catch {};
         }
-        if (delivery.to) |t| {
+        if (enriched_delivery.to) |t| {
             body_buf.appendSlice(allocator, ",") catch {};
             json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_to", t) catch {};
         }
-        if (!delivery.best_effort) {
+        if (enriched_delivery.peer_kind) |peer_kind| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_peer_kind", chatTypeAsStr(peer_kind)) catch {};
+        }
+        if (enriched_delivery.peer_id) |peer_id| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_peer_id", peer_id) catch {};
+        }
+        if (enriched_delivery.thread_id) |thread_id| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_thread_id", thread_id) catch {};
+        }
+        if (!enriched_delivery.best_effort) {
             body_buf.appendSlice(allocator, ",\"delivery_best_effort\":false") catch {};
         }
         body_buf.appendSlice(allocator, "}") catch {};
@@ -3391,6 +3758,7 @@ pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prom
         var temp = CronScheduler.init(allocator, 65535, true);
         defer temp.deinit();
         const job = temp.addAgentJob(expression, prompt, model, delivery) catch break :db_blk;
+        job.session_target = session_target;
         job.tz_offset_s = tz_offset_s;
         if (tz_offset_s != 0) {
             job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
@@ -3412,7 +3780,8 @@ pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prom
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
-    const job = try scheduler.addAgentJob(expression, prompt, model, delivery);
+    const job = try scheduler.addAgentJob(expression, prompt, model, enriched_delivery);
+    job.session_target = session_target;
     job.tz_offset_s = tz_offset_s;
     if (tz_offset_s != 0) {
         job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
@@ -3495,7 +3864,14 @@ pub fn cliAddOnce(allocator: std.mem.Allocator, delay: []const u8, command: []co
 }
 
 /// CLI: add a one-shot delayed agent task.
-pub fn cliAddAgentOnce(allocator: std.mem.Allocator, delay: []const u8, prompt: []const u8, model: ?[]const u8) !void {
+pub fn cliAddAgentOnce(
+    allocator: std.mem.Allocator,
+    delay: []const u8,
+    prompt: []const u8,
+    model: ?[]const u8,
+    session_target: SessionTarget,
+) !void {
+    const delivery = DeliveryConfig{};
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
         var body_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -3508,6 +3884,10 @@ pub fn cliAddAgentOnce(allocator: std.mem.Allocator, delay: []const u8, prompt: 
             body_buf.appendSlice(allocator, ",") catch {};
             json_util.appendJsonKeyValue(&body_buf, allocator, "model", m) catch {};
         }
+        if (session_target != .isolated) {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "session_target", session_target.asStr()) catch {};
+        }
         body_buf.appendSlice(allocator, "}") catch {};
         if (gatewayPost(allocator, url, "/cron/add", body_buf.items)) return;
     }
@@ -3516,7 +3896,8 @@ pub fn cliAddAgentOnce(allocator: std.mem.Allocator, delay: []const u8, prompt: 
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
-    const job = try scheduler.addAgentOnce(delay, prompt, model);
+    const job = try scheduler.addAgentOnce(delay, prompt, model, delivery);
+    job.session_target = session_target;
     try saveJobs(&scheduler);
 
     log.info("Added one-shot agent task {s}", .{job.id});
@@ -3761,6 +4142,7 @@ pub fn cliUpdateJob(
     prompt: ?[]const u8,
     model: ?[]const u8,
     enabled: ?bool,
+    session_target: ?SessionTarget,
     tz_offset_s: ?i32,
 ) !void {
     if (readGatewayUrl(allocator)) |url| {
@@ -3789,6 +4171,10 @@ pub fn cliUpdateJob(
             body_buf.appendSlice(allocator, ",\"enabled\":") catch {};
             body_buf.appendSlice(allocator, if (ena) "true" else "false") catch {};
         }
+        if (session_target) |value| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "session_target", value.asStr()) catch {};
+        }
         if (tz_offset_s) |tz| {
             var tz_buf: [32]u8 = undefined;
             const tz_str = std.fmt.bufPrint(&tz_buf, ",\"tz_offset_s\":{d}", .{tz}) catch "";
@@ -3804,12 +4190,21 @@ pub fn cliUpdateJob(
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
+    if (session_target != null) {
+        const existing = scheduler.getJob(id) orelse {
+            log.warn("Cron job '{s}' not found", .{id});
+            return;
+        };
+        if (existing.job_type != .agent) return error.SessionTargetRequiresAgentJob;
+    }
+
     const patch = CronJobPatch{
         .expression = expression,
         .command = command,
         .prompt = prompt,
         .model = model,
         .enabled = enabled,
+        .session_target = session_target,
         .tz_offset_s = tz_offset_s,
     };
     if (scheduler.updateJob(allocator, id, patch)) {
@@ -5335,17 +5730,17 @@ test "db upsert and load roundtrip keeps agent fields" {
     scheduler.db_path = db_path;
     defer scheduler.deinit();
 
-    const agent_job_id = blk: {
-        const j = try scheduler.addAgentJob("*/15 * * * *", "Summarize release status", "openrouter/anthropic/claude-sonnet-4", .{
-            .mode = .always,
-            .channel = "telegram",
-            .account_id = "backup",
-            .to = "chat-42",
-        });
-        break :blk try std.testing.allocator.dupe(u8, j.id);
-    };
-    defer std.testing.allocator.free(agent_job_id);
-    try dbUpsertAndVerify(&scheduler, scheduler.getJob(agent_job_id).?);
+    const recurring = try scheduler.addAgentJob("*/15 * * * *", "Summarize release status", "openrouter/anthropic/claude-sonnet-4", .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "backup",
+        .to = "chat-42",
+        .peer_kind = .group,
+        .peer_id = "-100123",
+        .thread_id = "77",
+    });
+    recurring.session_target = .main;
+    try saveJobs(&scheduler);
 
     var loaded = CronScheduler.init(std.testing.allocator, 10, true);
     loaded.db_path = db_path;
@@ -5353,19 +5748,25 @@ test "db upsert and load roundtrip keeps agent fields" {
     try loadJobsFromDb(&loaded);
 
     try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
-    const loaded_job = loaded.listJobs()[0];
-    try std.testing.expectEqual(JobType.agent, loaded_job.job_type);
-    try std.testing.expect(loaded_job.prompt != null);
-    try std.testing.expectEqualStrings("Summarize release status", loaded_job.prompt.?);
-    try std.testing.expect(loaded_job.model != null);
-    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", loaded_job.model.?);
-    try std.testing.expectEqual(DeliveryMode.always, loaded_job.delivery.mode);
-    try std.testing.expect(loaded_job.delivery.channel != null);
-    try std.testing.expectEqualStrings("telegram", loaded_job.delivery.channel.?);
-    try std.testing.expect(loaded_job.delivery.account_id != null);
-    try std.testing.expectEqualStrings("backup", loaded_job.delivery.account_id.?);
-    try std.testing.expect(loaded_job.delivery.to != null);
-    try std.testing.expectEqualStrings("chat-42", loaded_job.delivery.to.?);
+    const job = loaded.listJobs()[0];
+    try std.testing.expectEqual(JobType.agent, job.job_type);
+    try std.testing.expect(job.prompt != null);
+    try std.testing.expectEqualStrings("Summarize release status", job.prompt.?);
+    try std.testing.expect(job.model != null);
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", job.model.?);
+    try std.testing.expectEqual(DeliveryMode.always, job.delivery.mode);
+    try std.testing.expect(job.delivery.channel != null);
+    try std.testing.expectEqualStrings("telegram", job.delivery.channel.?);
+    try std.testing.expect(job.delivery.account_id != null);
+    try std.testing.expectEqualStrings("backup", job.delivery.account_id.?);
+    try std.testing.expect(job.delivery.to != null);
+    try std.testing.expectEqualStrings("chat-42", job.delivery.to.?);
+    try std.testing.expectEqual(agent_routing.ChatType.group, job.delivery.peer_kind.?);
+    try std.testing.expect(job.delivery.peer_id != null);
+    try std.testing.expectEqualStrings("-100123", job.delivery.peer_id.?);
+    try std.testing.expect(job.delivery.thread_id != null);
+    try std.testing.expectEqualStrings("77", job.delivery.thread_id.?);
+    try std.testing.expectEqual(SessionTarget.main, job.session_target);
 }
 
 test "JobType parse and asStr" {
@@ -5382,6 +5783,12 @@ test "SessionTarget parse and asStr" {
     try std.testing.expectEqual(SessionTarget.main, SessionTarget.parse("MAIN"));
     try std.testing.expectEqualStrings("isolated", SessionTarget.isolated.asStr());
     try std.testing.expectEqualStrings("main", SessionTarget.main.asStr());
+}
+
+test "SessionTarget parseStrict rejects invalid values" {
+    try std.testing.expectEqual(SessionTarget.isolated, try SessionTarget.parseStrict("isolated"));
+    try std.testing.expectEqual(SessionTarget.main, try SessionTarget.parseStrict("MAIN"));
+    try std.testing.expectError(error.InvalidSessionTarget, SessionTarget.parseStrict("primary"));
 }
 
 test "CronJob has new fields" {
@@ -5420,12 +5827,13 @@ test "updateJob modifies job fields" {
     _ = try scheduler.addJob("* * * * *", "echo original");
     const jobs = scheduler.listJobs();
     const id = jobs[0].id;
-    const patch = CronJobPatch{ .command = "echo updated", .enabled = false };
+    const patch = CronJobPatch{ .command = "echo updated", .enabled = false, .session_target = .main };
     try std.testing.expect(scheduler.updateJob(allocator, id, patch));
     const updated = scheduler.getJob(id).?;
     try std.testing.expectEqualStrings("echo updated", updated.command);
     try std.testing.expect(!updated.enabled);
     try std.testing.expect(updated.paused);
+    try std.testing.expectEqual(SessionTarget.main, updated.session_target);
 }
 
 test "updateJob keeps agent command and prompt in sync" {
@@ -5535,7 +5943,7 @@ test "tick removes more than 64 one-shot jobs in one pass" {
 
     var i: usize = 0;
     while (i < 80) : (i += 1) {
-        _ = try scheduler.addAgentOnce("1s", "noop prompt", null);
+        _ = try scheduler.addAgentOnce("1s", "noop prompt", null, .{});
     }
 
     const now = std.time.timestamp();
@@ -5723,6 +6131,36 @@ test "deliverResult best_effort swallows closed bus error" {
     // Should not return error because best_effort is true
     const delivered = try deliverResult(allocator, delivery, "msg", true, &test_bus);
     try std.testing.expect(!delivered);
+}
+
+test "deliverViaMainAgent preserves account metadata and session key" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "backup",
+        .to = "chat123",
+    };
+
+    const delivered = try deliverViaMainAgent(allocator, delivery, "job output here", true, &test_bus, "traffic");
+    try std.testing.expect(delivered);
+
+    var msg = test_bus.consumeInbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("system:cron", msg.sender_id);
+    try std.testing.expectEqualStrings("chat123", msg.chat_id);
+    try std.testing.expectEqualStrings("telegram:backup:chat123", msg.session_key);
+    try std.testing.expect(msg.metadata_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "Scheduled task 'traffic'") != null);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, msg.metadata_json.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("backup", parsed.value.object.get("account_id").?.string);
+    try std.testing.expectEqualStrings("chat123", parsed.value.object.get("peer_id").?.string);
 }
 
 test "one-shot job deleted after tick execution" {

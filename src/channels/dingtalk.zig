@@ -1455,7 +1455,9 @@ pub const DingTalkChannel = struct {
 
         if (self.event_bus) |eb| {
             try eb.publishInbound(inbound);
+            log.debug("dingtalk published inbound message from {s} ({d} bytes)", .{ owned.sender_id, owned.content.len });
         } else {
+            log.warn("dingtalk no event_bus, dropping message", .{});
             inbound.deinit(self.allocator);
         }
     }
@@ -1541,6 +1543,7 @@ pub const DingTalkChannel = struct {
         var ws = try websocket.WsClient.connect(self.allocator, endpoint.host, endpoint.port, endpoint.path, &.{});
         self.ws_fd.store(ws.stream.handle, .release);
         self.connected.store(true, .release);
+        log.info("dingtalk websocket connected to {s}", .{endpoint.host});
         defer {
             self.connected.store(false, .release);
             self.ws_fd.store(invalid_socket, .release);
@@ -1557,6 +1560,7 @@ pub const DingTalkChannel = struct {
             defer self.allocator.free(message.payload);
 
             if (message.opcode != .text) continue;
+            log.debug("dingtalk received message: {d} bytes", .{message.payload.len});
             const should_disconnect = self.handleEnvelope(&ws, message.payload) catch |err| blk: {
                 log.warn("dingtalk envelope handling failed: {}", .{err});
                 break :blk false;
