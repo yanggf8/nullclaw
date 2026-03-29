@@ -4454,7 +4454,17 @@ pub fn cliInitSeed(allocator: std.mem.Allocator) !void {
                 "Type 'yes' to confirm: ",
             .{existing_count},
         );
+    } else {
+        std.debug.print(
+            "init-seed will initialize the cron DB from {s}.\n" ++
+                "Type 'yes' to confirm: ",
+            .{seed_path},
+        );
+    }
 
+    // Require 3 consecutive "yes" confirmations to prevent accidental execution.
+    var confirms: u8 = 0;
+    while (confirms < 3) {
         const stdin = std.fs.File.stdin();
         var buf: [64]u8 = undefined;
         const n = stdin.read(&buf) catch 0;
@@ -4462,6 +4472,10 @@ pub fn cliInitSeed(allocator: std.mem.Allocator) !void {
         if (!std.mem.eql(u8, input, "yes")) {
             log.info("Aborted.", .{});
             return;
+        }
+        confirms += 1;
+        if (confirms < 3) {
+            std.debug.print("Confirm again ({d}/3): ", .{confirms + 1});
         }
     }
 

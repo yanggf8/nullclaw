@@ -951,7 +951,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  backup                        Backup cron.db to ~/.nullclaw/backup/
             \\  restore [file]                Restore cron.db from latest backup or specified file
             \\  export-seed                   Export enabled jobs to ~/.nullclaw/cron-seed.json
-            \\  init-seed                     Initialize DB from ~/.nullclaw/cron-seed.json (DESTRUCTIVE: replaces all jobs)
+            \\  init-seed                     Initialize DB from ~/.nullclaw/cron-seed.json (DESTRUCTIVE: requires 3x confirmation)
             \\
         , .{CRON_SUBCOMMANDS}), .{});
         std.process.exit(1);
