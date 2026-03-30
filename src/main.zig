@@ -841,6 +841,7 @@ const CronAddAgentOptions = struct {
 const CronAddSkillOptions = struct {
     skill_args: ?[]const u8 = null,
     deliver_to: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
     timeout_secs: ?u32 = null,
     tz_offset_s: i32 = 0,
 };
@@ -862,6 +863,13 @@ fn parseCronAddSkillOptions(allocator: std.mem.Allocator, sub_args: []const []co
             i += 1;
         } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--timeout")) {
             options.timeout_secs = std.fmt.parseInt(u32, sub_args[i + 1], 10) catch null;
+            i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--account")) {
+            options.account_id = sub_args[i + 1];
+            // Keep --account in skill_args for the script
+            if (args_buf.items.len > 0) args_buf.appendSlice(allocator, " ") catch {};
+            args_buf.appendSlice(allocator, "--account ") catch {};
+            args_buf.appendSlice(allocator, sub_args[i + 1]) catch {};
             i += 1;
         } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--tz")) {
             options.tz_offset_s = parseTzOffset(sub_args[i + 1]);
@@ -937,7 +945,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  add <expression> <command>    Add a recurring cron job
             \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
             \\                                Add a recurring agent cron job
-            \\  add-skill <expression> <skill> [args...] [--deliver-to <id>] [--timeout <secs>]
+            \\  add-skill <expression> <skill> [args...] [--deliver-to <id>] [--account <id>] [--timeout <secs>]
             \\                                Add a recurring skill cron job
             \\  once <delay> <command>        Add a one-shot delayed task
             \\  once-agent <delay> <prompt> [--model <model>]
@@ -1017,6 +1025,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         const delivery: yc.cron.DeliveryConfig = if (options.deliver_to) |dt| .{
             .mode = .always,
             .channel = "telegram",
+            .account_id = options.account_id,
             .to = dt,
             .best_effort = true,
         } else .{};
