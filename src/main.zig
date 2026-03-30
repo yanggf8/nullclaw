@@ -1018,7 +1018,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], options.model, options.session_target, options.delivery, options.tz_offset_s);
     } else if (std.mem.eql(u8, subcmd, "add-skill")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron add-skill <expression> <skill> [args...] [--deliver-to <id>] [--timeout <secs>]\n", .{});
+            std.debug.print("Usage: nullclaw cron add-skill <expression> <skill> [args...] [--deliver-to <id>] [--account <id>] [--timeout <secs>]\n", .{});
             std.process.exit(1);
         }
         const options = parseCronAddSkillOptions(allocator, sub_args);
@@ -4731,4 +4731,40 @@ test "parseCronAddAgentOptions preserves delivery account flag" {
     try std.testing.expect(!options.delivery.channel_owned);
     try std.testing.expect(!options.delivery.account_id_owned);
     try std.testing.expect(!options.delivery.to_owned);
+}
+
+test "parseCronAddSkillOptions preserves account and deliver-to in both config and skill_args" {
+    // Regression: cron add-skill --account must set account_id on delivery config
+    // AND keep --account in skill_args so the Python script can route via the right bot.
+    const args = [_][]const u8{
+        "add-skill",
+        "18 7 * * 1,2,4",
+        "weather",
+        "--location",
+        "臺北市",
+        "--deliver-to",
+        "8768462400",
+        "--account",
+        "nunu",
+        "--timeout",
+        "120",
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const options = parseCronAddSkillOptions(arena.allocator(), &args);
+
+    // account_id extracted for delivery config
+    try std.testing.expectEqualStrings("nunu", options.account_id.?);
+    // deliver_to extracted for delivery config
+    try std.testing.expectEqualStrings("8768462400", options.deliver_to.?);
+    // timeout extracted
+    try std.testing.expectEqual(@as(u32, 120), options.timeout_secs.?);
+    // skill_args preserves --location, --deliver-to, and --account for the script
+    const sa = options.skill_args.?;
+    try std.testing.expect(std.mem.indexOf(u8, sa, "--account nunu") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sa, "--deliver-to 8768462400") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sa, "--location") != null);
+    // --timeout should NOT appear in skill_args
+    try std.testing.expect(std.mem.indexOf(u8, sa, "--timeout") == null);
 }
