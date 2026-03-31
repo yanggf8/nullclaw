@@ -62,13 +62,44 @@ pub const CompactionConfig = struct {
 // Public functions
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Estimate total tokens in conversation history using heuristic: (total_chars + 3) / 4.
-pub fn tokenEstimate(history: []const OwnedMessage) u64 {
-    var total_chars: u64 = 0;
-    for (history) |*msg| {
-        total_chars += msg.content.len;
+/// Estimate tokens for a UTF-8 byte slice, CJK-aware.
+/// ASCII chars ≈ 0.25 tokens each; CJK chars (3-byte UTF-8) ≈ 1.0 token each.
+/// Falls back to byte_len/4 only for pure-ASCII text.
+pub fn estimateTokens(text: []const u8) u64 {
+    var tokens: u64 = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const byte = text[i];
+        if (byte < 0x80) {
+            // ASCII: ~0.25 tokens per char — accumulate 4, emit 1
+            // Count consecutive ASCII run and divide by 4
+            const start = i;
+            while (i < text.len and text[i] < 0x80) i += 1;
+            tokens += ((i - start) + 3) / 4;
+        } else if (byte < 0xE0) {
+            // 2-byte sequence (Latin extended, Cyrillic, etc.): ~0.5 tokens
+            tokens += 1; // round up to 1 per char (conservative)
+            i += 2;
+        } else if (byte < 0xF0) {
+            // 3-byte sequence: CJK, Hangul, Kana, etc. — ~1.0 token each
+            tokens += 1;
+            i += 3;
+        } else {
+            // 4-byte sequence (emoji, rare CJK): ~1.0 token
+            tokens += 1;
+            i += 4;
+        }
     }
-    return (total_chars + 3) / 4;
+    return tokens;
+}
+
+/// Estimate total tokens in conversation history, CJK-aware.
+pub fn tokenEstimate(history: []const OwnedMessage) u64 {
+    var total: u64 = 0;
+    for (history) |*msg| {
+        total += estimateTokens(msg.content);
+    }
+    return total;
 }
 
 /// Auto-compact history when it exceeds max_history_messages or when
@@ -575,8 +606,8 @@ test "tokenEstimate with messages" {
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
 
-    // Add messages with known content lengths
-    // "hello" = 5 chars, "world" = 5 chars => total 10 chars => (10 + 3) / 4 = 3
+    // "hello" = 5 ASCII chars => (5+3)/4 = 2 tokens
+    // "world" = 5 ASCII chars => (5+3)/4 = 2 tokens => total 4
     try agent.history.append(allocator, .{
         .role = .user,
         .content = try allocator.dupe(u8, "hello"),
@@ -586,7 +617,7 @@ test "tokenEstimate with messages" {
         .content = try allocator.dupe(u8, "world"),
     });
 
-    try std.testing.expectEqual(@as(u64, 3), tokenEstimate(agent.history.items));
+    try std.testing.expectEqual(@as(u64, 4), tokenEstimate(agent.history.items));
 }
 
 test "tokenEstimate heuristic accuracy" {
@@ -606,6 +637,41 @@ test "tokenEstimate heuristic accuracy" {
 
     // (400 + 3) / 4 = 100
     try std.testing.expectEqual(@as(u64, 100), tokenEstimate(agent.history.items));
+}
+
+test "estimateTokens pure ASCII" {
+    // 12 ASCII chars => (12+3)/4 = 3 tokens
+    try std.testing.expectEqual(@as(u64, 3), estimateTokens("hello world!"));
+}
+
+test "estimateTokens pure CJK" {
+    // "你好世界" = 4 CJK chars, each 3 bytes in UTF-8 = 12 bytes
+    // Old formula: (12+3)/4 = 3 tokens (WRONG — should be ~4)
+    // New formula: 4 CJK chars × 1 token = 4 tokens
+    try std.testing.expectEqual(@as(u64, 4), estimateTokens("你好世界"));
+}
+
+test "estimateTokens mixed CJK and ASCII" {
+    // "Hello你好" = 5 ASCII bytes + 6 CJK bytes = 11 bytes
+    // Old formula: (11+3)/4 = 3 tokens
+    // New formula: ASCII run "Hello" = (5+3)/4 = 2, CJK "你好" = 2 => total 4
+    try std.testing.expectEqual(@as(u64, 4), estimateTokens("Hello你好"));
+}
+
+test "estimateTokens CJK sentence" {
+    // "今天天氣怎麼樣" = 7 CJK chars = 21 bytes
+    // Old formula: (21+3)/4 = 6 (undercount)
+    // New formula: 7 tokens
+    try std.testing.expectEqual(@as(u64, 7), estimateTokens("今天天氣怎麼樣"));
+}
+
+test "estimateTokens emoji" {
+    // "👋" = 4 bytes (U+1F44B), counts as 1 token
+    try std.testing.expectEqual(@as(u64, 1), estimateTokens("👋"));
+}
+
+test "estimateTokens empty" {
+    try std.testing.expectEqual(@as(u64, 0), estimateTokens(""));
 }
 
 test "autoCompactHistory no-op below count and token thresholds" {

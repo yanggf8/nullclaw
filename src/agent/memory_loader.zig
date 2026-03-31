@@ -15,7 +15,7 @@ const GLOBAL_RECALL_CANDIDATE_LIMIT: usize = 64;
 
 /// Maximum total bytes of memory context injected into a message.
 /// Prevents a few large entries from blowing the token budget.
-/// ~4000 chars ~ 1000 tokens — a safe ceiling for context injection.
+/// ~4000 bytes ≈ 1000 ASCII tokens or ~1333 CJK tokens.
 const MAX_CONTEXT_BYTES: usize = 4_000;
 
 /// Truncate a UTF-8 slice to at most `max_len` bytes without splitting

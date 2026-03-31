@@ -50,7 +50,7 @@ const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 25;
 const DEFAULT_MAX_HISTORY: u32 = 50;
 
 pub fn estimate_text_tokens(text: []const u8) u32 {
-    return @intCast((text.len + 3) / 4);
+    return @intCast(compaction.estimateTokens(text));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
