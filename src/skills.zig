@@ -712,6 +712,10 @@ pub fn listSkills(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]Sk
 
     var it = dir_mut.iterate();
     while (try it.next()) |entry| {
+        // Accept both real directories and symlinks.  Symlinks let admins
+        // share skill trees across paths (e.g. ~/.claude/skills → ~/.nullclaw/skills).
+        // The security audit (auditSkillDirectory) runs at *install* time and is
+        // not re-run here; symlinked skills are trusted as admin-controlled.
         if (entry.kind != .directory and entry.kind != .sym_link) continue;
 
         const sub_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ skills_dir_path, entry.name });
@@ -2586,6 +2590,49 @@ test "listSkills skips directories without valid manifest" {
 
     try std.testing.expectEqual(@as(usize, 1), skills.len);
     try std.testing.expectEqualStrings("valid", skills[0].name);
+}
+
+test "listSkills discovers symlinked skill directories" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    // Create real skill directory outside the skills root
+    const ext_skill = try std.fs.path.join(allocator, &.{ base, "external", "my-skill" });
+    defer allocator.free(ext_skill);
+    try std.fs.cwd().makePath(ext_skill);
+    {
+        const md_path = try std.fs.path.join(allocator, &.{ ext_skill, "SKILL.md" });
+        defer allocator.free(md_path);
+        const f = try std.fs.cwd().createFile(md_path, .{});
+        defer f.close();
+        try f.writeAll("---\nname: my-skill\ndescription: test symlinked skill\nalways: true\n---\n# my-skill\nTest.");
+    }
+
+    // Create skills root with an absolute symlink pointing to the external dir
+    const skills_dir = try std.fs.path.join(allocator, &.{ base, "skills" });
+    defer allocator.free(skills_dir);
+    try std.fs.cwd().makePath(skills_dir);
+
+    // Create symlink: skills/my-skill -> external/my-skill (absolute target)
+    {
+        var skills_handle = try std.fs.openDirAbsolute(skills_dir, .{});
+        defer skills_handle.close();
+        skills_handle.symLink(ext_skill, "my-skill", .{}) catch return error.SkipZigTest;
+    }
+
+    // listSkills appends "/skills" to workspace_dir, so pass the parent
+    const skills = try listSkills(allocator, base);
+    defer freeSkills(allocator, skills);
+
+    try std.testing.expectEqual(@as(usize, 1), skills.len);
+    try std.testing.expectEqualStrings("my-skill", skills[0].name);
+    try std.testing.expect(skills[0].always);
 }
 
 test "isGitSource accepts remote protocols and scp style" {
