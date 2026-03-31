@@ -62,44 +62,55 @@ pub const CompactionConfig = struct {
 // Public functions
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Estimate tokens for a UTF-8 byte slice, CJK-aware.
-/// ASCII chars ≈ 0.25 tokens each; CJK chars (3-byte UTF-8) ≈ 1.0 token each.
-/// Falls back to byte_len/4 only for pure-ASCII text.
-pub fn estimateTokens(text: []const u8) u64 {
-    var tokens: u64 = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        const byte = text[i];
-        if (byte < 0x80) {
-            // ASCII: ~0.25 tokens per char — accumulate 4, emit 1
-            // Count consecutive ASCII run and divide by 4
-            const start = i;
-            while (i < text.len and text[i] < 0x80) i += 1;
-            tokens += ((i - start) + 3) / 4;
-        } else if (byte < 0xE0) {
-            // 2-byte sequence (Latin extended, Cyrillic, etc.): ~0.5 tokens
-            tokens += 1; // round up to 1 per char (conservative)
-            i += 2;
-        } else if (byte < 0xF0) {
-            // 3-byte sequence: CJK, Hangul, Kana, etc. — ~1.0 token each
-            tokens += 1;
-            i += 3;
-        } else {
-            // 4-byte sequence (emoji, rare CJK): ~1.0 token
-            tokens += 1;
-            i += 4;
+/// Raw character counts by encoding class, for deferred token estimation.
+const CharCounts = struct {
+    ascii: u64 = 0, // 1-byte chars: ~0.25 tokens each
+    extended: u64 = 0, // 2-byte chars: ~0.5 tokens each
+    cjk: u64 = 0, // 3-byte chars (CJK, Kana, etc.): ~1.0 token each
+    wide: u64 = 0, // 4-byte chars (emoji, rare CJK): ~1.0 token each
+
+    fn addText(self: *CharCounts, text: []const u8) void {
+        var i: usize = 0;
+        while (i < text.len) {
+            const byte = text[i];
+            if (byte < 0x80) {
+                self.ascii += 1;
+                i += 1;
+            } else if (byte < 0xE0) {
+                self.extended += 1;
+                i += 2;
+            } else if (byte < 0xF0) {
+                self.cjk += 1;
+                i += 3;
+            } else {
+                self.wide += 1;
+                i += 4;
+            }
         }
     }
-    return tokens;
+
+    fn toTokens(self: CharCounts) u64 {
+        return (self.ascii + 3) / 4 + (self.extended + 1) / 2 + self.cjk + self.wide;
+    }
+};
+
+/// Estimate tokens for a UTF-8 byte slice, CJK-aware.
+/// ASCII chars ≈ 0.25 tokens each; CJK chars (3-byte UTF-8) ≈ 1.0 token each.
+pub fn estimateTokens(text: []const u8) u64 {
+    var counts = CharCounts{};
+    counts.addText(text);
+    return counts.toTokens();
 }
 
 /// Estimate total tokens in conversation history, CJK-aware.
+/// Accumulates character counts across all messages before converting
+/// to tokens, avoiding per-message rounding inflation.
 pub fn tokenEstimate(history: []const OwnedMessage) u64 {
-    var total: u64 = 0;
+    var counts = CharCounts{};
     for (history) |*msg| {
-        total += estimateTokens(msg.content);
+        counts.addText(msg.content);
     }
-    return total;
+    return counts.toTokens();
 }
 
 /// Auto-compact history when it exceeds max_history_messages or when
@@ -606,8 +617,8 @@ test "tokenEstimate with messages" {
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
 
-    // "hello" = 5 ASCII chars => (5+3)/4 = 2 tokens
-    // "world" = 5 ASCII chars => (5+3)/4 = 2 tokens => total 4
+    // "hello" + "world" = 10 ASCII chars total => (10+3)/4 = 3 tokens
+    // (accumulated across messages, rounded once)
     try agent.history.append(allocator, .{
         .role = .user,
         .content = try allocator.dupe(u8, "hello"),
@@ -617,7 +628,7 @@ test "tokenEstimate with messages" {
         .content = try allocator.dupe(u8, "world"),
     });
 
-    try std.testing.expectEqual(@as(u64, 4), tokenEstimate(agent.history.items));
+    try std.testing.expectEqual(@as(u64, 3), tokenEstimate(agent.history.items));
 }
 
 test "tokenEstimate heuristic accuracy" {
@@ -672,6 +683,44 @@ test "estimateTokens emoji" {
 
 test "estimateTokens empty" {
     try std.testing.expectEqual(@as(u64, 0), estimateTokens(""));
+}
+
+test "tokenEstimate many short ASCII messages accumulates before rounding" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    // 100 messages of "hi" (2 ASCII chars each) = 200 ASCII chars total
+    // Correct: (200+3)/4 = 50 tokens
+    // Wrong (per-message rounding): 100 × ((2+3)/4) = 100 tokens (2x overcount)
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        try agent.history.append(allocator, .{
+            .role = if (i % 2 == 0) .user else .assistant,
+            .content = try allocator.dupe(u8, "hi"),
+        });
+    }
+
+    try std.testing.expectEqual(@as(u64, 50), tokenEstimate(agent.history.items));
+}
+
+test "tokenEstimate mixed CJK and ASCII messages" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    // "hello" = 5 ASCII + "你好世界" = 4 CJK
+    // Total: (5+3)/4 + 4 = 2 + 4 = 6 tokens
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "hello"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "你好世界"),
+    });
+
+    try std.testing.expectEqual(@as(u64, 6), tokenEstimate(agent.history.items));
 }
 
 test "autoCompactHistory no-op below count and token thresholds" {
