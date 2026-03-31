@@ -75,12 +75,14 @@ fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bo
 }
 
 fn estimateRestoredSessionTokens(entries: []const memory_mod.MessageEntry) u64 {
-    var total: u64 = 0;
+    // Accumulate char counts across all entries before converting to tokens,
+    // avoiding per-message rounding inflation on short replies.
+    var counts = agent_mod.compaction.CharCounts{};
     for (entries) |entry| {
         if (!std.mem.eql(u8, entry.role, "assistant")) continue;
-        total += agent_mod.estimate_text_tokens(entry.content);
+        counts.addText(entry.content);
     }
-    return total;
+    return counts.toTokens();
 }
 
 fn persistedAssistantReply(agent: *const Agent, response: []const u8) []const u8 {
@@ -3709,6 +3711,24 @@ test "processMessage slash-prefixed prompt that is not a local command persists 
     try testing.expectEqual(@as(usize, 2), restored.agent.historyLen());
     try testing.expectEqualStrings(slash_prompt, restored.agent.history.items[0].content);
     try testing.expectEqualStrings("ok", restored.agent.history.items[1].content);
+}
+
+test "estimateRestoredSessionTokens accumulates before rounding to avoid inflation" {
+    // Regression: many short assistant replies must not inflate token count
+    // via per-message rounding.  "hi" is 2 ASCII chars → 1 token each if
+    // rounded independently (100 messages → 100), but only 50 tokens when
+    // accumulated (200 chars / 4).
+    const entries = comptime blk: {
+        var arr: [100]memory_mod.MessageEntry = undefined;
+        for (&arr) |*e| {
+            e.* = .{ .role = "assistant", .content = "hi" };
+        }
+        break :blk arr;
+    };
+    const result = estimateRestoredSessionTokens(&entries);
+    // Accumulated: 200 ASCII chars → (200+3)/4 = 50 tokens.
+    // If per-message rounding were used: 100 × ((2+3)/4) = 100 tokens.
+    try testing.expectEqual(@as(u64, 50), result);
 }
 
 test "processMessage runtime slash commands persist across reload" {

@@ -63,13 +63,13 @@ pub const CompactionConfig = struct {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Raw character counts by encoding class, for deferred token estimation.
-const CharCounts = struct {
+pub const CharCounts = struct {
     ascii: u64 = 0, // 1-byte chars: ~0.25 tokens each
     extended: u64 = 0, // 2-byte chars: ~0.5 tokens each
     cjk: u64 = 0, // 3-byte chars (CJK, Kana, etc.): ~1.0 token each
     wide: u64 = 0, // 4-byte chars (emoji, rare CJK): ~1.0 token each
 
-    fn addText(self: *CharCounts, text: []const u8) void {
+    pub fn addText(self: *CharCounts, text: []const u8) void {
         var i: usize = 0;
         while (i < text.len) {
             const byte = text[i];
@@ -89,7 +89,7 @@ const CharCounts = struct {
         }
     }
 
-    fn toTokens(self: CharCounts) u64 {
+    pub fn toTokens(self: CharCounts) u64 {
         return (self.ascii + 3) / 4 + (self.extended + 1) / 2 + self.cjk + self.wide;
     }
 };
