@@ -501,6 +501,10 @@ pub const GatewayState = struct {
     // runQueueWorker uses this for atomic dequeue+claim. Null until gateway.run() starts.
     cron_db_backend: ?cron_db_mod.DbCronBackend = null,
 
+    // Alert delivery destination for DB-backed skill job failures.
+    // Mirrors CronScheduler.alert_delivery for the run queue worker path.
+    alert_delivery: ?cron_mod.DeliveryConfig = null,
+
     // Job run queue — handleCronRun enqueues job IDs here; a single worker
     // thread pops and executes them sequentially to avoid concurrent Telegram
     // deliveries racing each other.
@@ -3833,9 +3837,15 @@ fn runQueueWorker(state: *GatewayState) void {
                 .skill => {
                     // Skill jobs own their entire workflow including delivery.
                     // Cron only triggers and records status.
+                    // alert_delivery is used to notify the operator on failure.
+                    const alert_del = state.alert_delivery orelse cron_mod.DeliveryConfig{};
                     const raw_skill_cmd = cron_mod.resolveSkillExec(arena, spec.skill_name, spec.skill_args) catch |err| {
                         log.err("[{s}] skill resolution failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false);
+                        if (state.event_bus) |eb| {
+                            const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' resolution failed: {s}", .{ spec.skill_name orelse "?", @errorName(err) }) catch null;
+                            if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
+                        }
                         continue;
                     };
                     defer arena.free(raw_skill_cmd);
@@ -3851,6 +3861,10 @@ fn runQueueWorker(state: *GatewayState) void {
                     skill_child.spawn() catch |err| {
                         log.err("[{s}] skill exec failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false);
+                        if (state.event_bus) |eb| {
+                            const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' failed to start: {s}", .{ spec.skill_name orelse "?", @errorName(err) }) catch null;
+                            if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
+                        }
                         continue;
                     };
                     errdefer {
@@ -3872,11 +3886,19 @@ fn runQueueWorker(state: *GatewayState) void {
                     ) catch |err| {
                         log.err("[{s}] skill collect failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false);
+                        if (state.event_bus) |eb| {
+                            const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' output collection failed: {s}", .{ spec.skill_name orelse "?", @errorName(err) }) catch null;
+                            if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
+                        }
                         continue;
                     };
                     const skill_term = skill_child.wait() catch |err| {
                         log.err("[{s}] skill wait failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false);
+                        if (state.event_bus) |eb| {
+                            const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' wait failed: {s}", .{ spec.skill_name orelse "?", @errorName(err) }) catch null;
+                            if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
+                        }
                         continue;
                     };
                     if (skill_timed_out) log.warn("[{s}] skill timed out after {d}s", .{ spec.id, timeout });
@@ -3889,9 +3911,30 @@ fn runQueueWorker(state: *GatewayState) void {
                     const skill_status = if (skill_ok) "ok" else "error";
                     // Skills self-deliver — no cron delivery needed.
                     complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, skill_status, if (skill_output.len > 0) skill_output else null, spec.delete_after_run, false);
-                    if (skill_output.len > 0) {
-                        const nl = std.mem.indexOfScalar(u8, skill_output, '\n') orelse skill_output.len;
-                        log.info("[{s}] skill completed ({s}): {s}", .{ spec.id, skill_status, skill_output[0..@min(nl, 120)] });
+                    // Alert operator on non-zero exit or timeout.
+                    if (!skill_ok) {
+                        if (state.event_bus) |eb| {
+                            const stderr_preview = if (skill_stderr.items.len > 0)
+                                skill_stderr.items[0..@min(skill_stderr.items.len, 200)]
+                            else
+                                "no stderr";
+                            const em = if (skill_timed_out)
+                                std.fmt.allocPrint(arena, "[cron] skill '{s}' timed out after {d}s", .{ spec.skill_name orelse "?", timeout }) catch null
+                            else
+                                std.fmt.allocPrint(arena, "[cron] skill '{s}' exit={d}: {s}", .{ spec.skill_name orelse "?", skill_exit, stderr_preview }) catch null;
+                            if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
+                        }
+                    }
+                    // Log status with first line of output for delivery observability.
+                    // Stdout is typically a delivery confirmation; stderr is errors.
+                    // Use stderr for failures (more diagnostic), stdout for success.
+                    const log_output = if (!skill_ok and skill_stderr.items.len > 0)
+                        skill_stderr.items
+                    else
+                        skill_stdout.items;
+                    if (log_output.len > 0) {
+                        const nl = std.mem.indexOfScalar(u8, log_output, '\n') orelse log_output.len;
+                        log.info("[{s}] skill completed ({s}): {s}", .{ spec.id, skill_status, log_output[0..@min(nl, 120)] });
                     } else {
                         log.info("[{s}] skill completed ({s}): (no output)", .{ spec.id, skill_status });
                     }
@@ -6315,6 +6358,19 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         state.cron_db_backend = cron_db_mod.DbCronBackend.init(allocator, db_path) catch null;
     }
     defer if (state.cron_db_backend) |*be| be.deinit();
+
+    // Wire alert delivery for DB-backed skill job failures.
+    if (config_ptr) |cfg| {
+        if (cfg.scheduler.alert_channel != null and cfg.scheduler.alert_to != null) {
+            state.alert_delivery = .{
+                .mode = .always,
+                .channel = cfg.scheduler.alert_channel,
+                .account_id = cfg.scheduler.alert_account,
+                .to = cfg.scheduler.alert_to,
+                .best_effort = true,
+            };
+        }
+    }
 
     // Start the sequential job run queue worker thread.
     state.startRunQueue() catch |err| {

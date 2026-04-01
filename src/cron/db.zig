@@ -1428,3 +1428,104 @@ test "DbCronBackend jobs survive bounce — add, reopen, remove, reopen" {
         try std.testing.expectEqual(@as(usize, 3), count3);
     }
 }
+
+test "dbManualEnqueueJob advances next_run_secs atomically" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/manual_enqueue.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    var be = try DbCronBackend.init(allocator, db_path_z);
+    defer be.deinit();
+    const iface = be.backend();
+
+    // Add a job with next_run_secs in the past (simulates a due job).
+    const job = try iface.add(allocator, .{ .expression = "30 8 * * 1-5", .command = "echo test" });
+    defer {
+        allocator.free(job.id);
+        allocator.free(job.expression);
+        allocator.free(job.command);
+    }
+    const now: i64 = 1774917000; // 2026-03-31 08:30 CST (a Tuesday)
+    _ = try iface.update(job.id, .{ .next_run_secs = now - 60 });
+
+    // Manual enqueue: should insert into run queue AND advance next_run_secs.
+    try cron.dbManualEnqueueJob(db_path_z, job.id, now);
+
+    // Verify next_run_secs was advanced beyond now.
+    const updated = (try iface.get(allocator, job.id)).?;
+    defer {
+        allocator.free(updated.id);
+        allocator.free(updated.expression);
+        allocator.free(updated.command);
+    }
+    try std.testing.expect(updated.next_run_secs > now);
+
+    // Verify the run queue has exactly one pending entry.
+    const db = try cron.openCronDbAtPath(db_path_z);
+    defer cron.closeCronDb(db);
+    var count_stmt: ?*c.sqlite3_stmt = null;
+    _ = c.sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM cron_run_queue WHERE status='pending'", -1, &count_stmt, null);
+    defer _ = c.sqlite3_finalize(count_stmt);
+    _ = c.sqlite3_step(count_stmt);
+    const queue_count = c.sqlite3_column_int(count_stmt, 0);
+    try std.testing.expectEqual(@as(c_int, 1), queue_count);
+}
+
+test "dbManualEnqueueJob does not re-fire on subsequent tick" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/no_refire.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    var be = try DbCronBackend.init(allocator, db_path_z);
+    defer be.deinit();
+    const iface = be.backend();
+
+    const job = try iface.add(allocator, .{ .expression = "30 8 * * 1-5", .command = "echo test" });
+    defer {
+        allocator.free(job.id);
+        allocator.free(job.expression);
+        allocator.free(job.command);
+    }
+    const now: i64 = 1774917000; // 2026-03-31 08:30 CST
+    _ = try iface.update(job.id, .{ .next_run_secs = now - 60 });
+
+    // Manual enqueue advances next_run_secs.
+    try cron.dbManualEnqueueJob(db_path_z, job.id, now);
+
+    // A tick at the same 'now' must NOT enqueue again (next_run_secs is now in future).
+    const n = try be.backend().tick(now);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "dbManualEnqueueJob returns JobNotFound for unknown id" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/notfound.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    // Initialize DB schema by opening a backend.
+    var be = try DbCronBackend.init(allocator, db_path_z);
+    be.deinit();
+
+    try std.testing.expectError(error.JobNotFound, cron.dbManualEnqueueJob(db_path_z, "nonexistent-id", 1000));
+}

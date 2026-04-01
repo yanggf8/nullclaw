@@ -4690,6 +4690,7 @@ pub fn dbManualEnqueueJob(db_path: [:0]const u8, job_id: []const u8, now: i64) !
     const db = try openCronDbAtPath(db_path);
     defer _ = c.sqlite3_close(db);
 
+    try ensureCronTable(db);
     try ensureRunQueueTable(db);
 
     if (c.sqlite3_exec(db, "BEGIN IMMEDIATE", null, null, null) != c.SQLITE_OK)
