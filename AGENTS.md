@@ -340,14 +340,46 @@ Hooks:
 
 To bypass a hook in an emergency: `git commit --no-verify` / `git push --no-verify`.
 
-## 9) Privacy and Sensitive Data (Required)
+## 9) Autonomy and Security Policy
+
+### Autonomy levels
+
+Autonomy is **global** — there is no per-agent override in the current config model (`src/config_types.zig` `AutonomyConfig`, `src/security/policy.zig`). The mode name is `full`, not `autonomous`.
+
+| Level | Shell tools | Notes |
+|-------|------------|-------|
+| `supervised` | blocked unless in `allowed_commands` | default; safe for multi-user bots |
+| `full` | unrestricted | use only for trusted single-user deployments |
+
+### `allowed_commands`
+
+In `supervised` mode, agents can only run shell commands whose executable basename appears in `autonomy.allowed_commands`. Example config (`~/.nullclaw/config.json`):
+
+```json
+"autonomy": {
+  "level": "supervised",
+  "workspace_only": true,
+  "max_actions_per_hour": 20,
+  "allowed_commands": ["python3"]
+}
+```
+
+`python3` must be present for interactive skill invocations — agents answering stock/weather/news queries call skill scripts directly via the `bash` tool. Cron skill jobs run outside the agent loop and are not subject to this policy.
+
+### Known limitation
+
+There is no per-agent autonomy or per-channel allowlist. Both `nunu` and `ping` bots share the global `allowed_commands`. If you need tighter restrictions per bot, the correct long-term fix is either:
+- add per-agent autonomy config in `AgentConfig` / `AutonomyConfig`
+- or route skill execution through a first-class skill tool path that does not depend on generic shell access
+
+## 10) Privacy and Sensitive Data (Required)
 
 - Never commit real API keys, tokens, credentials, personal data, or private URLs.
 - Use neutral placeholders in tests: `"test-key"`, `"example.com"`, `"user_a"`.
 - Test fixtures must be impersonal and system-focused.
 - Review `git diff --cached` before push for accidental sensitive strings.
 
-## 10) Anti-Patterns (Do Not)
+## 11) Anti-Patterns (Do Not)
 
 - Do not add C dependencies or large Zig packages without strong justification (binary size impact).
 - Do not return vtable interfaces pointing to temporaries — dangling pointer.
@@ -361,7 +393,7 @@ To bypass a hook in an emergency: `git commit --no-verify` / `git push --no-veri
 - Do not use `SQLITE_TRANSIENT` in auto-translated C code — use `SQLITE_STATIC` (null) instead.
 - Do not use heap-allocated output buffers in `ChaCha20Poly1305.decrypt` — use stack buffer + `allocator.dupe()`.
 
-## 11) Handoff Template (Agent → Agent / Maintainer)
+## 12) Handoff Template (Agent → Agent / Maintainer)
 
 When handing off work, include:
 
@@ -371,7 +403,7 @@ When handing off work, include:
 4. Remaining risks / unknowns
 5. Next recommended action
 
-## 12) Vibe Coding Guardrails
+## 13) Vibe Coding Guardrails
 
 When working in fast iterative mode:
 
