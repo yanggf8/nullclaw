@@ -250,17 +250,37 @@ Never use `/skill <name>` or `-m /skill <name>` as a cron prompt. It spawns a su
 curl -s -X POST http://localhost:PORT/cron/load-from-seed
 ```
 
-Never edit the live DB directly to apply config changes — update `cron-seed.json` and call `load-from-seed`.
+Never edit the live DB directly to apply config changes — update `cron-seed.json` and call `load-from-seed`. Exception: correcting a corrupted `next_run_secs` after a manual trigger may require a direct `UPDATE` followed by a seed backup (`cp ~/.nullclaw/cron.db ~/.nullclaw/cron.db.bak.<timestamp>` then re-export with the Python dump script).
+
+#### Manual job trigger
+
+POST `/cron/run` with `{"id": "<job-id>"}` to trigger a job immediately. The DB-direct path uses `dbManualEnqueueJob` which atomically inserts into `cron_run_queue` **and** advances `next_run_secs` to the next scheduled occurrence in one `BEGIN IMMEDIATE` transaction. This prevents the scheduler tick from re-firing the job immediately after a manual run.
+
+Never call `dbEnqueueJob` for manual triggers — it is a raw queue insert that does not advance the schedule.
+
+#### Operator alert delivery
+
+`Config.scheduler.alert_channel` / `alert_to` / `alert_account` configure a fallback delivery destination for skill job failures. Both execution paths honour it:
+
+- **Legacy (`CronScheduler`)**: `alert_delivery` is set via `setAlertDelivery()` in `schedulerThread`.
+- **DB-direct (`runQueueWorker`)**: `GatewayState.alert_delivery` is populated from config in `gateway.run()` and used in all four failure branches (resolution, exec, collect, wait) plus non-zero exit.
+
+When a job has `delivery_mode != none`, its own delivery config is used for alerts. The `alert_delivery` fallback is only used when the job has no delivery config.
 
 #### E2E verification
 
-After triggering a job, verify delivery via the log — do not poll `/cron/output`:
+After a job runs, verify in `journalctl`:
 
 ```bash
-strings ~/.nullclaw/gateway.log | grep "JOB_ID\|delivery" | tail -20
+journalctl --user -u nullclaw.service -n 50 --no-pager | grep "cron_queue\|cron_tick\|scheduler"
 ```
 
-Look for `captured delivery.to=...` to confirm Telegram delivery.
+Expected log sequence for a healthy skill run:
+1. `info(cron_tick): enqueued job '<id>' [<expr>] next_run=<ts>` — tick fired, next schedule set
+2. `info(cron_queue): running queued job '<id>'` — worker picked it up
+3. `info(cron_queue): [<id>] skill completed (ok): Delivered to Telegram chat <id>` — script ran and delivered
+
+Scheduler liveness: `info(scheduler): alive, 0 jobs due (DbCronBackend)` appears every ~5 minutes when no jobs are due. Absence of this line for >10 minutes indicates the scheduler thread has stalled.
 
 ## 8) Validation Matrix
 
