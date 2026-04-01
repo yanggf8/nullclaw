@@ -506,6 +506,10 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     state.markRunning("scheduler");
     health.markComponentOk("scheduler");
 
+    // Emit a heartbeat log every ~5 minutes so a silent scheduler is detectable.
+    const heartbeat_ticks: u64 = @max(1, 300 / @max(poll_secs, 1));
+    var tick_count: u64 = 0;
+
     while (!isShutdownRequested()) {
         const now = std.time.timestamp();
 
@@ -517,6 +521,12 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
                 log.info("scheduler: enqueued {d} job(s) via DbCronBackend", .{n});
                 state.markRunning("scheduler");
                 health.markComponentOk("scheduler");
+            } else {
+                tick_count += 1;
+                if (tick_count >= heartbeat_ticks) {
+                    tick_count = 0;
+                    log.debug("scheduler: alive, 0 jobs due (DbCronBackend)", .{});
+                }
             }
             var slept2: u64 = 0;
             while (slept2 < poll_secs and !isShutdownRequested()) : (slept2 += 1) {

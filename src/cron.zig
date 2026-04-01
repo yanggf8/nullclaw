@@ -4683,6 +4683,78 @@ pub fn dbEnqueueJob(db: *c.sqlite3, job_id: []const u8, enqueued_at: i64) !void 
     if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
 }
 
+/// Manual-run variant: enqueue a specific job by ID and advance its next_run_secs
+/// so the scheduler tick does not immediately re-fire it.
+/// Opens its own connection and runs atomically under BEGIN IMMEDIATE.
+pub fn dbManualEnqueueJob(db_path: [:0]const u8, job_id: []const u8, now: i64) !void {
+    const db = try openCronDbAtPath(db_path);
+    defer _ = c.sqlite3_close(db);
+
+    try ensureRunQueueTable(db);
+
+    if (c.sqlite3_exec(db, "BEGIN IMMEDIATE", null, null, null) != c.SQLITE_OK)
+        return error.TransactionBeginFailed;
+    var tx_open = true;
+    errdefer {
+        if (tx_open) _ = c.sqlite3_exec(db, "ROLLBACK", null, null, null);
+    }
+
+    // Fetch expression, one_shot, tz_offset_s for this job.
+    const sel_sql = "SELECT expression, one_shot, tz_offset_s FROM cron_jobs WHERE id=?1 AND enabled=1";
+    var sel_stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sel_sql, -1, &sel_stmt, null) != c.SQLITE_OK)
+        return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(sel_stmt);
+    _ = c.sqlite3_bind_text(sel_stmt, 1, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
+
+    const rc = c.sqlite3_step(sel_stmt);
+    if (rc == c.SQLITE_DONE) return error.JobNotFound;
+    if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+    const expr_ptr = c.sqlite3_column_text(sel_stmt, 0);
+    const one_shot_val = c.sqlite3_column_int(sel_stmt, 1);
+    const tz_offset_val: i32 = @intCast(c.sqlite3_column_int(sel_stmt, 2));
+
+    if (expr_ptr == null) return error.InvalidJob;
+    const expr_len: usize = @intCast(c.sqlite3_column_bytes(sel_stmt, 0));
+    const expr_str = expr_ptr[0..expr_len];
+
+    // Insert into run queue.
+    const ins_sql = "INSERT INTO cron_run_queue (job_id, enqueued_at, status) VALUES (?1, ?2, 'pending')";
+    var ins_stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, ins_sql, -1, &ins_stmt, null) != c.SQLITE_OK)
+        return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(ins_stmt);
+    _ = c.sqlite3_bind_text(ins_stmt, 1, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_int64(ins_stmt, 2, now);
+    _ = c.sqlite3_step(ins_stmt);
+
+    // Advance next_run_secs so the tick does not re-fire this job immediately.
+    if (one_shot_val != 0) {
+        const upd_sql = "UPDATE cron_jobs SET next_run_secs=0, paused=1 WHERE id=?1";
+        var upd_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, upd_sql, -1, &upd_stmt, null) == c.SQLITE_OK) {
+            _ = c.sqlite3_bind_text(upd_stmt, 1, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
+            _ = c.sqlite3_step(upd_stmt);
+            _ = c.sqlite3_finalize(upd_stmt);
+        }
+    } else {
+        const next_run = nextRunForCronExpressionTz(expr_str, now, tz_offset_val) catch now + 60;
+        const upd_sql = "UPDATE cron_jobs SET next_run_secs=?1 WHERE id=?2";
+        var upd_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, upd_sql, -1, &upd_stmt, null) == c.SQLITE_OK) {
+            _ = c.sqlite3_bind_int64(upd_stmt, 1, next_run);
+            _ = c.sqlite3_bind_text(upd_stmt, 2, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
+            _ = c.sqlite3_step(upd_stmt);
+            _ = c.sqlite3_finalize(upd_stmt);
+        }
+    }
+
+    if (c.sqlite3_exec(db, "COMMIT", null, null, null) != c.SQLITE_OK)
+        return error.TransactionCommitFailed;
+    tx_open = false;
+}
+
 /// Scan cron_jobs for due jobs, INSERT them into cron_run_queue, and
 /// UPDATE their next_run_secs. Returns the number of jobs enqueued.
 /// Opens its own DB connection — safe to call from any thread.

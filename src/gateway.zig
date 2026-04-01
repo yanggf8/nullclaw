@@ -3429,27 +3429,17 @@ fn handleCronRun(ctx: *WebhookHandlerContext) void {
     };
 
     if (ctx.state.cron_db_path) |db_path| {
-        // ── DB-direct path: verify job exists in DB, insert into cron_run_queue ──
-        const db = cron_mod.openCronDbAtPath(db_path) catch {
-            ctx.response_status = "503 Service Unavailable";
-            ctx.response_body = "{\"error\":\"could not open cron db\"}";
-            return;
-        };
-        defer cron_mod.closeCronDb(db);
-        cron_mod.ensureRunQueueTable(db) catch {};
-
-        // Verify the job exists.
-        const exists = cron_mod.dbJobExists(db, id) catch false;
-        if (!exists) {
-            ctx.response_status = "404 Not Found";
-            ctx.response_body = "{\"error\":\"job not found\"}";
-            return;
-        }
-
-        // Insert into run queue.
-        cron_mod.dbEnqueueJob(db, id, std.time.timestamp()) catch {
-            ctx.response_status = "500 Internal Server Error";
-            ctx.response_body = "{\"error\":\"failed to enqueue job\"}";
+        // ── DB-direct path: enqueue job and atomically advance next_run_secs ──
+        // Uses dbManualEnqueueJob (not dbEnqueueJob) so the scheduler tick does
+        // not immediately re-fire the job after a manual trigger.
+        cron_mod.dbManualEnqueueJob(db_path, id, std.time.timestamp()) catch |err| {
+            if (err == error.JobNotFound) {
+                ctx.response_status = "404 Not Found";
+                ctx.response_body = "{\"error\":\"job not found\"}";
+            } else {
+                ctx.response_status = "500 Internal Server Error";
+                ctx.response_body = "{\"error\":\"failed to enqueue job\"}";
+            }
             return;
         };
 
