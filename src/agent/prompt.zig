@@ -845,12 +845,14 @@ fn appendSkillsSection(
     workspace_dir: []const u8,
 ) !void {
     // Two-source loading: workspace skills + ~/.nullclaw/skills/
-    const home_dir = platform.getHomeDir(allocator) catch null;
-    defer if (home_dir) |h| allocator.free(h);
-    const community_base = if (home_dir) |h|
-        std.fs.path.join(allocator, &.{ h, ".nullclaw" }) catch null
-    else
-        null;
+    // Skip community merge in tests to keep skill discovery isolated.
+    const community_base = if (comptime builtin.is_test)
+        @as(?[]const u8, null)
+    else blk: {
+        const home_dir = platform.getHomeDir(allocator) catch break :blk null;
+        defer allocator.free(home_dir);
+        break :blk std.fs.path.join(allocator, &.{ home_dir, ".nullclaw" }) catch null;
+    };
     defer if (community_base) |cb| allocator.free(cb);
 
     // listSkillsMerged already calls checkRequirements on each skill.

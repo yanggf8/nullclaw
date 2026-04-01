@@ -1109,7 +1109,14 @@ pub const CronScheduler = struct {
                         null;
 
                     if (skill_cmd == null and !builtin.is_test) {
-                        // Resolution failed, error already logged above.
+                        // Resolution failed, error already logged above. Alert operator.
+                        if (out_bus) |b| {
+                            const err_msg = std.fmt.allocPrint(self.allocator, "[cron] skill '{s}' resolution failed", .{job.skill_name orelse "?"}) catch null;
+                            if (err_msg) |em| {
+                                defer self.allocator.free(em);
+                                _ = deliverResult(self.allocator, job.delivery, em, false, b) catch {};
+                            }
+                        }
                     } else if (builtin.is_test) {
                         // Test mode: record execution without subprocess.
                         job.last_run_secs = now;
@@ -1124,6 +1131,13 @@ pub const CronScheduler = struct {
                             log.err("cron skill job '{s}' failed to start: {}", .{ job.id, err });
                             job.last_run_secs = now;
                             job.last_status = "error";
+                            if (out_bus) |b| {
+                                const err_msg = std.fmt.allocPrint(self.allocator, "[cron] skill '{s}' failed to start: {s}", .{ job.skill_name orelse "?", @errorName(err) }) catch null;
+                                if (err_msg) |em| {
+                                    defer self.allocator.free(em);
+                                    _ = deliverResult(self.allocator, job.delivery, em, false, b) catch {};
+                                }
+                            }
                             continue;
                         };
                         defer self.allocator.free(result.stdout);
@@ -1141,6 +1155,21 @@ pub const CronScheduler = struct {
                             self.allocator.dupe(u8, result.stderr) catch null
                         else
                             null;
+
+                        // Alert on skill execution failure
+                        if (exit_code != 0) {
+                            if (out_bus) |b| {
+                                const stderr_preview = if (result.stderr.len > 0)
+                                    result.stderr[0..@min(result.stderr.len, 200)]
+                                else
+                                    "no stderr";
+                                const err_msg = std.fmt.allocPrint(self.allocator, "[cron] skill '{s}' exit={d}: {s}", .{ job.skill_name orelse "?", exit_code, stderr_preview }) catch null;
+                                if (err_msg) |em| {
+                                    defer self.allocator.free(em);
+                                    _ = deliverResult(self.allocator, job.delivery, em, false, b) catch {};
+                                }
+                            }
+                        }
                     }
                 },
             }
@@ -1392,7 +1421,7 @@ fn preferAgentExecPath(self_exe_path: []const u8) []const u8 {
 }
 
 /// If `prompt` starts with "skill:<name>", resolves to the skill's ## Prompt section
-/// from ~/.claude/skills/<name>/SKILL.md. Returns a heap-allocated string that the
+/// from ~/.nullclaw/skills/<name>/SKILL.md. Returns a heap-allocated string that the
 /// caller must free, or null if prompt is not a skill reference or resolution fails.
 pub fn resolveSkillPrompt(allocator: std.mem.Allocator, prompt: []const u8) !?[]const u8 {
     const prefix = "skill:";
@@ -1401,7 +1430,7 @@ pub fn resolveSkillPrompt(allocator: std.mem.Allocator, prompt: []const u8) !?[]
     if (skill_name.len == 0) return null;
 
     const home = std.posix.getenv("HOME") orelse return null;
-    const skill_md_path = try std.fmt.allocPrint(allocator, "{s}/.claude/skills/{s}/SKILL.md", .{ home, skill_name });
+    const skill_md_path = try std.fmt.allocPrint(allocator, "{s}/.nullclaw/skills/{s}/SKILL.md", .{ home, skill_name });
     defer allocator.free(skill_md_path);
 
     const content = std.fs.cwd().readFileAlloc(allocator, skill_md_path, 256 * 1024) catch return null;
@@ -1435,7 +1464,7 @@ pub fn resolveSkillCommand(allocator: std.mem.Allocator, command: []const u8) !?
     if (skill_name.len == 0) return null;
 
     const home = std.posix.getenv("HOME") orelse return null;
-    const skill_md_path = try std.fmt.allocPrint(allocator, "{s}/.claude/skills/{s}/SKILL.md", .{ home, skill_name });
+    const skill_md_path = try std.fmt.allocPrint(allocator, "{s}/.nullclaw/skills/{s}/SKILL.md", .{ home, skill_name });
     defer allocator.free(skill_md_path);
 
     const content = std.fs.cwd().readFileAlloc(allocator, skill_md_path, 256 * 1024) catch return null;
@@ -1474,12 +1503,12 @@ pub fn resolveSkillCommand(allocator: std.mem.Allocator, command: []const u8) !?
 }
 
 /// Resolves a skill name + args into an executable shell command.
-/// Reads ## Script from ~/.claude/skills/<name>/SKILL.md.
+/// Reads ## Script from ~/.nullclaw/skills/<name>/SKILL.md.
 /// Returns heap-allocated "python3 <expanded_path> <args>" or error.
 /// The caller must free the returned slice.
 pub fn resolveSkillExec(allocator: std.mem.Allocator, skill_name: ?[]const u8, skill_args: ?[]const u8) ![]const u8 {
     const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
-    const skills_dir = try std.fmt.allocPrint(allocator, "{s}/.claude/skills", .{home});
+    const skills_dir = try std.fmt.allocPrint(allocator, "{s}/.nullclaw/skills", .{home});
     defer allocator.free(skills_dir);
     return resolveSkillExecFrom(allocator, skill_name, skill_args, skills_dir, home);
 }
