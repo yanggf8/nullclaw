@@ -372,14 +372,51 @@ There is no per-agent autonomy or per-channel allowlist. Both `nunu` and `ping` 
 - add per-agent autonomy config in `AgentConfig` / `AutonomyConfig`
 - or route skill execution through a first-class skill tool path that does not depend on generic shell access
 
-## 10) Privacy and Sensitive Data (Required)
+## 10) Web Retrieval and MCP Servers
+
+### Search provider chain
+
+`http_request.search_provider` defaults to `"auto"`, which tries providers in this order:
+
+1. SearXNG (if `searxng_base_url` is configured)
+2. **Brave** (requires `BRAVE_API_KEY` env var)
+3. Firecrawl, Tavily, Perplexity, Exa, Jina (each requires its own API key)
+4. DuckDuckGo (no key required, rate-limited)
+
+API keys are read from environment variables only — not from `config.json`. Set them in `~/.nullclaw/.env` (loaded by the systemd `EnvironmentFile`). Never store live keys in `config.json` or commit them.
+
+### MCP servers
+
+MCP servers are configured in `config.json` under `mcp_servers` as an object-of-objects (compatible with Claude Desktop / Cursor format). Supported transports: `stdio` (child process) and `http` (JSON-RPC over HTTP).
+
+**Critical for systemd**: the service runs with a restricted `PATH` that does not include nvm or user-local bin directories. Always use **absolute paths** for both `command` and script arguments.
+
+```json
+"mcp_servers": {
+  "playwright": {
+    "command": "/home/yanggf/.nvm/versions/node/v24.3.0/bin/node",
+    "args": ["/home/yanggf/.nvm/versions/node/v24.3.0/bin/playwright-mcp", "--headless"]
+  }
+}
+```
+
+MCP tools are registered at agent startup as `mcp_<server>_<tool>` (e.g., `mcp_playwright_browser_navigate`). If a server fails to connect, its tools are silently omitted and an `error(mcp)` log line is emitted — check `journalctl` if tools are missing.
+
+### Playwright MCP
+
+- Package: `@playwright/mcp` (globally installed at `~/.nvm/versions/node/v24.3.0/lib`)
+- Browser: Chromium headless shell at `~/.cache/ms-playwright/chromium_headless_shell-1217/`
+- 21 tools registered: navigate, snapshot, click, type, screenshot, network requests, etc.
+- Use for deep retrieval when web search and HTTP fetch both fail (e.g., JS-rendered pages, paywalled previews)
+
+## 11) Privacy and Sensitive Data (Required)
 
 - Never commit real API keys, tokens, credentials, personal data, or private URLs.
 - Use neutral placeholders in tests: `"test-key"`, `"example.com"`, `"user_a"`.
 - Test fixtures must be impersonal and system-focused.
 - Review `git diff --cached` before push for accidental sensitive strings.
 
-## 11) Anti-Patterns (Do Not)
+## 12) Anti-Patterns (Do Not)
 
 - Do not add C dependencies or large Zig packages without strong justification (binary size impact).
 - Do not return vtable interfaces pointing to temporaries — dangling pointer.
@@ -393,7 +430,7 @@ There is no per-agent autonomy or per-channel allowlist. Both `nunu` and `ping` 
 - Do not use `SQLITE_TRANSIENT` in auto-translated C code — use `SQLITE_STATIC` (null) instead.
 - Do not use heap-allocated output buffers in `ChaCha20Poly1305.decrypt` — use stack buffer + `allocator.dupe()`.
 
-## 12) Handoff Template (Agent → Agent / Maintainer)
+## 13) Handoff Template (Agent → Agent / Maintainer)
 
 When handing off work, include:
 
@@ -403,7 +440,7 @@ When handing off work, include:
 4. Remaining risks / unknowns
 5. Next recommended action
 
-## 13) Vibe Coding Guardrails
+## 14) Vibe Coding Guardrails
 
 When working in fast iterative mode:
 
