@@ -503,6 +503,9 @@ pub const CronScheduler = struct {
     /// Null means use the default ~/.nullclaw/cron.db.
     /// Set this in tests to point at an isolated tmpDir DB.
     db_path: ?[:0]const u8 = null,
+    /// Operator alert delivery: used as fallback when a failing skill job has
+    /// no delivery config of its own (delivery.mode == .none).
+    alert_delivery: ?DeliveryConfig = null,
 
     pub fn init(allocator: std.mem.Allocator, max_tasks: usize, enabled: bool) CronScheduler {
         return .{
@@ -521,6 +524,10 @@ pub const CronScheduler = struct {
 
     pub fn setAgentTimeoutSecs(self: *CronScheduler, timeout_secs: u64) void {
         self.agent_timeout_secs = timeout_secs;
+    }
+
+    pub fn setAlertDelivery(self: *CronScheduler, delivery: DeliveryConfig) void {
+        self.alert_delivery = delivery;
     }
 
     fn freeJobOwned(self: *CronScheduler, job: CronJob) void {
@@ -1109,12 +1116,15 @@ pub const CronScheduler = struct {
                         null;
 
                     if (skill_cmd == null and !builtin.is_test) {
-                        // Resolution failed, error already logged above. Alert operator.
+                        // Resolution failed, error already logged above. Clear stale output and alert.
+                        if (job.last_output) |old| self.allocator.free(old);
+                        job.last_output = null;
                         if (out_bus) |b| {
+                            const delivery = if (job.delivery.mode != .none) job.delivery else (self.alert_delivery orelse DeliveryConfig{});
                             const err_msg = std.fmt.allocPrint(self.allocator, "[cron] skill '{s}' resolution failed", .{job.skill_name orelse "?"}) catch null;
                             if (err_msg) |em| {
                                 defer self.allocator.free(em);
-                                _ = deliverResult(self.allocator, job.delivery, em, false, b) catch {};
+                                _ = deliverResult(self.allocator, delivery, em, false, b) catch {};
                             }
                         }
                     } else if (builtin.is_test) {
@@ -1131,11 +1141,15 @@ pub const CronScheduler = struct {
                             log.err("cron skill job '{s}' failed to start: {}", .{ job.id, err });
                             job.last_run_secs = now;
                             job.last_status = "error";
+                            // Clear stale output from prior run
+                            if (job.last_output) |old| self.allocator.free(old);
+                            job.last_output = null;
                             if (out_bus) |b| {
+                                const delivery = if (job.delivery.mode != .none) job.delivery else (self.alert_delivery orelse DeliveryConfig{});
                                 const err_msg = std.fmt.allocPrint(self.allocator, "[cron] skill '{s}' failed to start: {s}", .{ job.skill_name orelse "?", @errorName(err) }) catch null;
                                 if (err_msg) |em| {
                                     defer self.allocator.free(em);
-                                    _ = deliverResult(self.allocator, job.delivery, em, false, b) catch {};
+                                    _ = deliverResult(self.allocator, delivery, em, false, b) catch {};
                                 }
                             }
                             continue;
@@ -1159,6 +1173,7 @@ pub const CronScheduler = struct {
                         // Alert on skill execution failure
                         if (exit_code != 0) {
                             if (out_bus) |b| {
+                                const delivery = if (job.delivery.mode != .none) job.delivery else (self.alert_delivery orelse DeliveryConfig{});
                                 const stderr_preview = if (result.stderr.len > 0)
                                     result.stderr[0..@min(result.stderr.len, 200)]
                                 else
@@ -1166,7 +1181,7 @@ pub const CronScheduler = struct {
                                 const err_msg = std.fmt.allocPrint(self.allocator, "[cron] skill '{s}' exit={d}: {s}", .{ job.skill_name orelse "?", exit_code, stderr_preview }) catch null;
                                 if (err_msg) |em| {
                                     defer self.allocator.free(em);
-                                    _ = deliverResult(self.allocator, job.delivery, em, false, b) catch {};
+                                    _ = deliverResult(self.allocator, delivery, em, false, b) catch {};
                                 }
                             }
                         }

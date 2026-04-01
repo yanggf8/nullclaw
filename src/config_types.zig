@@ -188,6 +188,12 @@ pub const SchedulerConfig = struct {
     max_concurrent: u32 = 4,
     /// Hard timeout for cron agent subprocess execution. 0 = no timeout.
     agent_timeout_secs: u64 = 0,
+    /// Channel for operator failure alerts (e.g. "telegram"). Null = no alerts.
+    alert_channel: ?[]const u8 = null,
+    /// Chat/room ID for operator failure alerts (e.g. a Telegram chat ID).
+    alert_to: ?[]const u8 = null,
+    /// Bot account to use for operator failure alerts (e.g. "main").
+    alert_account: ?[]const u8 = null,
 };
 
 // ── Tool filter groups ──────────────────────────────────────────

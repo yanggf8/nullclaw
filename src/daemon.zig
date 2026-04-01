@@ -476,6 +476,15 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
     scheduler.setShellCwd(config.workspace_dir);
     scheduler.setAgentTimeoutSecs(config.scheduler.agent_timeout_secs);
+    if (config.scheduler.alert_channel != null and config.scheduler.alert_to != null) {
+        scheduler.setAlertDelivery(.{
+            .mode = .always,
+            .channel = config.scheduler.alert_channel,
+            .account_id = config.scheduler.alert_account,
+            .to = config.scheduler.alert_to,
+            .best_effort = true,
+        });
+    }
     defer scheduler.deinit();
     defer gateway_mod.clearSharedScheduler();
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
