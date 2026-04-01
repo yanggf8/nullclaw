@@ -525,7 +525,7 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
                 tick_count += 1;
                 if (tick_count >= heartbeat_ticks) {
                     tick_count = 0;
-                    log.debug("scheduler: alive, 0 jobs due (DbCronBackend)", .{});
+                    log.info("scheduler: alive, 0 jobs due (DbCronBackend)", .{});
                 }
             }
             var slept2: u64 = 0;

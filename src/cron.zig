@@ -4740,6 +4740,7 @@ pub fn dbManualEnqueueJob(db_path: [:0]const u8, job_id: []const u8, now: i64) !
         }
     } else {
         const next_run = nextRunForCronExpressionTz(expr_str, now, tz_offset_val) catch now + 60;
+        std.log.scoped(.cron_tick).info("manual enqueue job '{s}' [{s}] next_run={d}", .{ job_id, expr_str, next_run });
         const upd_sql = "UPDATE cron_jobs SET next_run_secs=?1 WHERE id=?2";
         var upd_stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db, upd_sql, -1, &upd_stmt, null) == c.SQLITE_OK) {
@@ -4823,6 +4824,7 @@ pub fn dbTickAndEnqueue(db_path: [:0]const u8, allocator: std.mem.Allocator, now
 
         // Update next_run_secs (or set to 0 for one-shot jobs so they don't re-fire).
         if (one_shot_val != 0) {
+            std.log.scoped(.cron_tick).info("enqueued job '{s}' [{s}] (one-shot, will pause)", .{ id_str, expr_str });
             const upd_sql = "UPDATE cron_jobs SET next_run_secs=0, paused=1 WHERE id=?1";
             var upd_stmt: ?*c.sqlite3_stmt = null;
             if (c.sqlite3_prepare_v2(db, upd_sql, -1, &upd_stmt, null) == c.SQLITE_OK) {
@@ -4832,6 +4834,7 @@ pub fn dbTickAndEnqueue(db_path: [:0]const u8, allocator: std.mem.Allocator, now
             }
         } else {
             const next_run = nextRunForCronExpressionTz(expr_str, now, tz_offset_val) catch now + 60;
+            std.log.scoped(.cron_tick).info("enqueued job '{s}' [{s}] next_run={d}", .{ id_str, expr_str, next_run });
             const upd_sql = "UPDATE cron_jobs SET next_run_secs=?1 WHERE id=?2";
             var upd_stmt: ?*c.sqlite3_stmt = null;
             if (c.sqlite3_prepare_v2(db, upd_sql, -1, &upd_stmt, null) == c.SQLITE_OK) {

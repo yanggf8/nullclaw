@@ -3889,7 +3889,12 @@ fn runQueueWorker(state: *GatewayState) void {
                     const skill_status = if (skill_ok) "ok" else "error";
                     // Skills self-deliver — no cron delivery needed.
                     complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, skill_status, if (skill_output.len > 0) skill_output else null, spec.delete_after_run, false);
-                    log.info("[{s}] skill completed ({s})", .{ spec.id, skill_status });
+                    if (skill_output.len > 0) {
+                        const nl = std.mem.indexOfScalar(u8, skill_output, '\n') orelse skill_output.len;
+                        log.info("[{s}] skill completed ({s}): {s}", .{ spec.id, skill_status, skill_output[0..@min(nl, 120)] });
+                    } else {
+                        log.info("[{s}] skill completed ({s}): (no output)", .{ spec.id, skill_status });
+                    }
                 },
             }
         } else {
@@ -4180,10 +4185,15 @@ fn runQueueWorker(state: *GatewayState) void {
                     }
                     // Skills self-deliver — no cron delivery.
                     _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse {
-                        log.info("[{s}] skill completed ({s})", .{ id, if (skill_ok) "ok" else "error" });
+                        log.info("[{s}] skill completed ({s}): (no output)", .{ id, if (skill_ok) "ok" else "error" });
                         continue;
                     }) catch |err| log.err("[{s}] db persist failed: {s}", .{ id, @errorName(err) });
-                    log.info("[{s}] skill completed ({s})", .{ id, if (skill_ok) "ok" else "error" });
+                    if (skill_output.len > 0) {
+                        const nl2 = std.mem.indexOfScalar(u8, skill_output, '\n') orelse skill_output.len;
+                        log.info("[{s}] skill completed ({s}): {s}", .{ id, if (skill_ok) "ok" else "error", skill_output[0..@min(nl2, 120)] });
+                    } else {
+                        log.info("[{s}] skill completed ({s}): (no output)", .{ id, if (skill_ok) "ok" else "error" });
+                    }
                 },
             }
         }
