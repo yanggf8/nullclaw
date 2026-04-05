@@ -934,38 +934,53 @@ fn parseCronAddAgentOptions(sub_args: []const []const u8) !CronAddAgentOptions {
 }
 
 fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    const CRON_USAGE = std.fmt.comptimePrint(
+        \\Usage: nullclaw cron <{s}> [args]
+        \\
+        \\Commands:
+        \\  list                          List all scheduled tasks
+        \\  status                        Show scheduler daemon status
+        \\  schedule [--hours N] [--all] [--today]
+        \\                                Show upcoming jobs in CST (Asia/Shanghai, UTC+8).
+        \\                                --hours N   look-ahead window (default: 24)
+        \\                                --all       include paused/disabled jobs
+        \\                                --today     restrict to remaining jobs today (CST)
+        \\  add <expression> <command> [--tz <offset>]
+        \\                                Add a recurring shell cron job
+        \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--account <id>] [--to <id>] [--tz <offset>]
+        \\                                Add a recurring agent cron job
+        \\  add-skill <expression> <skill> [args...] [--deliver-to <id>] [--account <id>] [--timeout <secs>] [--tz <offset>]
+        \\                                Add a recurring skill cron job
+        \\  once <delay> <command>        Add a one-shot delayed task
+        \\  once-agent <delay> <prompt> [--model <model>]
+        \\                                Add a one-shot delayed agent task
+        \\  remove <id>                   Remove a scheduled task
+        \\  pause <id>                    Pause a scheduled task (temporary hold)
+        \\  resume <id>                   Resume a paused task
+        \\  run <id>                      Run a scheduled task immediately
+        \\  update <id> [--expression <expr>] [--command <cmd>] [--prompt <text>]
+        \\             [--model <model>] [--session-target <isolated|main>]
+        \\             [--enable] [--disable] [--tz <offset>]
+        \\                                Update a cron job. --expression also recomputes next run time.
+        \\  runs <id>                     List run history for a specific job
+        \\  backup                        Backup cron.db to ~/.nullclaw/backup/
+        \\  restore [file]                Restore cron.db from latest backup or specified file
+        \\  export-seed                   Export enabled jobs to ~/.nullclaw/cron-seed.json
+        \\  init-seed                     Initialize DB from ~/.nullclaw/cron-seed.json (DESTRUCTIVE: requires 3x confirmation)
+        \\
+    , .{CRON_SUBCOMMANDS});
+
     if (sub_args.len < 1) {
-        std.debug.print(std.fmt.comptimePrint(
-            \\Usage: nullclaw cron <{s}> [args]
-            \\
-            \\Commands:
-            \\  list                          List all scheduled tasks
-            \\  status                        Show scheduler daemon status
-            \\  schedule [--hours N] [--all] [--today]  Show upcoming jobs (CST)
-            \\  add <expression> <command>    Add a recurring cron job
-            \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
-            \\                                Add a recurring agent cron job
-            \\  add-skill <expression> <skill> [args...] [--deliver-to <id>] [--account <id>] [--timeout <secs>]
-            \\                                Add a recurring skill cron job
-            \\  once <delay> <command>        Add a one-shot delayed task
-            \\  once-agent <delay> <prompt> [--model <model>]
-            \\                                Add a one-shot delayed agent task
-            \\  remove <id>                   Remove a scheduled task
-            \\  pause <id>                    Pause a scheduled task
-            \\  resume <id>                   Resume a paused task
-            \\  run <id>                      Run a scheduled task immediately
-            \\  update <id> [options]         Update a cron job
-            \\  runs <id>                     List recent run history for a job
-            \\  backup                        Backup cron.db to ~/.nullclaw/backup/
-            \\  restore [file]                Restore cron.db from latest backup or specified file
-            \\  export-seed                   Export enabled jobs to ~/.nullclaw/cron-seed.json
-            \\  init-seed                     Initialize DB from ~/.nullclaw/cron-seed.json (DESTRUCTIVE: requires 3x confirmation)
-            \\
-        , .{CRON_SUBCOMMANDS}), .{});
+        std.debug.print(CRON_USAGE, .{});
         std.process.exit(1);
     }
 
     const subcmd = sub_args[0];
+
+    if (std.mem.eql(u8, subcmd, "--help") or std.mem.eql(u8, subcmd, "-h")) {
+        std.debug.print(CRON_USAGE, .{});
+        return;
+    }
 
     if (std.mem.eql(u8, subcmd, "list")) {
         try yc.cron.cliListJobs(allocator);
