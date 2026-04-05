@@ -934,25 +934,28 @@ fn parseCronAddAgentOptions(sub_args: []const []const u8) !CronAddAgentOptions {
 }
 
 fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
-    const CRON_USAGE = std.fmt.comptimePrint(
-        \\Usage: nullclaw cron <{s}> [args]
+    const cron_usage = std.fmt.comptimePrint(
+        \\Usage: nullclaw cron <{s}> [--help|-h]
         \\
         \\Commands:
         \\  list                          List all scheduled tasks
         \\  status                        Show scheduler daemon status
         \\  schedule [--hours N] [--all] [--today]
-        \\                                Show upcoming jobs in CST (Asia/Shanghai, UTC+8).
+        \\                                Show upcoming jobs. Display timezone defaults to UTC+8 when
+        \\                                no job timezone is set; per-job tz_offset overrides this.
         \\                                --hours N   look-ahead window (default: 24)
         \\                                --all       include paused/disabled jobs
-        \\                                --today     restrict to remaining jobs today (CST)
+        \\                                --today     restrict to remaining jobs in the current display day
         \\  add <expression> <command> [--tz <offset>]
         \\                                Add a recurring shell cron job
-        \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--account <id>] [--to <id>] [--tz <offset>]
+        \\  add-agent <expression> <prompt> [--model <model>] [--session-target <isolated|main>]
+        \\             [--announce] [--channel <name>] [--account <id>] [--to <id>] [--tz <offset>]
         \\                                Add a recurring agent cron job
-        \\  add-skill <expression> <skill> [args...] [--deliver-to <id>] [--account <id>] [--timeout <secs>] [--tz <offset>]
+        \\  add-skill <expression> <skill> [args...] [--deliver-to <id>] [--account <id>]
+        \\             [--timeout <secs>] [--tz <offset>]
         \\                                Add a recurring skill cron job
         \\  once <delay> <command>        Add a one-shot delayed task
-        \\  once-agent <delay> <prompt> [--model <model>]
+        \\  once-agent <delay> <prompt> [--model <model>] [--session-target <isolated|main>]
         \\                                Add a one-shot delayed agent task
         \\  remove <id>                   Remove a scheduled task
         \\  pause <id>                    Pause a scheduled task (temporary hold)
@@ -971,14 +974,14 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     , .{CRON_SUBCOMMANDS});
 
     if (sub_args.len < 1) {
-        std.debug.print(CRON_USAGE, .{});
+        std.debug.print(cron_usage, .{});
         std.process.exit(1);
     }
 
     const subcmd = sub_args[0];
 
     if (std.mem.eql(u8, subcmd, "--help") or std.mem.eql(u8, subcmd, "-h")) {
-        std.debug.print(CRON_USAGE, .{});
+        std.debug.print(cron_usage, .{});
         return;
     }
 
@@ -1020,7 +1023,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliAddJob(allocator, sub_args[1], sub_args[2], add_tz);
     } else if (std.mem.eql(u8, subcmd, "add-agent")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]\n", .{});
+            std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>] [--tz <offset>]\n", .{});
             std.process.exit(1);
         }
         const options = parseCronAddAgentOptions(sub_args) catch |err| switch (err) {
@@ -1033,7 +1036,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], options.model, options.session_target, options.delivery, options.tz_offset_s);
     } else if (std.mem.eql(u8, subcmd, "add-skill")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron add-skill <expression> <skill> [args...] [--deliver-to <id>] [--account <id>] [--timeout <secs>]\n", .{});
+            std.debug.print("Usage: nullclaw cron add-skill <expression> <skill> [args...] [--deliver-to <id>] [--account <id>] [--timeout <secs>] [--tz <offset>]\n", .{});
             std.process.exit(1);
         }
         const options = parseCronAddSkillOptions(allocator, sub_args);
