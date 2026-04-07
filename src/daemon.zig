@@ -394,7 +394,8 @@ fn upsertSchedulerRuntimeJob(
         dst.last_status = runtime_job.last_status;
         dst.paused = runtime_job.paused;
         dst.one_shot = runtime_job.one_shot;
-        // Update delivery config
+        // Update delivery config (all routing fields must be copied, not just channel/to)
+        dst.session_target = runtime_job.session_target;
         dst.delivery.mode = runtime_job.delivery.mode;
         if (dst.delivery.channel_owned) {
             if (dst.delivery.channel) |c| allocator.free(c);
@@ -406,6 +407,22 @@ fn upsertSchedulerRuntimeJob(
         }
         dst.delivery.to = if (runtime_job.delivery.to) |t| try allocator.dupe(u8, t) else null;
         dst.delivery.to_owned = runtime_job.delivery.to != null;
+        if (dst.delivery.account_id_owned) {
+            if (dst.delivery.account_id) |a| allocator.free(a);
+        }
+        dst.delivery.account_id = if (runtime_job.delivery.account_id) |a| try allocator.dupe(u8, a) else null;
+        dst.delivery.account_id_owned = runtime_job.delivery.account_id != null;
+        dst.delivery.peer_kind = runtime_job.delivery.peer_kind;
+        if (dst.delivery.peer_id_owned) {
+            if (dst.delivery.peer_id) |p| allocator.free(p);
+        }
+        dst.delivery.peer_id = if (runtime_job.delivery.peer_id) |p| try allocator.dupe(u8, p) else null;
+        dst.delivery.peer_id_owned = runtime_job.delivery.peer_id != null;
+        if (dst.delivery.thread_id_owned) {
+            if (dst.delivery.thread_id) |t| allocator.free(t);
+        }
+        dst.delivery.thread_id = if (runtime_job.delivery.thread_id) |t| try allocator.dupe(u8, t) else null;
+        dst.delivery.thread_id_owned = runtime_job.delivery.thread_id != null;
         dst.delivery.best_effort = runtime_job.delivery.best_effort;
         return;
     }
@@ -2863,6 +2880,71 @@ test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
     try std.testing.expectEqualStrings("summarize merge state", job.prompt.?);
     try std.testing.expect(job.model != null);
     try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", job.model.?);
+}
+
+test "mergeSchedulerTickChangesAndSave preserves routing fields on existing job update" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/daemon_routing_merge.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path);
+
+    // Create a job with full routing fields and persist it.
+    var runtime = CronScheduler.init(allocator, 32, true);
+    runtime.db_path = db_path;
+    defer runtime.deinit();
+    _ = try runtime.addAgentJob("* * * * *", "routing test", "model/test", .{});
+    const job_idx = runtime.jobs.items.len - 1;
+    runtime.jobs.items[job_idx].next_run_secs = 0;
+    runtime.jobs.items[job_idx].session_target = .main;
+    runtime.jobs.items[job_idx].delivery.mode = .always;
+    runtime.jobs.items[job_idx].delivery.account_id = "acct-42";
+    runtime.jobs.items[job_idx].delivery.peer_kind = .group;
+    runtime.jobs.items[job_idx].delivery.peer_id = "peer-99";
+    runtime.jobs.items[job_idx].delivery.thread_id = "thread-7";
+    try cron.saveJobs(&runtime);
+
+    // Load into a fresh scheduler (simulates next tick start).
+    var loaded = CronScheduler.init(allocator, 32, true);
+    loaded.db_path = db_path;
+    defer loaded.deinit();
+    try cron.loadJobs(&loaded);
+
+    var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
+    defer {
+        clearSchedulerSnapshot(allocator, &before_tick);
+        before_tick.deinit(allocator);
+    }
+    try buildSchedulerSnapshot(allocator, &loaded, &before_tick);
+
+    // Job still exists on disk (no concurrent removal), so upsert takes the existing-job path.
+    _ = loaded.tick(std.time.timestamp(), null);
+    try mergeSchedulerTickChangesAndSave(allocator, &loaded, &before_tick);
+
+    var merged = CronScheduler.init(allocator, 32, true);
+    merged.db_path = db_path;
+    defer merged.deinit();
+    try cron.loadJobsStrict(&merged);
+    try std.testing.expectEqual(@as(usize, 1), merged.listJobs().len);
+
+    const job = merged.listJobs()[0];
+    try std.testing.expectEqual(cron.SessionTarget.main, job.session_target);
+    try std.testing.expectEqual(cron.DeliveryMode.always, job.delivery.mode);
+    try std.testing.expect(job.delivery.account_id != null);
+    try std.testing.expectEqualStrings("acct-42", job.delivery.account_id.?);
+    try std.testing.expect(job.delivery.peer_kind != null);
+    try std.testing.expectEqual(agent_routing.ChatType.group, job.delivery.peer_kind.?);
+    try std.testing.expect(job.delivery.peer_id != null);
+    try std.testing.expectEqualStrings("peer-99", job.delivery.peer_id.?);
+    try std.testing.expect(job.delivery.thread_id != null);
+    try std.testing.expectEqualStrings("thread-7", job.delivery.thread_id.?);
 }
 
 test "channelSupervisorThread respects shutdown" {

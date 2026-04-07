@@ -258,6 +258,20 @@ POST `/cron/run` with `{"id": "<job-id>"}` to trigger a job immediately. The DB-
 
 Never call `dbEnqueueJob` for manual triggers — it is a raw queue insert that does not advance the schedule.
 
+#### Scheduler tick merge invariant
+
+`mergeSchedulerTickChangesAndSave` (in `src/daemon.zig`) performs a read-modify-write cycle on the on-disk cron state after every scheduler tick. It calls `upsertSchedulerRuntimeJob` to either append new jobs or update existing ones.
+
+**Invariant**: for the existing-job path, **all** routing-critical fields must be propagated from the in-memory runtime job to the on-disk copy. These include:
+
+- `session_target`
+- `delivery.account_id` / `account_id_owned`
+- `delivery.peer_kind`
+- `delivery.peer_id` / `peer_id_owned`
+- `delivery.thread_id` / `thread_id_owned`
+
+If any of these are omitted, a concurrent on-disk write (e.g. `load-from-seed` or a gateway API call) can silently strip the routing config from the persisted job. The regression test `mergeSchedulerTickChangesAndSave preserves routing fields on existing job update` in `src/daemon.zig` covers this path.
+
 #### Operator alert delivery
 
 `Config.scheduler.alert_channel` / `alert_to` / `alert_account` configure a fallback delivery destination for skill job failures. Both execution paths honour it:
