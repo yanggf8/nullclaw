@@ -1213,6 +1213,7 @@ pub fn initRuntime(
             .purge_after_days = config.lifecycle.purge_after_days,
             .preserve_before_purge = config.lifecycle.preserve_before_purge,
             .conversation_retention_days = config.lifecycle.conversation_retention_days,
+            .daily_retention_days = config.lifecycle.daily_retention_days,
             .workspace_dir = workspace_dir,
         };
         const report = hygiene.runIfDue(allocator, hygiene_cfg, instance.memory, preserve_sync_hook);

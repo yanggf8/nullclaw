@@ -1235,6 +1235,8 @@ pub const MemoryLifecycleConfig = struct {
     purge_after_days: u32 = 30,
     preserve_before_purge: bool = true,
     conversation_retention_days: u32 = 30,
+    /// Daily memories are semantically short-lived; prune SQLite rows older than this. Default: 2 days.
+    daily_retention_days: u32 = 2,
     snapshot_enabled: bool = false,
     snapshot_on_hygiene: bool = false,
     auto_hydrate: bool = true,

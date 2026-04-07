@@ -39,13 +39,29 @@ pub const MemoryStoreTool = struct {
 
         const category_str = root.getString(args, "category") orelse "core";
         const category = MemoryCategory.fromString(category_str);
-        const session_id: ?[]const u8 = if (args.get("session_id")) |_|
-            if (root.getString(args, "session_id")) |sid_raw|
+        // Determine whether the LLM explicitly passed a non-empty session_id.
+        // Empty string means "use current thread session" and is not a scope override.
+        const raw_session_id = if (args.get("session_id") != null) root.getString(args, "session_id") else null;
+        const session_id_nonempty = raw_session_id != null and raw_session_id.?.len > 0;
+        const session_id_key_present = args.get("session_id") != null;
+        const session_id: ?[]const u8 = if (session_id_key_present)
+            if (raw_session_id) |sid_raw|
                 if (sid_raw.len > 0) sid_raw else root.threadMemorySessionId()
             else
                 root.threadMemorySessionId()
         else
             root.threadMemorySessionId();
+
+        // Cross-validate category vs. scope to catch common LLM mistakes.
+        // Only enforce when session_id is a concrete non-empty value (not empty-string shorthand).
+        if (category == .core and session_id_nonempty) {
+            return ToolResult.fail("'core' memories must be durable (omit session_id). " ++
+                "Use category='conversation' for chat-specific facts.");
+        }
+        if (category == .conversation and !session_id_key_present) {
+            return ToolResult.fail("'conversation' memories must be session-scoped " ++
+                "(pass session_id or empty string). Use category='core' for cross-session facts.");
+        }
 
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot store: {s} = {s}", .{ key, content });
@@ -183,6 +199,64 @@ test "memory_store uses current thread session when session_id is empty string" 
     const scoped_entry = (try sqlite_mem.memory().getScoped(allocator, "chat.note", "chat-123")).?;
     defer scoped_entry.deinit(allocator);
     try std.testing.expectEqualStrings("chat-123", scoped_entry.session_id.?);
+}
+
+test "memory_store rejects core category with explicit session_id" {
+    const NoneMemory = mem_root.NoneMemory;
+    var backend = NoneMemory.init();
+    defer backend.deinit();
+
+    var mt = MemoryStoreTool{ .memory = backend.memory() };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\": \"fact\", \"content\": \"chat note\", \"category\": \"core\", \"session_id\": \"chat-123\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg orelse "", "durable") != null);
+}
+
+test "memory_store rejects conversation category without session_id" {
+    const NoneMemory = mem_root.NoneMemory;
+    var backend = NoneMemory.init();
+    defer backend.deinit();
+
+    var mt = MemoryStoreTool{ .memory = backend.memory() };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\": \"note\", \"content\": \"chat note\", \"category\": \"conversation\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg orelse "", "session-scoped") != null);
+}
+
+test "memory_store allows core without session_id" {
+    const NoneMemory = mem_root.NoneMemory;
+    var backend = NoneMemory.init();
+    defer backend.deinit();
+
+    var mt = MemoryStoreTool{ .memory = backend.memory() };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\": \"pref\", \"content\": \"likes Zig\", \"category\": \"core\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+}
+
+test "memory_store allows conversation with explicit session_id" {
+    const NoneMemory = mem_root.NoneMemory;
+    var backend = NoneMemory.init();
+    defer backend.deinit();
+
+    var mt = MemoryStoreTool{ .memory = backend.memory() };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\": \"note\", \"content\": \"chat note\", \"category\": \"conversation\", \"session_id\": \"chat-42\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
 }
 
 test "memory_store with daily category" {

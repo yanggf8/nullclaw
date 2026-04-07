@@ -191,7 +191,8 @@ pub const MemoryRecallTool = struct {
 
             const visible_candidates = countVisibleCandidates(merged_candidates.items);
             if (visible_candidates == 0) {
-                const msg = try std.fmt.allocPrint(allocator, "No memories found matching: {s}", .{query});
+                const msg = try std.fmt.allocPrint(allocator,
+                    "No memories found matching: {s}. Consider storing relevant facts with memory_store after this session.", .{query});
                 return ToolResult{ .success = true, .output = msg };
             }
 
@@ -223,7 +224,8 @@ pub const MemoryRecallTool = struct {
 
         const visible_entries = countVisibleEntries(merged_entries.items);
         if (visible_entries == 0) {
-            const msg = try std.fmt.allocPrint(allocator, "No memories found matching: {s}", .{query});
+            const msg = try std.fmt.allocPrint(allocator,
+                "No memories found matching: {s}. Consider storing relevant facts with memory_store after this session.", .{query});
             return ToolResult{ .success = true, .output = msg };
         }
 
@@ -246,6 +248,15 @@ pub const MemoryRecallTool = struct {
             count += 1;
         }
         return count;
+    }
+
+    /// Compute age in whole days from a Unix epoch timestamp string.
+    /// Returns null if the timestamp is missing, malformed, or in the future.
+    fn ageInDays(timestamp: []const u8) ?i64 {
+        const ts = std.fmt.parseInt(i64, std.mem.trim(u8, timestamp, " \t\r\n"), 10) catch return null;
+        const age_secs = std.time.timestamp() - ts;
+        if (age_secs < 0) return null;
+        return @divFloor(age_secs, 86400);
     }
 
     fn formatEntries(allocator: std.mem.Allocator, entries: []const MemoryEntry, visible_count: usize) !ToolResult {
@@ -271,6 +282,22 @@ pub const MemoryRecallTool = struct {
             try buf.appendSlice(allocator, entry.key);
             try buf.appendSlice(allocator, "] (");
             try buf.appendSlice(allocator, entry.category.toString());
+            // Freshness warning — borrowed from Claude Code's per-entry age annotation
+            if (ageInDays(entry.timestamp)) |days| {
+                if (days >= 30) {
+                    var age_buf: [40]u8 = undefined;
+                    const age_str = std.fmt.bufPrint(&age_buf, ", {d}d old — likely stale", .{days}) catch "";
+                    try buf.appendSlice(allocator, age_str);
+                } else if (days >= 7) {
+                    var age_buf: [40]u8 = undefined;
+                    const age_str = std.fmt.bufPrint(&age_buf, ", {d}d old — verify before acting", .{days}) catch "";
+                    try buf.appendSlice(allocator, age_str);
+                } else if (days >= 3) {
+                    var age_buf: [20]u8 = undefined;
+                    const age_str = std.fmt.bufPrint(&age_buf, ", {d}d old", .{days}) catch "";
+                    try buf.appendSlice(allocator, age_str);
+                }
+            }
             try buf.appendSlice(allocator, "): ");
             try buf.appendSlice(allocator, entry.content);
             try buf.append(allocator, '\n');
@@ -309,6 +336,10 @@ pub const MemoryRecallTool = struct {
             var score_buf: [20]u8 = undefined;
             const score_str = std.fmt.bufPrint(&score_buf, " {d:.2}", .{cand.final_score}) catch "";
             try buf.appendSlice(allocator, score_str);
+            // Low-score signal: warn when relevance is weak so the LLM knows the match is uncertain
+            if (cand.final_score < 0.4) {
+                try buf.appendSlice(allocator, " — low relevance");
+            }
             try buf.appendSlice(allocator, "): ");
             try buf.appendSlice(allocator, cand.snippet);
             try buf.append(allocator, '\n');

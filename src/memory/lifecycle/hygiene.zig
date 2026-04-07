@@ -29,9 +29,11 @@ pub const HygieneReport = struct {
     archived_memory_files: u64 = 0,
     purged_memory_archives: u64 = 0,
     pruned_conversation_rows: u64 = 0,
+    pruned_daily_rows: u64 = 0,
 
     pub fn totalActions(self: *const HygieneReport) u64 {
-        return self.archived_memory_files + self.purged_memory_archives + self.pruned_conversation_rows;
+        return self.archived_memory_files + self.purged_memory_archives +
+            self.pruned_conversation_rows + self.pruned_daily_rows;
     }
 };
 
@@ -41,6 +43,9 @@ pub const HygieneConfig = struct {
     archive_after_days: u32 = 7,
     purge_after_days: u32 = 30,
     conversation_retention_days: u32 = 30,
+    /// Daily memories are semantically short-lived reminders; prune SQLite rows
+    /// older than this many days. Default: 2 days. Set to 0 to disable.
+    daily_retention_days: u32 = 2,
     preserve_before_purge: bool = true,
     workspace_dir: []const u8 = "",
 };
@@ -80,6 +85,13 @@ pub fn runIfDue(allocator: std.mem.Allocator, config: HygieneConfig, mem: ?Memor
                 config.preserve_before_purge,
                 preserve_sync_hook,
             ) catch 0;
+        }
+    }
+
+    // Prune old daily rows — daily is semantically short-lived; use entry.timestamp not key prefix
+    if (config.daily_retention_days > 0) {
+        if (mem) |m| {
+            report.pruned_daily_rows = pruneDailyRows(allocator, m, config.daily_retention_days) catch 0;
         }
     }
 
@@ -272,6 +284,33 @@ fn preserveConversationEntry(
 /// Lists conversation-tagged entries and deletes those whose timestamp is old.
 pub fn pruneConversationRows(allocator: std.mem.Allocator, mem: Memory, retention_days: u32) !u64 {
     return pruneConversationRowsWithPreserve(allocator, mem, retention_days, false, null);
+}
+
+/// Prune daily-category rows older than retention_days.
+/// Unlike conversation rows, daily entries use arbitrary user-chosen keys so
+/// age is read from entry.timestamp (stored as a decimal Unix epoch integer).
+pub fn pruneDailyRows(allocator: std.mem.Allocator, mem: Memory, retention_days: u32) !u64 {
+    const cutoff_secs = std.time.timestamp() - @as(i64, @intCast(retention_days)) * 24 * 60 * 60;
+
+    const results = mem.list(allocator, .daily, null) catch return 0;
+    defer {
+        for (results) |r| r.deinit(allocator);
+        allocator.free(results);
+    }
+    if (results.len == 0) return 0;
+
+    var pruned: u64 = 0;
+    for (results) |entry| {
+        // Skip internal hygiene bookkeeping entries
+        if (std.mem.eql(u8, entry.key, LAST_HYGIENE_KEY)) continue;
+        const ts = std.fmt.parseInt(i64, std.mem.trim(u8, entry.timestamp, " \t\r\n"), 10) catch continue;
+        if (ts < cutoff_secs) {
+            _ = mem.forget(entry.key) catch continue;
+            pruned += 1;
+        }
+    }
+
+    return pruned;
 }
 
 fn pruneConversationRowsWithPreserve(
