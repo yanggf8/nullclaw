@@ -267,6 +267,31 @@ Never call `dbEnqueueJob` for manual triggers — it is a raw queue insert that 
 
 When a job has `delivery_mode != none`, its own delivery config is used for alerts. The `alert_delivery` fallback is only used when the job has no delivery config.
 
+#### Run history
+
+Every completed job execution is appended to the `cron_runs` table (created by `ensureCronRunsTable`, called inside `ensureCronTable`). The table schema:
+
+```sql
+CREATE TABLE IF NOT EXISTS cron_runs (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id      TEXT NOT NULL,
+  started_at  INTEGER NOT NULL DEFAULT 0,
+  finished_at INTEGER NOT NULL DEFAULT 0,
+  status      TEXT NOT NULL DEFAULT 'ok',
+  output      TEXT
+);
+```
+
+`dbCompleteJob` INSERTs the row and immediately prunes rows older than 30 days for that job (inline `DELETE`; no separate vacuum job needed).
+
+CLI access:
+- `nullclaw cron runs <id> [--limit N] [--json]` — per-job history (last 50 by default)
+- `nullclaw cron job-status [--json]` — last known status per job, sorted by recency
+- `nullclaw cron list [--limit N] [--json]` — all jobs as JSON array (stdout)
+- `nullclaw cron schedule [--hours N] [--all] [--today] [--json]` — upcoming fires as JSON array
+
+`--json` always writes to stdout (not stderr). Human-readable output continues to use `log.info` (stderr).
+
 #### E2E verification
 
 After a job runs, verify in `journalctl`:

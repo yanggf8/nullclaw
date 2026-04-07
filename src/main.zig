@@ -39,7 +39,7 @@ const Command = enum {
 };
 
 const SERVICE_SUBCOMMANDS = "install|start|stop|restart|status|uninstall";
-const CRON_SUBCOMMANDS = "list|status|schedule|add|add-agent|add-skill|once|once-agent|remove|pause|resume|run|update|runs|backup|restore|export-seed|init-seed";
+const CRON_SUBCOMMANDS = "list|status|job-status|schedule|add|add-agent|add-skill|once|once-agent|remove|pause|resume|run|update|runs|backup|restore|export-seed|init-seed";
 const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
@@ -938,9 +938,10 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         \\Usage: nullclaw cron <{s}> [--help|-h]
         \\
         \\Commands:
-        \\  list                          List all scheduled tasks
+        \\  list [--limit N] [--json]     List all scheduled tasks
         \\  status                        Show scheduler daemon status
-        \\  schedule [--hours N] [--all] [--today]
+        \\  job-status [--json]           Last known execution status per job, sorted by most-recently-run
+        \\  schedule [--hours N] [--all] [--today] [--json]
         \\                                Show upcoming jobs. Display timezone defaults to UTC+8 when
         \\                                no job timezone is set; per-job tz_offset overrides this.
         \\                                --hours N   look-ahead window (default: 24)
@@ -965,7 +966,8 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         \\             [--model <model>] [--session-target <isolated|main>]
         \\             [--enable] [--disable] [--tz <offset>]
         \\                                Update a cron job. --expression also recomputes next run time.
-        \\  runs <id>                     List run history for a specific job
+        \\  runs <id> [--limit N] [--json]
+        \\                                List run history for a specific job (from cron_runs table)
         \\  backup                        Backup cron.db to ~/.nullclaw/backup/
         \\  restore [file]                Restore cron.db from latest backup or specified file
         \\  export-seed                   Export enabled jobs to ~/.nullclaw/cron-seed.json
@@ -986,13 +988,30 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     }
 
     if (std.mem.eql(u8, subcmd, "list")) {
-        try yc.cron.cliListJobs(allocator);
+        var list_limit: usize = 0;
+        var list_json = false;
+        {
+            var li: usize = 1;
+            while (li < sub_args.len) : (li += 1) {
+                if (std.mem.eql(u8, sub_args[li], "--json")) {
+                    list_json = true;
+                } else if (std.mem.eql(u8, sub_args[li], "--limit") and li + 1 < sub_args.len) {
+                    li += 1;
+                    list_limit = std.fmt.parseInt(usize, sub_args[li], 10) catch 0;
+                }
+            }
+        }
+        try yc.cron.cliListJobs(allocator, list_limit, list_json);
     } else if (std.mem.eql(u8, subcmd, "status")) {
         try yc.cron.cliStatus(allocator);
+    } else if (std.mem.eql(u8, subcmd, "job-status")) {
+        const js_json = sub_args.len >= 2 and std.mem.eql(u8, sub_args[1], "--json");
+        try yc.cron.cliJobStatus(allocator, js_json);
     } else if (std.mem.eql(u8, subcmd, "schedule")) {
         var hours: u32 = 24;
         var show_all = false;
         var show_today = false;
+        var sched_json = false;
         var i: usize = 1;
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--hours") and i + 1 < sub_args.len) {
@@ -1002,9 +1021,11 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 show_all = true;
             } else if (std.mem.eql(u8, sub_args[i], "--today")) {
                 show_today = true;
+            } else if (std.mem.eql(u8, sub_args[i], "--json")) {
+                sched_json = true;
             }
         }
-        try yc.cron.cliSchedule(allocator, hours, show_all, show_today);
+        try yc.cron.cliSchedule(allocator, hours, show_all, show_today, sched_json);
     } else if (std.mem.eql(u8, subcmd, "add")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron add <expression> <command> [--tz <offset>]\n", .{});
@@ -1145,10 +1166,23 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         };
     } else if (std.mem.eql(u8, subcmd, "runs")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw cron runs <id>\n", .{});
+            std.debug.print("Usage: nullclaw cron runs <id> [--limit N] [--json]\n", .{});
             std.process.exit(1);
         }
-        try yc.cron.cliListRuns(allocator, sub_args[1]);
+        var runs_limit: usize = 0;
+        var runs_json = false;
+        {
+            var ri: usize = 2;
+            while (ri < sub_args.len) : (ri += 1) {
+                if (std.mem.eql(u8, sub_args[ri], "--json")) {
+                    runs_json = true;
+                } else if (std.mem.eql(u8, sub_args[ri], "--limit") and ri + 1 < sub_args.len) {
+                    ri += 1;
+                    runs_limit = std.fmt.parseInt(usize, sub_args[ri], 10) catch 0;
+                }
+            }
+        }
+        try yc.cron.cliListRuns(allocator, sub_args[1], runs_limit, runs_json);
     } else if (std.mem.eql(u8, subcmd, "backup")) {
         try yc.cron.cliBackup(allocator);
     } else if (std.mem.eql(u8, subcmd, "restore")) {
