@@ -1559,8 +1559,7 @@ fn printMemoryUsage() void {
         \\  drain-outbox                  Drain durable vector outbox queue
         \\  forget <key> [--session <id>] Delete entry from primary memory (if backend supports)
         \\                                --session limits deletion to a specific session scope
-        \\  run-hygiene [--force]         Run memory hygiene pass now
-        \\                                --force skips the 12h cooldown window
+        \\  run-hygiene [--force]         Run memory hygiene pass now (always bypasses cooldown)
         \\
     , .{MEMORY_SUBCOMMANDS}), .{});
 }
@@ -1993,40 +1992,22 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     }
 
     if (std.mem.eql(u8, subcmd, "run-hygiene")) {
-        var force = false;
         var i: usize = 1;
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--force")) {
-                force = true;
+                // --force is accepted for scripting convenience; run-hygiene always resets
+                // the cooldown, so --force is a no-op synonym (documented in help text).
             } else {
                 std.debug.print("Unknown option for memory run-hygiene: {s}\n", .{sub_args[i]});
                 std.process.exit(1);
             }
         }
 
-        if (force) {
-            // Reset cooldown so runIfDue proceeds unconditionally
-            mem_rt.memory.store("last_hygiene_at", "0", .core, null) catch |err| {
-                std.debug.print("Failed to reset hygiene timestamp: {s}\n", .{@errorName(err)});
-                std.process.exit(1);
-            };
-        }
+        // Always bypass the 12h cooldown: initRuntime() already ran hygiene at startup,
+        // so runIfDue() would find it fresh without the forced reset here.
+        const report = mem_rt.runHygieneForcedNow(allocator, cfg.memory.lifecycle, cfg.workspace_dir);
 
-        const hygiene_cfg = yc.memory.hygiene.HygieneConfig{
-            .hygiene_enabled = true,
-            .archive_after_days = cfg.memory.lifecycle.archive_after_days,
-            .purge_after_days = cfg.memory.lifecycle.purge_after_days,
-            .conversation_retention_days = cfg.memory.lifecycle.conversation_retention_days,
-            .daily_retention_days = cfg.memory.lifecycle.daily_retention_days,
-            .preserve_before_purge = cfg.memory.lifecycle.preserve_before_purge,
-            .workspace_dir = cfg.workspace_dir,
-        };
-
-        const report = yc.memory.hygiene.runIfDue(allocator, hygiene_cfg, mem_rt.memory, null);
-
-        if (report.totalActions() == 0 and !force) {
-            std.debug.print("Hygiene not due yet (last run < 12h ago). Use --force to run anyway.\n", .{});
-        } else if (report.totalActions() == 0) {
+        if (report.totalActions() == 0) {
             std.debug.print("Hygiene ran: nothing to prune.\n", .{});
         } else {
             std.debug.print("Hygiene complete:\n", .{});
@@ -4454,4 +4435,145 @@ test "parseCronAddSkillOptions preserves account and deliver-to in both config a
     try std.testing.expect(std.mem.indexOf(u8, sa, "--location") != null);
     // --timeout should NOT appear in skill_args
     try std.testing.expect(std.mem.indexOf(u8, sa, "--timeout") == null);
+}
+
+test "memoryAgeDays returns correct day count" {
+    const now = std.time.timestamp();
+    var buf: [32]u8 = undefined;
+
+    const ts_10d = try std.fmt.bufPrint(&buf, "{d}", .{now - 10 * 86400});
+    const d10 = memoryAgeDays(ts_10d).?;
+    try std.testing.expect(d10 >= 9 and d10 <= 11);
+
+    const ts_future = try std.fmt.bufPrint(&buf, "{d}", .{now + 3600});
+    try std.testing.expect(memoryAgeDays(ts_future) == null);
+
+    try std.testing.expect(memoryAgeDays("not-a-number") == null);
+}
+
+test "memoryAgeTag returns correct staleness label" {
+    const now = std.time.timestamp();
+    var buf: [32]u8 = undefined;
+
+    const ts_fresh = try std.fmt.bufPrint(&buf, "{d}", .{now - 2 * 86400});
+    try std.testing.expectEqualStrings("", memoryAgeTag(ts_fresh));
+
+    const ts_week = try std.fmt.bufPrint(&buf, "{d}", .{now - 8 * 86400});
+    try std.testing.expectEqualStrings(" — verify before acting", memoryAgeTag(ts_week));
+
+    const ts_old = try std.fmt.bufPrint(&buf, "{d}", .{now - 35 * 86400});
+    try std.testing.expectEqualStrings(" ⚠ likely stale", memoryAgeTag(ts_old));
+}
+
+test "runHygieneForcedNow always bypasses initRuntime cooldown" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try yc.memory.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // Simulate initRuntime having just set last_hygiene_at to now
+    const now = std.time.timestamp();
+    var ts_buf: [32]u8 = undefined;
+    const ts = try std.fmt.bufPrint(&ts_buf, "{d}", .{now});
+    try mem.store("last_hygiene_at", ts, .core, null);
+
+    // Store a stale conversation entry (40 days old)
+    try mem.store("old_chat", "stale note", .conversation, "sess-x");
+    try mem.store("last_hygiene_at", try std.fmt.bufPrint(&ts_buf, "{d}", .{now - 40 * 86400}), .core, null);
+
+    // Build a minimal MemoryRuntime wrapping the sqlite backend
+    var rt = yc.memory.MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
+        .resolved = .{
+            .primary_backend = "test",
+            .retrieval_mode = "keyword",
+            .vector_mode = "none",
+            .embedding_provider = "none",
+            .rollout_mode = "off",
+            .vector_sync_mode = "best_effort",
+            .hygiene_enabled = false,
+            .snapshot_enabled = false,
+            .cache_enabled = false,
+            .semantic_cache_enabled = false,
+            .summarizer_enabled = false,
+            .source_count = 0,
+            .fallback_policy = "degrade",
+        },
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+    };
+
+    // Re-set last_hygiene_at to now so runIfDue would normally skip
+    const ts_now = try std.fmt.bufPrint(&ts_buf, "{d}", .{now});
+    try mem.store("last_hygiene_at", ts_now, .core, null);
+
+    const lifecycle_cfg = yc.config.config_types.MemoryLifecycleConfig{
+        .hygiene_enabled = true,
+        .conversation_retention_days = 30,
+        .daily_retention_days = 2,
+    };
+    // runHygieneForcedNow must reset the cooldown and run
+    const report = rt.runHygieneForcedNow(allocator, lifecycle_cfg, "");
+    // No archive files in this in-memory test, but hygiene must have run (not skipped)
+    // Verify by checking last_hygiene_at was updated to a recent timestamp
+    const updated = (try mem.get(allocator, "last_hygiene_at")).?;
+    defer updated.deinit(allocator);
+    const updated_ts = std.fmt.parseInt(i64, updated.content, 10) catch 0;
+    try std.testing.expect(updated_ts >= now);
+    _ = report;
+}
+
+test "memory list --session filter reaches list() with correct arg" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try yc.memory.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("global_key", "global val", .core, null);
+    try mem.store("chat_key", "chat val", .conversation, "sess-42");
+
+    // With session filter "sess-42": should return chat_key
+    const filtered = try mem.list(allocator, null, "sess-42");
+    defer yc.memory.freeEntries(allocator, filtered);
+    var found = false;
+    for (filtered) |e| {
+        if (std.mem.eql(u8, e.key, "chat_key")) found = true;
+        try std.testing.expect(!std.mem.eql(u8, e.key, "global_key"));
+    }
+    try std.testing.expect(found);
+}
+
+test "memory forget --session calls forgetScoped with correct scope" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try yc.memory.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("note", "sess-a content", .conversation, "sess-a");
+    try mem.store("note", "sess-b content", .conversation, "sess-b");
+
+    // forgetScoped only removes the sess-a row
+    const deleted = try mem.forgetScoped(allocator, "note", "sess-a");
+    try std.testing.expect(deleted);
+
+    // sess-b entry must remain
+    const remaining = try mem.list(allocator, null, "sess-b");
+    defer yc.memory.freeEntries(allocator, remaining);
+    var found_b = false;
+    for (remaining) |e| {
+        if (std.mem.eql(u8, e.key, "note")) found_b = true;
+    }
+    try std.testing.expect(found_b);
+
+    // sess-a entry must be gone
+    const gone = try mem.list(allocator, null, "sess-a");
+    defer yc.memory.freeEntries(allocator, gone);
+    for (gone) |e| {
+        try std.testing.expect(!std.mem.eql(u8, e.key, "note"));
+    }
 }

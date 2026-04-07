@@ -707,6 +707,48 @@ pub const MemoryRuntime = struct {
         return reindexed;
     }
 
+    /// Force a hygiene pass now, bypassing the 12-hour cooldown window.
+    /// Equivalent to what initRuntime() does on startup but always runs regardless
+    /// of when hygiene last ran. Wires the preserve-to-vector hook from internal
+    /// vector plane components so preserved chunks are synced.
+    /// Returns the hygiene report (totalActions() == 0 means nothing to prune).
+    pub fn runHygieneForcedNow(
+        self: *MemoryRuntime,
+        allocator: std.mem.Allocator,
+        lifecycle_cfg: @import("../config_types.zig").MemoryLifecycleConfig,
+        workspace_dir: []const u8,
+    ) HygieneReport {
+        // Reset cooldown so runIfDue() proceeds unconditionally
+        self.memory.store("last_hygiene_at", "0", .core, null) catch {};
+
+        var preserve_sync_ctx = HygienePreserveSyncCtx{
+            .outbox = self._outbox,
+            .embed_provider = self._embedding_provider,
+            .vector_store = self._vector_store,
+            .circuit_breaker = self._circuit_breaker,
+        };
+        const preserve_sync_hook: ?hygiene.PreserveSyncHook = if (lifecycle_cfg.preserve_before_purge and
+            (self._outbox != null or (self._embedding_provider != null and self._vector_store != null)))
+            .{
+                .ptr = @ptrCast(&preserve_sync_ctx),
+                .callback = syncPreservedChunkToVector,
+            }
+        else
+            null;
+
+        const hygiene_cfg = hygiene.HygieneConfig{
+            .hygiene_enabled = true,
+            .archive_after_days = lifecycle_cfg.archive_after_days,
+            .purge_after_days = lifecycle_cfg.purge_after_days,
+            .preserve_before_purge = lifecycle_cfg.preserve_before_purge,
+            .conversation_retention_days = lifecycle_cfg.conversation_retention_days,
+            .daily_retention_days = lifecycle_cfg.daily_retention_days,
+            .workspace_dir = workspace_dir,
+        };
+
+        return hygiene.runIfDue(allocator, hygiene_cfg, self.memory, preserve_sync_hook);
+    }
+
     /// Enqueue a key for vector sync via the outbox (if configured).
     pub fn enqueueVectorSync(self: *MemoryRuntime, key: []const u8, session_id: ?[]const u8, operation: []const u8) void {
         const ob = self._outbox orelse return;
