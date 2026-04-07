@@ -1671,10 +1671,8 @@ pub const Agent = struct {
             defer if (capabilities_section) |section| self.allocator.free(section);
 
             const tz_for_log = if (cfg_for_prompt_ptr) |cfg_ptr| cfg_ptr.agent.timezone else "UTC";
-            log.info("system prompt rebuild session={s} timezone={s}", .{
-                self.memory_session_id orelse "none",
-                tz_for_log,
-            });
+            const session_hash_sp: u64 = if (self.memory_session_id) |sid| std.hash.Wyhash.hash(0, sid) else 0;
+            log.info("system prompt rebuild session=0x{x} timezone={s}", .{ session_hash_sp, tz_for_log });
 
             const full_system = try prompt.buildSystemPrompt(self.allocator, .{
                 .workspace_dir = self.workspace_dir,
