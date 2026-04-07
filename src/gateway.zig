@@ -2694,7 +2694,7 @@ fn handleCronList(ctx: *WebhookHandlerContext) void {
             defer cron_mod.closeCronDb(d);
             used_db = true;
             var buf: std.ArrayListUnmanaged(u8) = .empty;
-            cron_mod.dbListJobsJson(d, &buf, ctx.req_allocator) catch {
+            cron_mod.dbListJobsJson(d, &buf, ctx.req_allocator, 0) catch {
                 ctx.response_status = "500 Internal Server Error";
                 ctx.response_body = "{\"error\":\"db query failed\"}";
                 return;
