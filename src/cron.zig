@@ -1528,6 +1528,30 @@ pub fn resolveSkillExec(allocator: std.mem.Allocator, skill_name: ?[]const u8, s
     return resolveSkillExecFrom(allocator, skill_name, skill_args, skills_dir, home);
 }
 
+/// Validate that a skill name is safe for path construction.
+/// Rejects names containing path separators, null bytes, control characters, or "..".
+fn validateSkillNameSafe(name: []const u8) !void {
+    if (name.len == 0 or std.mem.eql(u8, name, "..")) return error.UnsafeSkillName;
+    for (name) |ch| {
+        if (ch == '/' or ch == '\\' or ch == '"' or ch == 0 or ch < 0x20) return error.UnsafeSkillName;
+    }
+}
+
+/// Validate that skill_args contain no shell metacharacters.
+/// Skill args are passed verbatim into a sh -c string; any shell syntax
+/// in args would be executed. Only allow word characters, spaces, hyphens,
+/// underscores, dots, forward slashes, and @.
+fn validateSkillArgsSafe(args: []const u8) !void {
+    for (args) |ch| {
+        switch (ch) {
+            'a'...'z', 'A'...'Z', '0'...'9',
+            ' ', '-', '_', '.', '/', '@', '+', '=', ':',
+            => {},
+            else => return error.UnsafeSkillArgs,
+        }
+    }
+}
+
 /// Testable inner: reads SKILL.md from `skills_dir/<name>/SKILL.md` and builds
 /// `python3 <script_path> [args]`. `tilde_home` is used for `~/` expansion.
 pub fn resolveSkillExecFrom(
@@ -1538,6 +1562,8 @@ pub fn resolveSkillExecFrom(
     tilde_home: []const u8,
 ) ![]const u8 {
     const name = skill_name orelse return error.MissingSkillName;
+    try validateSkillNameSafe(name);
+    if (skill_args) |args| try validateSkillArgsSafe(args);
     const skill_md_path = try std.fmt.allocPrint(allocator, "{s}/{s}/SKILL.md", .{ skills_dir, name });
     defer allocator.free(skill_md_path);
 
@@ -7090,4 +7116,71 @@ test "dbLoadJobSpec persists and restores delivery_best_effort and session_targe
     try std.testing.expect(spec != null);
     try std.testing.expect(spec.?.delivery.best_effort == true);
     try std.testing.expectEqual(SessionTarget.main, spec.?.session_target);
+}
+
+test "validateSkillNameSafe rejects path traversal and empty names" {
+    try std.testing.expectError(error.UnsafeSkillName, validateSkillNameSafe(""));
+    try std.testing.expectError(error.UnsafeSkillName, validateSkillNameSafe(".."));
+    try std.testing.expectError(error.UnsafeSkillName, validateSkillNameSafe("../etc/passwd"));
+    try std.testing.expectError(error.UnsafeSkillName, validateSkillNameSafe("news/../../secret"));
+    try std.testing.expectError(error.UnsafeSkillName, validateSkillNameSafe("bad\x00name"));
+    try validateSkillNameSafe("news");
+    try validateSkillNameSafe("my-skill");
+    try validateSkillNameSafe("skill_v2");
+}
+
+test "validateSkillArgsSafe rejects shell metacharacters" {
+    try std.testing.expectError(error.UnsafeSkillArgs, validateSkillArgsSafe("; rm -rf /"));
+    try std.testing.expectError(error.UnsafeSkillArgs, validateSkillArgsSafe("$(whoami)"));
+    try std.testing.expectError(error.UnsafeSkillArgs, validateSkillArgsSafe("arg && evil"));
+    try std.testing.expectError(error.UnsafeSkillArgs, validateSkillArgsSafe("arg | cat /etc/passwd"));
+    try std.testing.expectError(error.UnsafeSkillArgs, validateSkillArgsSafe("`id`"));
+    try validateSkillArgsSafe("--deliver-to 7972814626 --account ping --account-topics");
+    try validateSkillArgsSafe("--lang zh");
+    try validateSkillArgsSafe("--mode record");
+}
+
+test "resolveSkillExecFrom rejects unsafe skill_name" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    try std.testing.expectError(
+        error.UnsafeSkillName,
+        resolveSkillExecFrom(allocator, "../evil", null, base, base),
+    );
+    try std.testing.expectError(
+        error.UnsafeSkillName,
+        resolveSkillExecFrom(allocator, "news/../../secret", null, base, base),
+    );
+}
+
+test "resolveSkillExecFrom rejects shell-injectable skill_args" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skills_dir = try std.fmt.allocPrint(allocator, "{s}/skills", .{base});
+    defer allocator.free(skills_dir);
+    try tmp.dir.makePath("skills/news");
+    try tmp.dir.writeFile(.{
+        .sub_path = "skills/news/SKILL.md",
+        .data = "# news\n\n## Script\n\n~/scripts/run.py\n",
+    });
+
+    try std.testing.expectError(
+        error.UnsafeSkillArgs,
+        resolveSkillExecFrom(allocator, "news", "; evil", skills_dir, base),
+    );
+    try std.testing.expectError(
+        error.UnsafeSkillArgs,
+        resolveSkillExecFrom(allocator, "news", "$(id)", skills_dir, base),
+    );
+    // Safe args should still work
+    const cmd = try resolveSkillExecFrom(allocator, "news", "--lang zh", skills_dir, base);
+    defer allocator.free(cmd);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "--lang zh") != null);
 }
