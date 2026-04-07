@@ -305,7 +305,11 @@ pub fn pruneDailyRows(allocator: std.mem.Allocator, mem: Memory, retention_days:
         if (std.mem.eql(u8, entry.key, LAST_HYGIENE_KEY)) continue;
         const ts = std.fmt.parseInt(i64, std.mem.trim(u8, entry.timestamp, " \t\r\n"), 10) catch continue;
         if (ts < cutoff_secs) {
-            _ = mem.forget(entry.key) catch continue;
+            // Use scoped delete to avoid wiping entries with the same key in other sessions.
+            _ = mem.forgetScoped(allocator, entry.key, entry.session_id) catch {
+                // Fall back to unscoped delete only when forgetScoped is not supported.
+                _ = mem.forget(entry.key) catch continue;
+            };
             pruned += 1;
         }
     }

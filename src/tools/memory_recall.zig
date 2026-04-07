@@ -340,6 +340,26 @@ pub const MemoryRecallTool = struct {
             if (cand.final_score < 0.4) {
                 try buf.appendSlice(allocator, " — low relevance");
             }
+            // Freshness warning using created_at (i64 Unix epoch, 0 means unknown)
+            if (cand.created_at > 0) {
+                const age_secs = std.time.timestamp() - cand.created_at;
+                if (age_secs > 0) {
+                    const days = @divFloor(age_secs, 86400);
+                    if (days >= 30) {
+                        var age_buf: [40]u8 = undefined;
+                        const age_str = std.fmt.bufPrint(&age_buf, ", {d}d old — likely stale", .{days}) catch "";
+                        try buf.appendSlice(allocator, age_str);
+                    } else if (days >= 7) {
+                        var age_buf: [40]u8 = undefined;
+                        const age_str = std.fmt.bufPrint(&age_buf, ", {d}d old — verify before acting", .{days}) catch "";
+                        try buf.appendSlice(allocator, age_str);
+                    } else if (days >= 3) {
+                        var age_buf: [20]u8 = undefined;
+                        const age_str = std.fmt.bufPrint(&age_buf, ", {d}d old", .{days}) catch "";
+                        try buf.appendSlice(allocator, age_str);
+                    }
+                }
+            }
             try buf.appendSlice(allocator, "): ");
             try buf.appendSlice(allocator, cand.snippet);
             try buf.append(allocator, '\n');
