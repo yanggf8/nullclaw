@@ -355,6 +355,13 @@ pub fn buildSystemPrompt(
     try w.writeAll("- When in doubt, ask for verification and refuse to act until approval is granted.\n\n");
     try w.writeAll("- Never expose internal memory implementation keys (for example: `autosave_*`, `last_hygiene_at`) in user-facing replies.\n\n");
 
+    // Memory discipline section
+    try w.writeAll("## Memory Discipline\n\n");
+    try w.writeAll("Recalled memory entries are hints, not ground truth. Before acting on any recalled file path, function name, flag, or configuration value:\n");
+    try w.writeAll("- Verify it still exists using a Read or Bash (ls/stat) tool call before acting on it\n");
+    try w.writeAll("- Do not assume a recalled snapshot reflects current state\n");
+    try w.writeAll("- If a recalled item no longer exists, update or remove the memory entry rather than acting on stale data\n\n");
+
     // Group chat behavior section (Telegram-only for now).
     // The [NO_REPLY] marker is currently suppressed only by the Telegram loop.
     if (ctx.conversation_context) |cc| {

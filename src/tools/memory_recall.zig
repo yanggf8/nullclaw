@@ -16,7 +16,7 @@ pub const MemoryRecallTool = struct {
     mem_rt: ?*mem_root.MemoryRuntime = null,
 
     pub const tool_name = "memory_recall";
-    pub const tool_description = "Search long-term memory for relevant facts, preferences, or context.";
+    pub const tool_description = "Search long-term memory for relevant facts, preferences, or context. Results are snapshots from past sessions — verify any file paths, function names, or flags before acting on them.";
     pub const tool_params =
         \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"},"session_id":{"type":"string","description":"Optional session scope. Omit to search the current session plus global memory; pass an empty string to search only the current thread session."}},"required":["query"]}
     ;
@@ -252,6 +252,7 @@ pub const MemoryRecallTool = struct {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
 
+        try buf.appendSlice(allocator, "[Memory] Results are past snapshots — verify paths/facts before acting.\n");
         try buf.appendSlice(allocator, "Found ");
         var count_buf: [20]u8 = undefined;
         const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{visible_count}) catch "?";
@@ -286,6 +287,7 @@ pub const MemoryRecallTool = struct {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
 
+        try buf.appendSlice(allocator, "[Memory] Results are past snapshots — verify paths/facts before acting.\n");
         try buf.appendSlice(allocator, "Found ");
         var count_buf: [20]u8 = undefined;
         const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{visible_count}) catch "?";
