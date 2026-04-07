@@ -1670,6 +1670,12 @@ pub const Agent = struct {
             ) catch null;
             defer if (capabilities_section) |section| self.allocator.free(section);
 
+            const tz_for_log = if (cfg_for_prompt_ptr) |cfg_ptr| cfg_ptr.agent.timezone else "UTC";
+            log.info("system prompt rebuild session={s} timezone={s}", .{
+                self.memory_session_id orelse "none",
+                tz_for_log,
+            });
+
             const full_system = try prompt.buildSystemPrompt(self.allocator, .{
                 .workspace_dir = self.workspace_dir,
                 .model_name = turn_model_name,
