@@ -771,6 +771,14 @@ fn gatewayStatus(allocator: std.mem.Allocator) void {
             std.debug.print("  State:       {s}\n", .{buf[0..len]});
         }
     }
+
+    // Always show agent timezone so misconfiguration is immediately visible.
+    const tz = cfg.agent.timezone;
+    if (std.mem.eql(u8, tz, "UTC")) {
+        std.debug.print("  Agent TZ:    UTC (default -- consider setting agents.defaults.timezone)\n", .{});
+    } else {
+        std.debug.print("  Agent TZ:    {s}\n", .{tz});
+    }
 }
 
 // ── Service ──────────────────────────────────────────────────────
