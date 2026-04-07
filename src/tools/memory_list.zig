@@ -78,7 +78,8 @@ pub const MemoryListTool = struct {
         for (entries) |entry| {
             if (!include_internal and isInternalEntry(entry)) continue;
             if (written >= shown) break;
-            try w.print("  {d}. {s} [{s}] {s}\n", .{ written + 1, entry.key, entry.category.toString(), entry.timestamp });
+            const age_tag = ageTag(entry.timestamp);
+            try w.print("  {d}. {s} [{s}] {s}{s}\n", .{ written + 1, entry.key, entry.category.toString(), entry.timestamp, age_tag });
             if (include_content) {
                 const preview = truncateUtf8(entry.content, 120);
                 try w.print("     {s}{s}\n", .{ preview, if (entry.content.len > preview.len) "..." else "" });
@@ -87,6 +88,14 @@ pub const MemoryListTool = struct {
         }
 
         return ToolResult{ .success = true, .output = try out.toOwnedSlice(allocator) };
+    }
+
+    fn ageTag(timestamp: []const u8) []const u8 {
+        const ts = std.fmt.parseInt(i64, std.mem.trim(u8, timestamp, " \t\r\n"), 10) catch return "";
+        const age_days = @divFloor(std.time.timestamp() - ts, 86400);
+        if (age_days >= 30) return " ⚠ likely stale";
+        if (age_days >= 7) return " — verify before acting";
+        return "";
     }
 
     fn isInternalEntry(entry: MemoryEntry) bool {
@@ -179,6 +188,31 @@ test "memory_list filters markdown-encoded internal keys in content" {
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "last_hygiene_at") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "**Name**: User") != null);
+}
+
+test "memory_list shows stale tag for old entries" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // Store an entry, then overwrite its timestamp to 40 days ago via raw store
+    try mem.store("old_fact", "something", .core, null);
+
+    // Manually check ageTag logic: a timestamp 40 days ago should be "likely stale"
+    const now = std.time.timestamp();
+    const forty_days_ago = now - 40 * 86400;
+    var ts_buf: [32]u8 = undefined;
+    const ts_str = try std.fmt.bufPrint(&ts_buf, "{d}", .{forty_days_ago});
+    try std.testing.expectEqualStrings(" ⚠ likely stale", MemoryListTool.ageTag(ts_str));
+
+    const seven_days_ago = now - 8 * 86400;
+    const ts_str2 = try std.fmt.bufPrint(&ts_buf, "{d}", .{seven_days_ago});
+    try std.testing.expectEqualStrings(" — verify before acting", MemoryListTool.ageTag(ts_str2));
+
+    const recent = now - 2 * 86400;
+    const ts_str3 = try std.fmt.bufPrint(&ts_buf, "{d}", .{recent});
+    try std.testing.expectEqualStrings("", MemoryListTool.ageTag(ts_str3));
 }
 
 test "memory_list filters bootstrap internal keys by default" {

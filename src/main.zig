@@ -43,7 +43,7 @@ const CRON_SUBCOMMANDS = "list|status|job-status|schedule|add|add-agent|add-skil
 const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
-const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|drain-outbox|forget";
+const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|drain-outbox|forget|run-hygiene";
 const HISTORY_SUBCOMMANDS = "list|show";
 const WORKSPACE_SUBCOMMANDS = "edit|reset-md";
 const MODELS_SUBCOMMANDS = "list|info|benchmark|refresh";
@@ -1554,10 +1554,13 @@ fn printMemoryUsage() void {
         \\  search <query> [--limit N] [--json]
         \\                                Run runtime retrieval (keyword/hybrid)
         \\  get <key> [--json]            Show a single memory entry by key
-        \\  list [--category C] [--limit N] [--json]
+        \\  list [--category C] [--session S] [--limit N] [--json] [--show-age]
         \\                                List memory entries (default limit: 20)
         \\  drain-outbox                  Drain durable vector outbox queue
-        \\  forget <key>                  Delete entry from primary memory (if backend supports)
+        \\  forget <key> [--session <id>] Delete entry from primary memory (if backend supports)
+        \\                                --session limits deletion to a specific session scope
+        \\  run-hygiene [--force]         Run memory hygiene pass now
+        \\                                --force skips the 12h cooldown window
         \\
     , .{MEMORY_SUBCOMMANDS}), .{});
 }
@@ -1679,6 +1682,20 @@ fn writeJsonNullableF32(out: anytype, value: ?f32) !void {
     } else {
         try out.writeAll("null");
     }
+}
+
+fn memoryAgeDays(timestamp: []const u8) ?i64 {
+    const ts = std.fmt.parseInt(i64, std.mem.trim(u8, timestamp, " \t\r\n"), 10) catch return null;
+    const age_secs = std.time.timestamp() - ts;
+    if (age_secs < 0) return null;
+    return @divFloor(age_secs, 86400);
+}
+
+fn memoryAgeTag(timestamp: []const u8) []const u8 {
+    const d = memoryAgeDays(timestamp) orelse return "";
+    if (d >= 30) return " ⚠ likely stale";
+    if (d >= 7) return " — verify before acting";
+    return "";
 }
 
 fn writeJsonError(code: []const u8, message: []const u8, backend: ?[]const u8) void {
@@ -1884,10 +1901,26 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
 
     if (std.mem.eql(u8, subcmd, "forget")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw memory forget <key>\n", .{});
+            std.debug.print("Usage: nullclaw memory forget <key> [--session <id>]\n", .{});
             std.process.exit(1);
         }
         const key = sub_args[1];
+        var session_filter: ?[]const u8 = null;
+
+        var i: usize = 2;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--session")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory forget <key> [--session <id>]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                session_filter = sub_args[i];
+            } else {
+                std.debug.print("Unknown option for memory forget: {s}\n", .{sub_args[i]});
+                std.process.exit(1);
+            }
+        }
 
         var vector_delete_scopes: std.ArrayListUnmanaged(?[]u8) = .empty;
         defer {
@@ -1895,6 +1928,25 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 if (sid_opt) |sid| allocator.free(sid);
             }
             vector_delete_scopes.deinit(allocator);
+        }
+
+        if (session_filter) |sid| {
+            // Scoped delete: only remove the entry for this specific session
+            const deleted = mem_rt.memory.forgetScoped(allocator, key, sid) catch |err| {
+                if (err == error.NotSupported) {
+                    std.debug.print("This memory backend does not support scoped deletion (--session).\n", .{});
+                    std.process.exit(1);
+                }
+                std.debug.print("memory forget --session failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            if (deleted) {
+                mem_rt.deleteFromVectorStore(key, sid);
+                std.debug.print("Deleted memory entry: {s} (session: {s})\n", .{ key, sid });
+            } else {
+                std.debug.print("Entry not deleted (missing or backend is append-only): {s} (session: {s})\n", .{ key, sid });
+            }
+            return;
         }
 
         const existing_entries = mem_rt.memory.list(allocator, null, null) catch |err| {
@@ -1936,6 +1988,56 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.debug.print("Deleted memory entry: {s}\n", .{key});
         } else {
             std.debug.print("Entry not deleted (missing or backend is append-only): {s}\n", .{key});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "run-hygiene")) {
+        var force = false;
+        var i: usize = 1;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--force")) {
+                force = true;
+            } else {
+                std.debug.print("Unknown option for memory run-hygiene: {s}\n", .{sub_args[i]});
+                std.process.exit(1);
+            }
+        }
+
+        if (force) {
+            // Reset cooldown so runIfDue proceeds unconditionally
+            mem_rt.memory.store("last_hygiene_at", "0", .core, null) catch |err| {
+                std.debug.print("Failed to reset hygiene timestamp: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+        }
+
+        const hygiene_cfg = yc.memory.hygiene.HygieneConfig{
+            .hygiene_enabled = true,
+            .archive_after_days = cfg.memory.lifecycle.archive_after_days,
+            .purge_after_days = cfg.memory.lifecycle.purge_after_days,
+            .conversation_retention_days = cfg.memory.lifecycle.conversation_retention_days,
+            .daily_retention_days = cfg.memory.lifecycle.daily_retention_days,
+            .preserve_before_purge = cfg.memory.lifecycle.preserve_before_purge,
+            .workspace_dir = cfg.workspace_dir,
+        };
+
+        const report = yc.memory.hygiene.runIfDue(allocator, hygiene_cfg, mem_rt.memory, null);
+
+        if (report.totalActions() == 0 and !force) {
+            std.debug.print("Hygiene not due yet (last run < 12h ago). Use --force to run anyway.\n", .{});
+        } else if (report.totalActions() == 0) {
+            std.debug.print("Hygiene ran: nothing to prune.\n", .{});
+        } else {
+            std.debug.print("Hygiene complete:\n", .{});
+            if (report.archived_memory_files > 0)
+                std.debug.print("  archived_memory_files:    {d}\n", .{report.archived_memory_files});
+            if (report.purged_memory_archives > 0)
+                std.debug.print("  purged_memory_archives:   {d}\n", .{report.purged_memory_archives});
+            if (report.pruned_conversation_rows > 0)
+                std.debug.print("  pruned_conversation_rows: {d}\n", .{report.pruned_conversation_rows});
+            if (report.pruned_daily_rows > 0)
+                std.debug.print("  pruned_daily_rows:        {d}\n", .{report.pruned_daily_rows});
         }
         return;
     }
@@ -1994,13 +2096,15 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (std.mem.eql(u8, subcmd, "list")) {
         var limit: usize = 20;
         var category_opt: ?yc.memory.MemoryCategory = null;
+        var session_filter: ?[]const u8 = null;
         var json_mode = false;
+        var show_age = false;
 
         var i: usize = 1;
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--limit")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--json]\n", .{});
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--session S] [--limit N] [--json] [--show-age]\n", .{});
                     std.process.exit(1);
                 }
                 i += 1;
@@ -2010,20 +2114,29 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 };
             } else if (std.mem.eql(u8, sub_args[i], "--category")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--json]\n", .{});
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--session S] [--limit N] [--json] [--show-age]\n", .{});
                     std.process.exit(1);
                 }
                 i += 1;
                 category_opt = yc.memory.MemoryCategory.fromString(sub_args[i]);
+            } else if (std.mem.eql(u8, sub_args[i], "--session")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--session S] [--limit N] [--json] [--show-age]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                session_filter = sub_args[i];
             } else if (std.mem.eql(u8, sub_args[i], "--json")) {
                 json_mode = true;
+            } else if (std.mem.eql(u8, sub_args[i], "--show-age")) {
+                show_age = true;
             } else {
                 std.debug.print("Unknown option for memory list: {s}\n", .{sub_args[i]});
                 std.process.exit(1);
             }
         }
 
-        const entries = mem_rt.memory.list(allocator, category_opt, null) catch |err| {
+        const entries = mem_rt.memory.list(allocator, category_opt, session_filter) catch |err| {
             std.debug.print("memory list failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
@@ -2048,6 +2161,14 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 writeJsonString(out, e.content) catch return;
                 out.writeAll(",\"session_id\":") catch return;
                 writeJsonNullableString(out, e.session_id) catch return;
+                if (show_age) {
+                    const age_d = memoryAgeDays(e.timestamp);
+                    if (age_d) |d| {
+                        out.print(",\"age_days\":{d}", .{d}) catch return;
+                    } else {
+                        out.writeAll(",\"age_days\":null") catch return;
+                    }
+                }
                 out.writeAll("}") catch return;
             }
             out.writeAll("]\n") catch return;
@@ -2057,14 +2178,27 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             for (entries[0..shown], 0..) |e, idx| {
                 const preview_len = @min(@as(usize, 120), e.content.len);
                 const preview = e.content[0..preview_len];
-                std.debug.print("  {d}. {s} [{s}] {s}\n     {s}{s}\n", .{
-                    idx + 1,
-                    e.key,
-                    e.category.toString(),
-                    e.timestamp,
-                    preview,
-                    if (e.content.len > preview_len) "..." else "",
-                });
+                if (show_age) {
+                    const age_tag = memoryAgeTag(e.timestamp);
+                    std.debug.print("  {d}. {s} [{s}] {s}{s}\n     {s}{s}\n", .{
+                        idx + 1,
+                        e.key,
+                        e.category.toString(),
+                        e.timestamp,
+                        age_tag,
+                        preview,
+                        if (e.content.len > preview_len) "..." else "",
+                    });
+                } else {
+                    std.debug.print("  {d}. {s} [{s}] {s}\n     {s}{s}\n", .{
+                        idx + 1,
+                        e.key,
+                        e.category.toString(),
+                        e.timestamp,
+                        preview,
+                        if (e.content.len > preview_len) "..." else "",
+                    });
+                }
             }
         }
         return;
