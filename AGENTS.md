@@ -409,14 +409,26 @@ MCP tools are registered at agent startup as `mcp_<server>_<tool>` (e.g., `mcp_p
 - 21 tools registered: navigate, snapshot, click, type, screenshot, network requests, etc.
 - Use for deep retrieval when web search and HTTP fetch both fail (e.g., JS-rendered pages, paywalled previews)
 
-## 11) Privacy and Sensitive Data (Required)
+## 11) Skill Execution Security
+
+Skill jobs run scripts via `sh -c`. Two invariants are enforced in `resolveSkillExecFrom` (`src/cron.zig`):
+
+**Skill name validation** (`validateSkillNameSafe`): rejects names containing `/`, `\`, `..`, null bytes, or control characters before constructing the SKILL.md path. Prevents path traversal out of `~/.nullclaw/skills/`.
+
+**Skill args validation** (`validateSkillArgsSafe`): rejects `skill_args` containing shell metacharacters (`;`, `&&`, `$()`, backticks, `|`, `>`, etc.) before interpolating args into the `sh -c` string. Only alphanumerics, spaces, `-`, `_`, `.`, `/`, `@`, `+`, `=`, `:` are permitted.
+
+Both validators return typed errors (`UnsafeSkillName`, `UnsafeSkillArgs`) that propagate as job resolution failures — the job is marked `error` and an operator alert is sent.
+
+**When adding a new skill execution path**: always call both validators before constructing any path or shell string. The existing `validateSkillName` in `src/skills.zig` covers the skills install/list surface; `validateSkillNameSafe`/`validateSkillArgsSafe` in `src/cron.zig` cover the execution surface. Do not bypass either.
+
+## 12) Privacy and Sensitive Data (Required)
 
 - Never commit real API keys, tokens, credentials, personal data, or private URLs.
 - Use neutral placeholders in tests: `"test-key"`, `"example.com"`, `"user_a"`.
 - Test fixtures must be impersonal and system-focused.
 - Review `git diff --cached` before push for accidental sensitive strings.
 
-## 12) Anti-Patterns (Do Not)
+## 13) Anti-Patterns (Do Not)
 
 - Do not add C dependencies or large Zig packages without strong justification (binary size impact).
 - Do not return vtable interfaces pointing to temporaries — dangling pointer.
@@ -430,7 +442,7 @@ MCP tools are registered at agent startup as `mcp_<server>_<tool>` (e.g., `mcp_p
 - Do not use `SQLITE_TRANSIENT` in auto-translated C code — use `SQLITE_STATIC` (null) instead.
 - Do not use heap-allocated output buffers in `ChaCha20Poly1305.decrypt` — use stack buffer + `allocator.dupe()`.
 
-## 13) Handoff Template (Agent → Agent / Maintainer)
+## 14) Handoff Template (Agent → Agent / Maintainer)
 
 When handing off work, include:
 
@@ -440,7 +452,7 @@ When handing off work, include:
 4. Remaining risks / unknowns
 5. Next recommended action
 
-## 14) Vibe Coding Guardrails
+## 15) Vibe Coding Guardrails
 
 When working in fast iterative mode:
 
