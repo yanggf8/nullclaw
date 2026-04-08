@@ -113,7 +113,7 @@ Notes:
 | `nullclaw cron run <id>` | Run a task immediately |
 | `nullclaw cron pause <id>` / `resume <id>` | Pause or resume a task |
 | `nullclaw cron remove <id>` | Delete a task |
-| `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>]` | Update an existing task |
+| `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>]` | Update an existing task; `--enable` also clears the paused flag, `--disable` sets it |
 | `nullclaw cron runs <id> [--limit N] [--json]` | Show recent run history for a task |
 | `nullclaw cron backup` | Export all jobs to a timestamped seed file |
 | `nullclaw cron restore [<file>]` | Restore jobs from a seed file |

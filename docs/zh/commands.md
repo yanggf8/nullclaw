@@ -99,7 +99,7 @@
 | `nullclaw cron run <id>` | 立即执行指定任务 |
 | `nullclaw cron pause <id>` / `resume <id>` | 暂停 / 恢复任务 |
 | `nullclaw cron remove <id>` | 删除任务 |
-| `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>]` | 更新已有任务 |
+| `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>]` | 更新已有任务；`--enable` 同时清除 paused 标志，`--disable` 同时设置 |
 | `nullclaw cron runs <id> [--limit N] [--json]` | 查看任务最近执行记录 |
 | `nullclaw cron backup` | 将所有任务导出为带时间戳的 seed 文件 |
 | `nullclaw cron restore [<file>]` | 从 seed 文件恢复任务 |

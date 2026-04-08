@@ -89,6 +89,19 @@ curl -X POST \
 
 `/cron/add` also accepts one-shot payloads such as `{"delay":"10m","command":"echo later"}` and agent payloads such as `{"expression":"0 * * * *","prompt":"Summarize alerts","model":"openrouter/anthropic/claude-sonnet-4"}`.
 
+Skill jobs can be added without a `command` or `prompt` field — only `skill_name` is required:
+
+```bash
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"expression":"35 13 * * 1-5","job_type":"skill","skill_name":"cct2","skill_args":"--mode pre-market","delivery_channel":"telegram","delivery_to":"7972814626"}' \
+  http://127.0.0.1:3000/cron/add
+```
+
+Skill failure alerts are sent to the job's own `delivery_to` target. If the job has no delivery config, alerts fall back to the global `scheduler.alert_channel` / `scheduler.alert_to` in config.
+
+`/cron/update` with `{"enabled": true}` also clears the `paused` flag, and `{"enabled": false}` sets it. This keeps `enable`/`disable` consistent with `pause`/`resume` — a job re-enabled via update will always fire at its next scheduled time.
+
 ### 6) Max webhook delivery
 
 Single-account example:

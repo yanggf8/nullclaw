@@ -75,6 +75,19 @@ curl -X POST \
 
 `/cron/add` 也支持一次性任务，例如 `{"delay":"10m","command":"echo later"}`，以及 agent 任务，例如 `{"expression":"0 * * * *","prompt":"Summarize alerts","model":"openrouter/anthropic/claude-sonnet-4"}`。
 
+技能任务无需 `command` 或 `prompt` 字段，只需提供 `skill_name`：
+
+```bash
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"expression":"35 13 * * 1-5","job_type":"skill","skill_name":"cct2","skill_args":"--mode pre-market","delivery_channel":"telegram","delivery_to":"7972814626"}' \
+  http://127.0.0.1:3000/cron/add
+```
+
+技能任务失败时，告警优先投递到任务自身的 `delivery_to` 目标；若任务未配置投递目标，则回退到配置中的 `scheduler.alert_channel` / `scheduler.alert_to`。
+
+`/cron/update` 传入 `{"enabled": true}` 会同时清除 `paused` 标志，传入 `{"enabled": false}` 则同时设置。这样 `--enable`/`--disable` 与 `pause`/`resume` 的语义保持一致——通过 update 重新启用的任务将在下次计划时间正常触发。
+
 ### 6) Max webhook 投递
 
 单账号示例：
