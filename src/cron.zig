@@ -3318,14 +3318,14 @@ pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool) !
         return;
     }
 
-    // Human-readable path: always query DB directly — gateway path adds log prefix that breaks pipes.
+    // Human-readable path: weekly chronological table, always DB-direct (no log prefix).
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
     const stdout = std.fs.File.stdout();
 
-    // Check scheduler status and warn user if needed (stderr, not stdout).
+    // Warn about scheduler health on stderr so it doesn't pollute piped output.
     const sched_status = checkSchedulerStatus(allocator);
     if (sched_status.config_probe_error) |err_name| {
         log.warn("Cannot inspect scheduler config: {s}", .{err_name});
@@ -3338,45 +3338,86 @@ pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool) !
     }
 
     const all_jobs = scheduler.listJobs();
-    const jobs = if (limit > 0 and limit < all_jobs.len) all_jobs[0..limit] else all_jobs;
-    if (jobs.len == 0) {
+    if (all_jobs.len == 0) {
         stdout.writeAll("No scheduled jobs.\n") catch {};
         stdout.writeAll("  nullclaw cron add '*/10 * * * *' 'echo hello'\n") catch {};
         stdout.writeAll("  nullclaw cron once 30m 'echo reminder'\n") catch {};
         return;
     }
 
-    const display_tz: i64 = if (jobs.len > 0) @as(i64, jobs[0].tz_offset_s) else 8 * 3600;
+    const now = std.time.timestamp();
+    const display_tz: i64 = if (all_jobs.len > 0) @as(i64, all_jobs[0].tz_offset_s) else 8 * 3600;
+    const local_now = now + display_tz;
+    const day_start_local = local_now - @mod(local_now, 86400);
+    const week_start = day_start_local - display_tz;
+    const week_end = week_start + 7 * 86400;
+
+    const FireEntry = struct { fire_time: i64, job_idx: usize };
+    var entries: std.ArrayListUnmanaged(FireEntry) = .empty;
+    defer entries.deinit(allocator);
+
+    for (all_jobs, 0..) |job, i| {
+        if (job.paused) continue;
+        var cursor = week_start - 1;
+        var safety: u32 = 0;
+        while (safety < 200) : (safety += 1) {
+            const next = nextRunForCronExpressionTz(job.expression, cursor, job.tz_offset_s) catch break;
+            if (next >= week_end) break;
+            if (next > cursor) {
+                try entries.append(allocator, .{ .fire_time = next, .job_idx = i });
+                cursor = next;
+            } else break;
+        }
+    }
+
+    std.mem.sortUnstable(FireEntry, entries.items, {}, struct {
+        fn lessThan(_: void, a: FireEntry, b: FireEntry) bool {
+            return a.fire_time < b.fire_time;
+        }
+    }.lessThan);
+
+    // Apply limit after expansion so --limit N means "show first N fire events".
+    const show_entries = if (limit > 0 and limit < entries.items.len) entries.items[0..limit] else entries.items;
+
     const tz_label = formatTzLabel(display_tz);
+    var now_buf: [32]u8 = undefined;
+    const now_str = formatCstTime(now + display_tz, &now_buf);
     {
-        const hdr = try std.fmt.allocPrint(allocator, "Scheduled jobs ({d}, times in {s}):\n", .{ jobs.len, tz_label });
+        const hdr = try std.fmt.allocPrint(allocator, "Weekly schedule ({d} fires, now: {s} {s}):\n", .{ show_entries.len, now_str, tz_label });
         defer allocator.free(hdr);
         stdout.writeAll(hdr) catch {};
     }
     stdout.writeAll("─────────────────────────────────────────────────────────────────────────\n") catch {};
-    for (jobs) |job| {
-        const flags: []const u8 = blk: {
-            if (job.paused and job.one_shot) break :blk " [paused,one-shot]";
-            if (job.paused) break :blk " [paused]";
-            if (job.one_shot) break :blk " [one-shot]";
-            break :blk "";
-        };
-        const status = job.last_status orelse "never";
-        var next_buf: [32]u8 = undefined;
-        const next_str = formatCstTime(job.next_run_secs + display_tz, &next_buf);
+
+    const dow_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    for (show_entries) |entry| {
+        const job = all_jobs[entry.job_idx];
+        const job_tz: i64 = @as(i64, job.tz_offset_s);
+        var time_buf: [32]u8 = undefined;
+        const time_str = formatCstTime(entry.fire_time + job_tz, &time_buf);
+
+        const local_fire = entry.fire_time + job_tz;
+        const fire_epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(local_fire) };
+        const fire_day = fire_epoch.getEpochDay();
+        const weekday_num = @as(u3, @intCast((fire_day.day + 4) % 7));
+        const dow = dow_names[weekday_num];
+
         const label: []const u8 = switch (job.job_type) {
             .skill => job.skill_name orelse job.command,
             .agent => "agent",
             .shell => job.command,
         };
-        const line = try std.fmt.allocPrint(allocator, "  {s}  [{s}]  {s}  ({s})  last={s}{s}\n", .{
-            next_str,
-            job.job_type.asStr(),
-            label,
-            job.expression,
-            status,
-            flags,
-        });
+        const detail: []const u8 = switch (job.job_type) {
+            .skill => job.skill_args orelse "",
+            .agent => if (job.prompt) |p| p[0..@min(p.len, 40)] else job.command,
+            .shell => "",
+        };
+        const done: []const u8 = if (entry.fire_time < now) " [done]" else "";
+
+        const line = if (detail.len > 0)
+            try std.fmt.allocPrint(allocator, "  {s} {s}  [{s}] {s}  {s}{s}\n", .{ dow, time_str, job.job_type.asStr(), label, detail, done })
+        else
+            try std.fmt.allocPrint(allocator, "  {s} {s}  [{s}] {s}{s}\n", .{ dow, time_str, job.job_type.asStr(), label, done });
         defer allocator.free(line);
         stdout.writeAll(line) catch {};
     }
