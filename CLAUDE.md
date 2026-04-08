@@ -80,6 +80,7 @@ Defined in `src/root.zig`. Phases mirror deployment dependencies:
 - `src/memory/` - Layered architecture: **engines** (SQLite, Markdown, LRU, Redis, PostgreSQL, LanceDB, Lucid, ClickHouse, API, None) and **retrieval** (hybrid search, RRF, embeddings). Engines conditionally compiled via build flags.
 - `src/security/` - Policy enforcement (`policy.zig`), pairing (`pairing.zig`), encrypted secrets (`secrets.zig`), sandbox backends (`landlock.zig`, `firejail.zig`, `bubblewrap.zig`, `docker.zig`, `detect.zig`).
 - `src/agent/` - Agent loop internals: `dispatcher.zig` (tool call parsing), `compaction.zig` (history trimming), `prompt.zig` (system prompt builder), `memory_loader.zig` (context injection), `commands.zig` (agent-mode commands). Config defaults are `max_tool_iterations = 1000` and `max_history_messages = 100` (see `src/config_types.zig`).
+- `src/cron/` - DB-backed cron subsystem: `types.zig` (shared types: `CronJobSpec`, `DequeueResult`, `SessionTarget`), `db.zig` (SQLite vtable implementation), `root.zig` (CronBackend vtable interface), `factory.zig` (backend selection). The legacy in-memory `CronScheduler` lives in `src/cron.zig` (top-level, ~4500 lines). New work should target the DB backend in `src/cron/`.
 
 ### Dependency Direction
 
@@ -103,6 +104,7 @@ Key config sections: `models.providers` (API keys/endpoints), `agents` (named ag
 ## Zig 0.15.2 API Gotchas
 
 - `std.io.getStdOut()` does NOT exist. Use `std.fs.File.stdout()`.
+- Buffered stdout writer: `var buf: [N]u8 = undefined; var bw = std.fs.File.stdout().writer(&buf); const w = &bw.interface;` — use `w.print(...)` / `w.writeAll(...)`. `std.io.bufferedWriter` does not exist in 0.15.
 - HTTP client: `std.http.Client.fetch()` with `std.Io.Writer.Allocating`.
 - Child processes: `std.process.Child.init(argv, allocator)`, `.Pipe` (capitalized).
 - `ArrayListUnmanaged`: init with `.empty`, pass allocator to every method.
