@@ -502,6 +502,10 @@ pub const GatewayState = struct {
     // dbTickAndEnqueue, future handler rewrites). Populated in gateway.run().
     cron_db_path: ?[:0]const u8 = null,
 
+    // Working directory for DB-backed cron child processes — mirrors the
+    // shell_cwd used by the legacy in-memory scheduler path.
+    cron_workspace_dir: ?[]const u8 = null,
+
     // CronBackend vtable — set by gateway.run() after cron_db_path is populated.
     // runQueueWorker uses this for atomic dequeue+claim. Null until gateway.run() starts.
     cron_db_backend: ?cron_db_mod.DbCronBackend = null,
@@ -2732,7 +2736,6 @@ fn handleCronList(ctx: *WebhookHandlerContext) void {
     // ── Legacy in-memory scheduler path ──────────────────────────────
     if (!used_db) {
         const sched = lockRequestScheduler(ctx) orelse {
-            unlockRequestScheduler(ctx);
             ctx.response_status = "503 Service Unavailable";
             ctx.response_body = "{\"error\":\"scheduler not running\"}";
             return;
@@ -3778,6 +3781,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     shell_child.stdin_behavior = .Ignore;
                     shell_child.stdout_behavior = .Pipe;
                     shell_child.stderr_behavior = .Pipe;
+                    shell_child.cwd = state.cron_workspace_dir;
                     shell_child.spawn() catch |err| {
                         log.err("[{s}] exec failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false);
@@ -3836,7 +3840,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     const resolved_p = cron_mod.resolveSkillPrompt(arena, raw_p) catch null;
                     defer if (resolved_p) |rp| arena.free(rp);
                     const p = resolved_p orelse raw_p;
-                    const agent_result = cron_mod.runAgentJob(arena, null, p, spec.model, timeout) catch |err| {
+                    const agent_result = cron_mod.runAgentJob(arena, state.cron_workspace_dir, p, spec.model, timeout) catch |err| {
                         log.err("[{s}] agent failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false);
                         continue;
@@ -3846,10 +3850,18 @@ fn runQueueWorker(state: *GatewayState) void {
                     const agent_output = std.fmt.allocPrint(arena, "{s}\n\n`{s}`", .{ raw_agent, spec.id }) catch raw_agent;
                     var delivered = false;
                     if (state.event_bus) |eb| {
-                        delivered = cron_mod.deliverResult(state.allocator, delivery, agent_output, agent_result.success, eb) catch |err| blk: {
-                            log.err("[{s}] delivery failed: {s}", .{ spec.id, @errorName(err) });
-                            break :blk false;
-                        };
+                        const job_name = spec.id;
+                        const session_target: cron_mod.SessionTarget = @enumFromInt(@intFromEnum(spec.session_target));
+                        delivered = if (session_target == .main)
+                            cron_mod.deliverViaMainAgent(state.allocator, delivery, agent_output, agent_result.success, eb, job_name) catch |err| blk: {
+                                log.err("[{s}] main-session delivery failed: {s}", .{ spec.id, @errorName(err) });
+                                break :blk false;
+                            }
+                        else
+                            cron_mod.deliverResult(state.allocator, delivery, agent_output, agent_result.success, eb) catch |err| blk: {
+                                log.err("[{s}] delivery failed: {s}", .{ spec.id, @errorName(err) });
+                                break :blk false;
+                            };
                         if (!delivered and raw_agent.len > 0 and delivery.mode != .none and delivery.channel != null) {
                             log.warn("[{s}] output not delivered (len={d})", .{ spec.id, agent_output.len });
                         }
@@ -3882,6 +3894,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     skill_child.stdin_behavior = .Ignore;
                     skill_child.stdout_behavior = .Pipe;
                     skill_child.stderr_behavior = .Pipe;
+                    skill_child.cwd = state.cron_workspace_dir;
                     skill_child.spawn() catch |err| {
                         log.err("[{s}] skill exec failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false);
@@ -6376,6 +6389,11 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     // Resolve and store the cron DB path for DB-direct worker/handler access.
     state.cron_db_path = cron_mod.getCronDbPathZ(allocator) catch null;
     defer if (state.cron_db_path) |p| allocator.free(p);
+
+    // Workspace dir for DB-backed job children — mirrors shell_cwd of the legacy scheduler path.
+    if (config_ptr) |cfg| {
+        if (cfg.workspace_dir.len > 0) state.cron_workspace_dir = cfg.workspace_dir;
+    }
 
     // Initialize DbCronBackend so runQueueWorker gets atomic dequeue+claim.
     if (state.cron_db_path) |db_path| {

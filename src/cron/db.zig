@@ -104,7 +104,7 @@ pub const DbCronBackend = struct {
         const next_run = if (spec.next_run_secs_override != 0)
             spec.next_run_secs_override
         else
-            cron.nextRunForCronExpressionTz(spec.expression, now, spec.tz_offset_s) catch now + 60;
+            try cron.nextRunForCronExpressionTz(spec.expression, now, spec.tz_offset_s);
         const created_at = if (spec.created_at_s != 0) spec.created_at_s else now;
 
         const job = types.CronJob{
