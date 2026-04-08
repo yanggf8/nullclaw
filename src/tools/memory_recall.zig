@@ -191,8 +191,7 @@ pub const MemoryRecallTool = struct {
 
             const visible_candidates = countVisibleCandidates(merged_candidates.items);
             if (visible_candidates == 0) {
-                const msg = try std.fmt.allocPrint(allocator,
-                    "No memories found matching: {s}. Consider storing relevant facts with memory_store after this session.", .{query});
+                const msg = try std.fmt.allocPrint(allocator, "No memories found matching: {s}. Consider storing relevant facts with memory_store after this session.", .{query});
                 return ToolResult{ .success = true, .output = msg };
             }
 
@@ -224,8 +223,7 @@ pub const MemoryRecallTool = struct {
 
         const visible_entries = countVisibleEntries(merged_entries.items);
         if (visible_entries == 0) {
-            const msg = try std.fmt.allocPrint(allocator,
-                "No memories found matching: {s}. Consider storing relevant facts with memory_store after this session.", .{query});
+            const msg = try std.fmt.allocPrint(allocator, "No memories found matching: {s}. Consider storing relevant facts with memory_store after this session.", .{query});
             return ToolResult{ .success = true, .output = msg };
         }
 

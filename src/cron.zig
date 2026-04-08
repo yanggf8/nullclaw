@@ -1556,8 +1556,18 @@ fn validateSkillNameSafe(name: []const u8) !void {
 fn validateSkillArgsSafe(args: []const u8) !void {
     for (args) |ch| {
         switch (ch) {
-            'a'...'z', 'A'...'Z', '0'...'9',
-            ' ', '-', '_', '.', '/', '@', '+', '=', ':',
+            'a'...'z',
+            'A'...'Z',
+            '0'...'9',
+            ' ',
+            '-',
+            '_',
+            '.',
+            '/',
+            '@',
+            '+',
+            '=',
+            ':',
             => {},
             else => return error.UnsafeSkillArgs,
         }
@@ -7838,7 +7848,9 @@ test "dbListJobsJson respects limit parameter" {
     try dbListJobsJson(db, &buf2, std.testing.allocator, 2);
     // Count '{' occurrences — each job is one JSON object.
     var count2: usize = 0;
-    for (buf2.items) |ch| if (ch == '{') { count2 += 1; };
+    for (buf2.items) |ch| if (ch == '{') {
+        count2 += 1;
+    };
     try std.testing.expectEqual(@as(usize, 2), count2);
 
     // limit=0 should return all 3.
@@ -7846,7 +7858,9 @@ test "dbListJobsJson respects limit parameter" {
     defer buf0.deinit(std.testing.allocator);
     try dbListJobsJson(db, &buf0, std.testing.allocator, 0);
     var count0: usize = 0;
-    for (buf0.items) |ch| if (ch == '{') { count0 += 1; };
+    for (buf0.items) |ch| if (ch == '{') {
+        count0 += 1;
+    };
     try std.testing.expectEqual(@as(usize, 3), count0);
 }
 

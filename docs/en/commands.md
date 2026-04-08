@@ -140,8 +140,12 @@ Notes:
 | `nullclaw memory search "query" --limit 10` | Run retrieval against memory |
 | `nullclaw memory get <key>` | Show one memory entry |
 | `nullclaw memory list --category task --limit 20` | List memory entries by category |
+| `nullclaw memory list --session <id>` | List entries for a specific session scope |
+| `nullclaw memory list --show-age` | List entries with freshness age tags (≥7d, ≥30d) |
 | `nullclaw memory drain-outbox` | Drain the durable vector outbox queue |
-| `nullclaw memory forget <key>` | Delete one memory entry |
+| `nullclaw memory forget <key>` | Delete one memory entry (all scopes) |
+| `nullclaw memory forget <key> --session <id>` | Delete entry for a specific session scope only |
+| `nullclaw memory run-hygiene` | Run a memory hygiene pass now (bypasses 12h cooldown) |
 
 ### `workspace`, `capabilities`, `models`, `migrate`
 

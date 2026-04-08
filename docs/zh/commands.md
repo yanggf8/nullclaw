@@ -126,8 +126,12 @@
 | `nullclaw memory search "query" --limit 10` | 执行检索 |
 | `nullclaw memory get <key>` | 查看单条 memory |
 | `nullclaw memory list --category task --limit 20` | 按分类列出 memory |
+| `nullclaw memory list --session <id>` | 列出指定 session 范围的条目 |
+| `nullclaw memory list --show-age` | 列出条目并显示新鲜度标签（≥7d、≥30d） |
 | `nullclaw memory drain-outbox` | 清空 durable vector outbox 队列 |
-| `nullclaw memory forget <key>` | 删除一条 memory |
+| `nullclaw memory forget <key>` | 删除一条 memory（所有 session） |
+| `nullclaw memory forget <key> --session <id>` | 仅删除指定 session 范围的条目 |
+| `nullclaw memory run-hygiene` | 立即执行 memory hygiene（跳过 12h 冷却） |
 
 ### Workspace / Capabilities / Models / Migrate
 

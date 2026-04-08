@@ -275,8 +275,7 @@ pub fn checkConfigSemantics(
     // Timezone: warn when a channel bot is running with the silent UTC default.
     // UTC is almost never correct for end-users and causes wrong date/time reasoning.
     if (has_channel and std.mem.eql(u8, config.agent.timezone, "UTC")) {
-        try items.append(allocator, DiagItem.warn(cat,
-            "agents.defaults.timezone is UTC (the silent default) -- " ++
+        try items.append(allocator, DiagItem.warn(cat, "agents.defaults.timezone is UTC (the silent default) -- " ++
             "set it to your local offset (e.g. \"UTC+08:00\") so the agent reasons correctly about time"));
     } else if (!std.mem.eql(u8, config.agent.timezone, "UTC")) {
         try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
