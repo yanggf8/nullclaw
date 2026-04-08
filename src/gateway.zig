@@ -2533,7 +2533,13 @@ fn lockRequestScheduler(ctx: *WebhookHandlerContext) ?*cron_mod.CronScheduler {
     // Use tryLock to avoid blocking HTTP worker threads indefinitely.
     // Returns null (→ 503) if the scheduler is momentarily busy rather than
     // saturating the thread pool and hanging the entire gateway.
+    // Invariant: returns non-null IFF the lock is held. Callers must call
+    // unlockRequestScheduler() iff this returns non-null.
     if (!ctx.state.scheduler_mutex.tryLock()) return null;
+    if (ctx.state.scheduler == null) {
+        ctx.state.scheduler_mutex.unlock();
+        return null;
+    }
     return ctx.state.scheduler;
 }
 
@@ -2863,14 +2869,21 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
         else
             expression_opt.?;
 
+        // Skill jobs don't use command/prompt for execution — only skill_name/skill_args.
+        // For shell and agent jobs, command or prompt is required.
+        const is_skill_job = skill_name_opt != null or
+            (job_type_opt != null and std.mem.eql(u8, job_type_opt.?, "skill"));
         const cmd: []const u8 = if (prompt_opt != null)
             prompt_opt.?
-        else
-            (command_opt orelse {
-                ctx.response_status = "400 Bad Request";
-                ctx.response_body = "{\"error\":\"missing command or prompt\"}";
-                return;
-            });
+        else if (command_opt) |c|
+            c
+        else if (is_skill_job)
+            "" // placeholder; execution path uses skill_name/skill_args
+        else {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing command or prompt\"}";
+            return;
+        };
 
         const db_delivery = cron_backend_mod.DeliveryConfig{
             .mode = if (delivery_mode_opt) |raw|
@@ -2945,7 +2958,6 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
 
     // ── Legacy in-memory path ─────────────────────────────────────────
     const sched = lockRequestScheduler(ctx) orelse {
-        unlockRequestScheduler(ctx);
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
@@ -3143,7 +3155,6 @@ fn handleCronRemove(ctx: *WebhookHandlerContext) void {
 
     // ── Legacy in-memory path ─────────────────────────────────────────
     const sched = lockRequestScheduler(ctx) orelse {
-        unlockRequestScheduler(ctx);
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
@@ -3207,7 +3218,6 @@ fn handleCronPause(ctx: *WebhookHandlerContext) void {
 
     // ── Legacy in-memory path ─────────────────────────────────────────
     const sched = lockRequestScheduler(ctx) orelse {
-        unlockRequestScheduler(ctx);
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
@@ -3271,7 +3281,6 @@ fn handleCronResume(ctx: *WebhookHandlerContext) void {
 
     // ── Legacy in-memory path ─────────────────────────────────────────
     const sched = lockRequestScheduler(ctx) orelse {
-        unlockRequestScheduler(ctx);
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
@@ -3390,7 +3399,6 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
 
     // ── Legacy in-memory path ─────────────────────────────────────────
     const sched = lockRequestScheduler(ctx) orelse {
-        unlockRequestScheduler(ctx);
         ctx.response_status = "503 Service Unavailable";
         ctx.response_body = "{\"error\":\"scheduler not running\"}";
         return;
@@ -6390,7 +6398,12 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     state.event_bus = event_bus;
 
     // Resolve and store the cron DB path for DB-direct worker/handler access.
-    state.cron_db_path = cron_mod.getCronDbPathZ(allocator) catch null;
+    // Only populated when SQLite is compiled in; otherwise the worker and handlers
+    // must stay on the in-memory scheduler path.
+    state.cron_db_path = if (build_options.enable_sqlite)
+        cron_mod.getCronDbPathZ(allocator) catch null
+    else
+        null;
     defer if (state.cron_db_path) |p| allocator.free(p);
 
     // Workspace dir for DB-backed job children — mirrors shell_cwd of the legacy scheduler path.
