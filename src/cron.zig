@@ -3294,8 +3294,10 @@ fn checkSchedulerStatus(allocator: std.mem.Allocator) SchedulerStatus {
 }
 
 pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool) !void {
-    // JSON path: query DB directly, write to stdout.
+    // JSON path: always query DB directly (never via gateway — gateway adds log prefix).
     if (json_out) {
+        // Default JSON limit to 100 to avoid 30KB+ output when caller omits --limit.
+        const json_limit: usize = if (limit == 0) 100 else limit;
         const db_path_z = getCronDbPathZ(allocator) catch null;
         defer if (db_path_z) |p| allocator.free(p);
         if (db_path_z) |dbp| db_blk: {
@@ -3304,9 +3306,7 @@ pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool) !
             ensureCronTable(db) catch break :db_blk;
             var buf: std.ArrayListUnmanaged(u8) = .empty;
             defer buf.deinit(allocator);
-            dbListJobsJson(db, &buf, allocator, limit) catch break :db_blk;
-            // Apply limit post-query: full array emitted (limit param is for human path only).
-            // JSON consumers can slice the array themselves.
+            dbListJobsJson(db, &buf, allocator, json_limit) catch break :db_blk;
             const stdout = std.fs.File.stdout();
             stdout.writeAll(buf.items) catch {};
             stdout.writeAll("\n") catch {};
@@ -3318,62 +3318,67 @@ pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool) !
         return;
     }
 
-    // Human-readable path: load via gateway if running, else from DB/JSON.
-    if (readGatewayUrl(allocator)) |url| {
-        defer allocator.free(url);
-        if (gatewayGet(allocator, url, "/cron")) return;
-    }
-
+    // Human-readable path: always query DB directly — gateway path adds log prefix that breaks pipes.
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
-    // Check scheduler status and warn user if needed.
+    const stdout = std.fs.File.stdout();
+
+    // Check scheduler status and warn user if needed (stderr, not stdout).
     const sched_status = checkSchedulerStatus(allocator);
     if (sched_status.config_probe_error) |err_name| {
         log.warn("Cannot inspect scheduler config: {s}", .{err_name});
     } else if (!sched_status.config_exists) {
         log.warn("Config file not found. Run `nullclaw onboard` first.", .{});
     } else if (!sched_status.scheduler_enabled) {
-        log.warn("Cron scheduler is DISABLED in config. Jobs will not run automatically.", .{});
-        log.warn("Enable with: scheduler.enabled = true in config, then restart daemon.", .{});
+        log.warn("Cron scheduler is DISABLED. Enable in config and restart daemon.", .{});
     } else if (!sched_status.daemon_state_present) {
-        log.warn("Daemon state file not found. Cron jobs will not run until the daemon starts.", .{});
-        log.warn("Start with: nullclaw gateway or nullclaw service start", .{});
+        log.warn("Daemon not running. Start with: nullclaw gateway", .{});
     }
 
     const all_jobs = scheduler.listJobs();
     const jobs = if (limit > 0 and limit < all_jobs.len) all_jobs[0..limit] else all_jobs;
     if (jobs.len == 0) {
-        log.info("No scheduled tasks yet.", .{});
-        log.info("Usage:", .{});
-        log.info("  nullclaw cron add '*/10 * * * *' 'echo hello'", .{});
-        log.info("  nullclaw cron once 30m 'echo reminder'", .{});
-        if (sched_status.config_exists and sched_status.scheduler_enabled and sched_status.daemon_state_present) {
-            log.info("Scheduler is configured and has written a state file.", .{});
-            log.info("Run `nullclaw doctor` to verify live daemon health.", .{});
-        }
+        stdout.writeAll("No scheduled jobs.\n") catch {};
+        stdout.writeAll("  nullclaw cron add '*/10 * * * *' 'echo hello'\n") catch {};
+        stdout.writeAll("  nullclaw cron once 30m 'echo reminder'\n") catch {};
         return;
     }
 
-    log.info("Scheduled jobs ({d}):", .{jobs.len});
+    const display_tz: i64 = if (jobs.len > 0) @as(i64, jobs[0].tz_offset_s) else 8 * 3600;
+    const tz_label = formatTzLabel(display_tz);
+    {
+        const hdr = try std.fmt.allocPrint(allocator, "Scheduled jobs ({d}, times in {s}):\n", .{ jobs.len, tz_label });
+        defer allocator.free(hdr);
+        stdout.writeAll(hdr) catch {};
+    }
+    stdout.writeAll("─────────────────────────────────────────────────────────────────────────\n") catch {};
     for (jobs) |job| {
         const flags: []const u8 = blk: {
-            if (job.paused and job.one_shot) break :blk " [paused, one-shot]";
+            if (job.paused and job.one_shot) break :blk " [paused,one-shot]";
             if (job.paused) break :blk " [paused]";
             if (job.one_shot) break :blk " [one-shot]";
             break :blk "";
         };
-        const status = job.last_status orelse "n/a";
-        log.info("- {s} | {s} | type={s} | next={d} | status={s}{s} cmd: {s}", .{
-            job.id,
-            job.expression,
+        const status = job.last_status orelse "never";
+        var next_buf: [32]u8 = undefined;
+        const next_str = formatCstTime(job.next_run_secs + display_tz, &next_buf);
+        const label: []const u8 = switch (job.job_type) {
+            .skill => job.skill_name orelse job.command,
+            .agent => "agent",
+            .shell => job.command,
+        };
+        const line = try std.fmt.allocPrint(allocator, "  {s}  [{s}]  {s}  ({s})  last={s}{s}\n", .{
+            next_str,
             job.job_type.asStr(),
-            job.next_run_secs,
+            label,
+            job.expression,
             status,
             flags,
-            job.command,
         });
+        defer allocator.free(line);
+        stdout.writeAll(line) catch {};
     }
 }
 
