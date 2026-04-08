@@ -3326,6 +3326,17 @@ fn printWeeklyTable(allocator: std.mem.Allocator, all_jobs: []const CronJob, now
         }
     }.lessThan);
 
+    // For each job, find the index of the most-recent past fire slot (closest to now from below).
+    // That slot gets the job's last_status annotation; earlier past slots show [done].
+    var most_recent_past = try allocator.alloc(usize, all_jobs.len);
+    defer allocator.free(most_recent_past);
+    @memset(most_recent_past, std.math.maxInt(usize));
+    for (entries.items, 0..) |entry, ei| {
+        if (entry.fire_time < now) {
+            most_recent_past[entry.job_idx] = ei; // last assignment wins (entries sorted by time)
+        }
+    }
+
     const tz_label = formatTzLabel(display_tz);
     var now_buf: [32]u8 = undefined;
     const now_str = formatCstTime(now + display_tz, &now_buf);
@@ -3333,7 +3344,7 @@ fn printWeeklyTable(allocator: std.mem.Allocator, all_jobs: []const CronJob, now
     try writer.writeAll("─────────────────────────────────────────────────────────────────────────\n");
 
     const dow_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
-    for (entries.items) |entry| {
+    for (entries.items, 0..) |entry, ei| {
         const job = all_jobs[entry.job_idx];
         const job_tz: i64 = @as(i64, job.tz_offset_s);
         var time_buf: [32]u8 = undefined;
@@ -3355,12 +3366,19 @@ fn printWeeklyTable(allocator: std.mem.Allocator, all_jobs: []const CronJob, now
             .agent => if (job.prompt) |p| p[0..@min(p.len, 40)] else job.command,
             .shell => "",
         };
-        const done: []const u8 = if (entry.fire_time < now) " [done]" else "";
+
+        // Past slots: most-recent gets last_status, earlier ones get [done].
+        const suffix: []const u8 = if (entry.fire_time >= now)
+            ""
+        else if (most_recent_past[entry.job_idx] == ei)
+            if (job.last_status) |s| if (std.mem.eql(u8, s, "ok")) " [ok]" else " [error]" else " [done]"
+        else
+            " [done]";
 
         if (detail.len > 0) {
-            try writer.print("  {s} {s}  [{s}] {s}  {s}{s}\n", .{ dow, time_str, job.job_type.asStr(), label, detail, done });
+            try writer.print("  {s} {s}  [{s}] {s}  {s}{s}\n", .{ dow, time_str, job.job_type.asStr(), label, detail, suffix });
         } else {
-            try writer.print("  {s} {s}  [{s}] {s}{s}\n", .{ dow, time_str, job.job_type.asStr(), label, done });
+            try writer.print("  {s} {s}  [{s}] {s}{s}\n", .{ dow, time_str, job.job_type.asStr(), label, suffix });
         }
     }
 }

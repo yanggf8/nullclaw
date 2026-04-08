@@ -101,7 +101,7 @@ Notes:
 
 | Command | Purpose |
 |---|---|
-| `nullclaw cron list [--json] [--limit N]` | Weekly chronological fire-time table (human) or JSON array |
+| `nullclaw cron list [--json] [--limit N] [--all]` | Weekly chronological fire-time table (human) or JSON array; `--all` shows all jobs without a limit |
 | `nullclaw cron schedule [--hours N] [--today] [--all] [--json]` | Upcoming fires within a time window |
 | `nullclaw cron status` | Scheduler daemon health summary |
 | `nullclaw cron job-status [--json]` | Per-job last-run status and timestamps |

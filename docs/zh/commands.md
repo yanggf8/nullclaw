@@ -87,7 +87,7 @@
 
 | 命令 | 说明 |
 |---|---|
-| `nullclaw cron list [--json] [--limit N]` | 按时间顺序显示本周触发计划（人类可读）或 JSON 数组 |
+| `nullclaw cron list [--json] [--limit N] [--all]` | 按时间顺序显示本周触发计划（人类可读）或 JSON 数组；`--all` 不限条数显示所有任务 |
 | `nullclaw cron schedule [--hours N] [--today] [--all] [--json]` | 查看指定时间窗口内的即将触发任务 |
 | `nullclaw cron status` | 调度守护进程健康摘要 |
 | `nullclaw cron job-status [--json]` | 各任务最近执行状态与时间戳 |

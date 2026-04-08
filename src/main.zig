@@ -882,6 +882,12 @@ fn parseCronAddSkillOptions(allocator: std.mem.Allocator, sub_args: []const []co
         } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--tz")) {
             options.tz_offset_s = parseTzOffset(sub_args[i + 1]);
             i += 1;
+        } else if (std.mem.eql(u8, sub_args[i], "--skill-args") and i + 1 < sub_args.len) {
+            // --skill-args <value>: the user passed the value as a quoted string after --skill-args,
+            // store only the value (not the flag itself) to avoid double-prefix on re-invocation.
+            i += 1;
+            if (args_buf.items.len > 0) args_buf.appendSlice(allocator, " ") catch {};
+            args_buf.appendSlice(allocator, sub_args[i]) catch {};
         } else {
             if (args_buf.items.len > 0) args_buf.appendSlice(allocator, " ") catch {};
             args_buf.appendSlice(allocator, sub_args[i]) catch {};
@@ -946,7 +952,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         \\Usage: nullclaw cron <{s}> [--help|-h]
         \\
         \\Commands:
-        \\  list [--limit N] [--json]     List all scheduled tasks
+        \\  list [--limit N] [--all] [--json]  List all scheduled tasks (--all: no limit)
         \\  status                        Show scheduler daemon status
         \\  job-status [--json]           Last known execution status per job, sorted by most-recently-run
         \\  schedule [--hours N] [--all] [--today] [--json]
@@ -1003,6 +1009,8 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             while (li < sub_args.len) : (li += 1) {
                 if (std.mem.eql(u8, sub_args[li], "--json")) {
                     list_json = true;
+                } else if (std.mem.eql(u8, sub_args[li], "--all")) {
+                    list_limit = 0; // 0 means unlimited
                 } else if (std.mem.eql(u8, sub_args[li], "--limit") and li + 1 < sub_args.len) {
                     li += 1;
                     list_limit = std.fmt.parseInt(usize, sub_args[li], 10) catch 0;
@@ -4435,6 +4443,30 @@ test "parseCronAddSkillOptions preserves account and deliver-to in both config a
     try std.testing.expect(std.mem.indexOf(u8, sa, "--location") != null);
     // --timeout should NOT appear in skill_args
     try std.testing.expect(std.mem.indexOf(u8, sa, "--timeout") == null);
+}
+
+test "parseCronAddSkillOptions strips --skill-args flag prefix" {
+    // Regression: `nullclaw cron add-skill expr skill --skill-args "--mode pre-market"`
+    // should store "--mode pre-market" in skill_args, not "--skill-args --mode pre-market".
+    const args = [_][]const u8{
+        "add-skill",
+        "0 9 * * 1-5",
+        "cct",
+        "--skill-args",
+        "--mode pre-market",
+        "--deliver-to",
+        "7972814626",
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const options = parseCronAddSkillOptions(arena.allocator(), &args);
+
+    const sa = options.skill_args.?;
+    // The value "--mode pre-market" must be present
+    try std.testing.expect(std.mem.indexOf(u8, sa, "--mode pre-market") != null);
+    // The flag "--skill-args" itself must NOT appear in stored skill_args
+    try std.testing.expect(std.mem.indexOf(u8, sa, "--skill-args") == null);
 }
 
 test "memoryAgeDays returns correct day count" {
