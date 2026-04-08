@@ -3293,59 +3293,9 @@ fn checkSchedulerStatus(allocator: std.mem.Allocator) SchedulerStatus {
     return probeSchedulerStatus(config_opt.config_path, daemon_state_path, config_opt.scheduler.enabled);
 }
 
-pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool) !void {
-    // JSON path: always query DB directly (never via gateway — gateway adds log prefix).
-    if (json_out) {
-        // Default JSON limit to 100 to avoid 30KB+ output when caller omits --limit.
-        const json_limit: usize = if (limit == 0) 100 else limit;
-        const db_path_z = getCronDbPathZ(allocator) catch null;
-        defer if (db_path_z) |p| allocator.free(p);
-        if (db_path_z) |dbp| db_blk: {
-            const db = openCronDbAtPath(dbp) catch break :db_blk;
-            defer closeCronDb(db);
-            ensureCronTable(db) catch break :db_blk;
-            var buf: std.ArrayListUnmanaged(u8) = .empty;
-            defer buf.deinit(allocator);
-            dbListJobsJson(db, &buf, allocator, json_limit) catch break :db_blk;
-            const stdout = std.fs.File.stdout();
-            stdout.writeAll(buf.items) catch {};
-            stdout.writeAll("\n") catch {};
-            return;
-        }
-        // DB unavailable: emit empty array.
-        const stdout = std.fs.File.stdout();
-        stdout.writeAll("[]\n") catch {};
-        return;
-    }
-
-    // Human-readable path: weekly chronological table, always DB-direct (no log prefix).
-    var scheduler = CronScheduler.init(allocator, 1024, true);
-    defer scheduler.deinit();
-    try loadJobs(&scheduler);
-
-    const stdout = std.fs.File.stdout();
-
-    // Warn about scheduler health on stderr so it doesn't pollute piped output.
-    const sched_status = checkSchedulerStatus(allocator);
-    if (sched_status.config_probe_error) |err_name| {
-        log.warn("Cannot inspect scheduler config: {s}", .{err_name});
-    } else if (!sched_status.config_exists) {
-        log.warn("Config file not found. Run `nullclaw onboard` first.", .{});
-    } else if (!sched_status.scheduler_enabled) {
-        log.warn("Cron scheduler is DISABLED. Enable in config and restart daemon.", .{});
-    } else if (!sched_status.daemon_state_present) {
-        log.warn("Daemon not running. Start with: nullclaw gateway", .{});
-    }
-
-    const all_jobs = scheduler.listJobs();
-    if (all_jobs.len == 0) {
-        stdout.writeAll("No scheduled jobs.\n") catch {};
-        stdout.writeAll("  nullclaw cron add '*/10 * * * *' 'echo hello'\n") catch {};
-        stdout.writeAll("  nullclaw cron once 30m 'echo reminder'\n") catch {};
-        return;
-    }
-
-    const now = std.time.timestamp();
+/// Render a weekly chronological fire-time table to any writer.
+/// Expands every non-paused job into all fires within the next 7 days, sorted by time.
+fn printWeeklyTable(allocator: std.mem.Allocator, all_jobs: []const CronJob, now: i64, writer: *std.Io.Writer) !void {
     const display_tz: i64 = if (all_jobs.len > 0) @as(i64, all_jobs[0].tz_offset_s) else 8 * 3600;
     const local_now = now + display_tz;
     const day_start_local = local_now - @mod(local_now, 86400);
@@ -3376,21 +3326,14 @@ pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool) !
         }
     }.lessThan);
 
-    // Apply limit after expansion so --limit N means "show first N fire events".
-    const show_entries = if (limit > 0 and limit < entries.items.len) entries.items[0..limit] else entries.items;
-
     const tz_label = formatTzLabel(display_tz);
     var now_buf: [32]u8 = undefined;
     const now_str = formatCstTime(now + display_tz, &now_buf);
-    {
-        const hdr = try std.fmt.allocPrint(allocator, "Weekly schedule ({d} fires, now: {s} {s}):\n", .{ show_entries.len, now_str, tz_label });
-        defer allocator.free(hdr);
-        stdout.writeAll(hdr) catch {};
-    }
-    stdout.writeAll("─────────────────────────────────────────────────────────────────────────\n") catch {};
+    try writer.print("Weekly schedule ({d} fires, now: {s} {s}):\n", .{ entries.items.len, now_str, tz_label });
+    try writer.writeAll("─────────────────────────────────────────────────────────────────────────\n");
 
     const dow_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
-    for (show_entries) |entry| {
+    for (entries.items) |entry| {
         const job = all_jobs[entry.job_idx];
         const job_tz: i64 = @as(i64, job.tz_offset_s);
         var time_buf: [32]u8 = undefined;
@@ -3403,7 +3346,7 @@ pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool) !
         const dow = dow_names[weekday_num];
 
         const label: []const u8 = switch (job.job_type) {
-            .skill => job.skill_name orelse job.command,
+            .skill => job.skill_name orelse "(unnamed)",
             .agent => "agent",
             .shell => job.command,
         };
@@ -3414,13 +3357,67 @@ pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool) !
         };
         const done: []const u8 = if (entry.fire_time < now) " [done]" else "";
 
-        const line = if (detail.len > 0)
-            try std.fmt.allocPrint(allocator, "  {s} {s}  [{s}] {s}  {s}{s}\n", .{ dow, time_str, job.job_type.asStr(), label, detail, done })
-        else
-            try std.fmt.allocPrint(allocator, "  {s} {s}  [{s}] {s}{s}\n", .{ dow, time_str, job.job_type.asStr(), label, done });
-        defer allocator.free(line);
-        stdout.writeAll(line) catch {};
+        if (detail.len > 0) {
+            try writer.print("  {s} {s}  [{s}] {s}  {s}{s}\n", .{ dow, time_str, job.job_type.asStr(), label, detail, done });
+        } else {
+            try writer.print("  {s} {s}  [{s}] {s}{s}\n", .{ dow, time_str, job.job_type.asStr(), label, done });
+        }
     }
+}
+
+pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool) !void {
+    // JSON path: always query DB directly (never via gateway — gateway adds log prefix).
+    if (json_out) {
+        // Default JSON limit to 100 to avoid 30KB+ output when caller omits --limit.
+        const json_limit: usize = if (limit == 0) 100 else limit;
+        const db_path_z = getCronDbPathZ(allocator) catch null;
+        defer if (db_path_z) |p| allocator.free(p);
+        if (db_path_z) |dbp| db_blk: {
+            const db = openCronDbAtPath(dbp) catch break :db_blk;
+            defer closeCronDb(db);
+            ensureCronTable(db) catch break :db_blk;
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer buf.deinit(allocator);
+            dbListJobsJson(db, &buf, allocator, json_limit) catch break :db_blk;
+            const stdout = std.fs.File.stdout();
+            stdout.writeAll(buf.items) catch {};
+            stdout.writeAll("\n") catch {};
+            return;
+        }
+        // DB unavailable: emit empty array.
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll("[]\n") catch {};
+        return;
+    }
+
+    // Human-readable path: weekly chronological table written to stdout (no log prefix).
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    // Scheduler health warnings go to stderr via log so they don't pollute stdout.
+    const sched_status = checkSchedulerStatus(allocator);
+    if (sched_status.config_probe_error) |err_name| {
+        log.warn("Cannot inspect scheduler config: {s}", .{err_name});
+    } else if (!sched_status.config_exists) {
+        log.warn("Config file not found. Run `nullclaw onboard` first.", .{});
+    } else if (!sched_status.scheduler_enabled) {
+        log.warn("Cron scheduler is DISABLED. Enable in config and restart daemon.", .{});
+    } else if (!sched_status.daemon_state_present) {
+        log.warn("Daemon not running. Start with: nullclaw gateway", .{});
+    }
+
+    const all_jobs = scheduler.listJobs();
+    const stdout = std.fs.File.stdout();
+    if (all_jobs.len == 0) {
+        stdout.writeAll("No scheduled jobs.\n") catch {};
+        stdout.writeAll("  nullclaw cron add '*/10 * * * *' 'echo hello'\n") catch {};
+        stdout.writeAll("  nullclaw cron once 30m 'echo reminder'\n") catch {};
+        return;
+    }
+    var out_buf: [4096]u8 = undefined;
+    var bw = stdout.writer(&out_buf);
+    try printWeeklyTable(allocator, all_jobs, std.time.timestamp(), &bw.interface);
 }
 
 /// CLI: show upcoming schedule within a time window, or all jobs.
@@ -3572,79 +3569,9 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, sho
     }
 
     if (show_all) {
-        // Show full week: expand each job into all its fire times for the next 7 days.
-        // Use the first job's tz_offset for the display window, or default to UTC+8.
-        const display_tz: i64 = if (all_jobs.len > 0) @as(i64, all_jobs[0].tz_offset_s) else 8 * 3600;
-        const local_now = now + display_tz;
-        const day_start_local = local_now - @mod(local_now, 86400);
-        const week_start = day_start_local - display_tz; // start of today in UTC
-        const week_end = week_start + 7 * 86400;
-
-        const FireEntry = struct { fire_time: i64, job_idx: usize };
-        var entries: std.ArrayListUnmanaged(FireEntry) = .empty;
-        defer entries.deinit(allocator);
-
-        for (all_jobs, 0..) |job, i| {
-            if (job.paused) continue;
-            // Walk the expression forward from start of today, collecting all fires within 7 days.
-            var cursor = week_start - 1;
-            var safety: u32 = 0;
-            while (safety < 200) : (safety += 1) {
-                const next = nextRunForCronExpressionTz(job.expression, cursor, job.tz_offset_s) catch break;
-                if (next >= week_end) break;
-                if (next > cursor) {
-                    try entries.append(allocator, .{ .fire_time = next, .job_idx = i });
-                    cursor = next;
-                } else break;
-            }
-        }
-
-        // Sort by fire time
-        std.mem.sortUnstable(FireEntry, entries.items, {}, struct {
-            fn lessThan(_: void, a: FireEntry, b: FireEntry) bool {
-                return a.fire_time < b.fire_time;
-            }
-        }.lessThan);
-
-        var now_buf: [32]u8 = undefined;
-        const now_local_str = formatCstTime(now + display_tz, &now_buf);
-        const tz_label_w = formatTzLabel(display_tz);
-        log.info("Weekly schedule ({d} fires, now: {s} {s}):", .{ entries.items.len, now_local_str, tz_label_w });
-        log.info("{s}", .{"─────────────────────────────────────────────────────────────────────────"});
-
-        const dow_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
-
-        for (entries.items) |entry| {
-            const job = all_jobs[entry.job_idx];
-            const job_tz: i64 = @as(i64, job.tz_offset_s);
-            var time_buf: [32]u8 = undefined;
-            const time_str = formatCstTime(entry.fire_time + job_tz, &time_buf);
-
-            // Compute local weekday using job's timezone
-            const local_fire = entry.fire_time + job_tz;
-            const fire_epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(local_fire) };
-            const fire_day = fire_epoch.getEpochDay();
-            const weekday_num = @as(u3, @intCast((fire_day.day + 4) % 7));
-            const dow = dow_names[weekday_num];
-
-            const label: []const u8 = switch (job.job_type) {
-                .skill => job.skill_name orelse "(unnamed)",
-                .agent => "agent",
-                .shell => job.command,
-            };
-            const detail: []const u8 = switch (job.job_type) {
-                .skill => job.skill_args orelse "",
-                .agent => if (job.prompt) |p| p[0..@min(p.len, 40)] else job.command,
-                .shell => "",
-            };
-            const done: []const u8 = if (entry.fire_time < now) " [done]" else "";
-
-            if (detail.len > 0) {
-                log.info("  {s} {s}  [{s}] {s}  {s}{s}", .{ dow, time_str, job.job_type.asStr(), label, detail, done });
-            } else {
-                log.info("  {s} {s}  [{s}] {s}{s}", .{ dow, time_str, job.job_type.asStr(), label, done });
-            }
-        }
+        var out_buf: [4096]u8 = undefined;
+        var bw = std.fs.File.stdout().writer(&out_buf);
+        try printWeeklyTable(allocator, all_jobs, now, &bw.interface);
         return;
     }
 
