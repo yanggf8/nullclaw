@@ -62,6 +62,9 @@ pub const CronUpdateTool = struct {
             const patch = cron_types.CronJobPatch{
                 .expression = expression,
                 .command = command,
+                .prompt = prompt,
+                .model = model,
+                .session_target = if (session_target) |st| @enumFromInt(@intFromEnum(st)) else null,
                 .enabled = enabled,
             };
             const found = backend.update(job_id, patch) catch |err| {

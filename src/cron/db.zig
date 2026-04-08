@@ -373,7 +373,7 @@ fn dbApplyPatch(db: *c.sqlite3, id: []const u8, patch: types.CronJobPatch) !void
         // Update expression AND recalculate next_run_secs so the scheduler
         // uses the new expression immediately (not after one stale firing).
         const now = std.time.timestamp();
-        const next_run: i64 = cron.nextRunForCronExpressionTz(expr, now, tz_offset) catch now + 60;
+        const next_run: i64 = try cron.nextRunForCronExpressionTz(expr, now, tz_offset);
         const sql = "UPDATE cron_jobs SET expression=?1, next_run_secs=?3 WHERE id=?2";
         var s: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {

@@ -3743,6 +3743,9 @@ fn runQueueWorker(state: *GatewayState) void {
                 .channel = spec.delivery.channel,
                 .account_id = spec.delivery.account_id,
                 .to = spec.delivery.to,
+                .peer_kind = if (spec.delivery.peer_kind) |pk| @enumFromInt(@intFromEnum(pk)) else null,
+                .peer_id = spec.delivery.peer_id,
+                .thread_id = spec.delivery.thread_id,
                 .best_effort = spec.delivery.best_effort,
             };
 
