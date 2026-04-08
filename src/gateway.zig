@@ -3884,8 +3884,20 @@ fn runQueueWorker(state: *GatewayState) void {
                 .skill => {
                     // Skill jobs own their entire workflow including delivery.
                     // Cron only triggers and records status.
-                    // alert_delivery is used to notify the operator on failure.
-                    const alert_del = state.alert_delivery orelse cron_mod.DeliveryConfig{};
+                    // For failure alerts: prefer the job's own delivery config (so --deliver-to
+                    // jobs get error notifications without requiring a global alert destination),
+                    // then fall back to the global alert_delivery, then a no-op empty config.
+                    const job_del = cron_mod.DeliveryConfig{
+                        .mode = @enumFromInt(@intFromEnum(spec.delivery.mode)),
+                        .channel = spec.delivery.channel,
+                        .account_id = spec.delivery.account_id,
+                        .to = spec.delivery.to,
+                        .best_effort = true, // errors are best-effort notifications
+                    };
+                    const alert_del = if (spec.delivery.mode != .none)
+                        job_del
+                    else
+                        state.alert_delivery orelse cron_mod.DeliveryConfig{};
                     const raw_skill_cmd = cron_mod.resolveSkillExec(arena, spec.skill_name, spec.skill_args) catch |err| {
                         log.err("[{s}] skill resolution failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false);

@@ -415,11 +415,14 @@ fn dbApplyPatch(db: *c.sqlite3, id: []const u8, patch: types.CronJobPatch) !void
         }
     }
     if (patch.enabled) |en| {
-        const sql = "UPDATE cron_jobs SET enabled=?1 WHERE id=?2";
+        // Keep paused in sync: enabling clears paused (tick requires enabled=1 AND paused=0);
+        // disabling sets paused=1 so list output is consistent with pause/resume semantics.
+        const sql = "UPDATE cron_jobs SET enabled=?1, paused=?2 WHERE id=?3";
         var s: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
             _ = c.sqlite3_bind_int(s, 1, if (en) 1 else 0);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_int(s, 2, if (en) 0 else 1);
+            _ = c.sqlite3_bind_text(s, 3, id.ptr, @intCast(id.len), SQLITE_STATIC);
             _ = c.sqlite3_step(s);
             _ = c.sqlite3_finalize(s);
         }
