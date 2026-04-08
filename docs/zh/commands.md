@@ -87,16 +87,24 @@
 
 | 命令 | 说明 |
 |---|---|
-| `nullclaw cron list` | 查看所有计划任务 |
-| `nullclaw cron add "0 * * * *" "command"` | 新增周期性 shell 任务 |
-| `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--announce] [--channel <name>] [--account <id>] [--to <id>]` | 新增周期性 agent 任务 |
-| `nullclaw cron once 10m "command"` | 新增一次性延迟任务 |
-| `nullclaw cron once-agent 10m "prompt" --model <model>` | 新增一次性 agent 延迟任务 |
+| `nullclaw cron list [--json] [--limit N]` | 按时间顺序显示本周触发计划（人类可读）或 JSON 数组 |
+| `nullclaw cron schedule [--hours N] [--today] [--all] [--json]` | 查看指定时间窗口内的即将触发任务 |
+| `nullclaw cron status` | 调度守护进程健康摘要 |
+| `nullclaw cron job-status [--json]` | 各任务最近执行状态与时间戳 |
+| `nullclaw cron add "0 * * * *" "command" [--tz <offset>]` | 新增周期性 shell 任务 |
+| `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--session-target isolated\|main] [--channel <name>] [--account <id>] [--to <id>] [--tz <offset>]` | 新增周期性 agent 任务 |
+| `nullclaw cron add-skill "0 * * * *" <skill> [--skill-args "..."] [--deliver-to <id>] [--account <id>] [--timeout <secs>] [--tz <offset>]` | 新增周期性技能任务 |
+| `nullclaw cron once <delay> "command"` | 新增一次性延迟任务 |
+| `nullclaw cron once-agent <delay> "prompt" --model <model> [--session-target isolated\|main]` | 新增一次性 agent 延迟任务 |
 | `nullclaw cron run <id>` | 立即执行指定任务 |
 | `nullclaw cron pause <id>` / `resume <id>` | 暂停 / 恢复任务 |
 | `nullclaw cron remove <id>` | 删除任务 |
-| `nullclaw cron runs <id>` | 查看任务最近执行记录 |
-| `nullclaw cron update <id> --expression ... --command ... --prompt ... --model ... --enable/--disable` | 更新已有任务 |
+| `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>]` | 更新已有任务 |
+| `nullclaw cron runs <id> [--limit N] [--json]` | 查看任务最近执行记录 |
+| `nullclaw cron backup` | 将所有任务导出为带时间戳的 seed 文件 |
+| `nullclaw cron restore [<file>]` | 从 seed 文件恢复任务 |
+| `nullclaw cron export-seed` | 以可移植 JSON 格式打印任务 |
+| `nullclaw cron init-seed` | 将 seed 文件加载到全新 DB（仅用于新安装） |
 
 ### Skills
 

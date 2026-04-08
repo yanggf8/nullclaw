@@ -101,16 +101,24 @@ Notes:
 
 | Command | Purpose |
 |---|---|
-| `nullclaw cron list` | List scheduled tasks |
-| `nullclaw cron add "0 * * * *" "command"` | Add a recurring shell task |
-| `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--announce] [--channel <name>] [--account <id>] [--to <id>]` | Add a recurring agent task |
-| `nullclaw cron once 10m "command"` | Add a one-shot delayed shell task |
-| `nullclaw cron once-agent 10m "prompt" --model <model>` | Add a one-shot delayed agent task |
+| `nullclaw cron list [--json] [--limit N]` | Weekly chronological fire-time table (human) or JSON array |
+| `nullclaw cron schedule [--hours N] [--today] [--all] [--json]` | Upcoming fires within a time window |
+| `nullclaw cron status` | Scheduler daemon health summary |
+| `nullclaw cron job-status [--json]` | Per-job last-run status and timestamps |
+| `nullclaw cron add "0 * * * *" "command" [--tz <offset>]` | Add a recurring shell task |
+| `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--session-target isolated\|main] [--channel <name>] [--account <id>] [--to <id>] [--tz <offset>]` | Add a recurring agent task |
+| `nullclaw cron add-skill "0 * * * *" <skill> [--skill-args "..."] [--deliver-to <id>] [--account <id>] [--timeout <secs>] [--tz <offset>]` | Add a recurring skill task |
+| `nullclaw cron once <delay> "command"` | Add a one-shot delayed shell task |
+| `nullclaw cron once-agent <delay> "prompt" --model <model> [--session-target isolated\|main]` | Add a one-shot delayed agent task |
 | `nullclaw cron run <id>` | Run a task immediately |
 | `nullclaw cron pause <id>` / `resume <id>` | Pause or resume a task |
 | `nullclaw cron remove <id>` | Delete a task |
-| `nullclaw cron runs <id>` | Show recent run history |
-| `nullclaw cron update <id> --expression ... --command ... --prompt ... --model ... --enable/--disable` | Update an existing task |
+| `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>]` | Update an existing task |
+| `nullclaw cron runs <id> [--limit N] [--json]` | Show recent run history for a task |
+| `nullclaw cron backup` | Export all jobs to a timestamped seed file |
+| `nullclaw cron restore [<file>]` | Restore jobs from a seed file |
+| `nullclaw cron export-seed` | Print jobs as a portable seed JSON |
+| `nullclaw cron init-seed` | Load seed file into a fresh DB (new installs only) |
 
 ### `skills`
 
