@@ -223,6 +223,10 @@ pub const SessionManager = struct {
     observer: Observer,
     policy: ?*const SecurityPolicy = null,
     subagent_manager: ?*@import("subagent.zig").SubagentManager = null,
+    /// Optional callback that returns a scheduler snapshot for sensorium injection.
+    /// Set by the gateway before serving requests. Called with null ctx when not set.
+    scheduler_snapshot_fn: ?*const fn (*anyopaque) agent_mod.memory_loader.SensoriumData = null,
+    scheduler_snapshot_ctx: ?*anyopaque = null,
 
     /// Result of the startup vision probe against the configured model.
     /// null = not yet confirmed (probe not run, skipped, or inconclusive), true = model accepts images,
@@ -1688,6 +1692,13 @@ pub const SessionManager = struct {
             .bot_account = if (conversation_context) |ctx| ctx.account_id else null,
         } };
         session.agent.observer.recordEvent(&start_event);
+
+        // Populate scheduler snapshot for sensorium (per-turn, zero-copy value type)
+        if (self.scheduler_snapshot_fn) |snap_fn| {
+            if (self.scheduler_snapshot_ctx) |ctx| {
+                session.agent.scheduler_snapshot = snap_fn(ctx);
+            }
+        }
 
         const response = try session.agent.turn(content);
         session.turn_count += 1;

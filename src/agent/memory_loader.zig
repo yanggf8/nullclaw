@@ -248,6 +248,100 @@ pub fn enrichMessageWithRuntime(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Sensorium — per-turn ambient self-state prefix
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Snapshot of live agent and scheduler state for sensorium injection.
+/// All fields are plain values (no borrowed slices) — safe to copy and store.
+pub const SensoriumData = struct {
+    now_secs: i64 = 0,
+    tz_offset_s: i32 = 0,
+    scheduler_jobs: u32 = 0,
+    scheduler_next_fire_secs: ?i64 = null,
+    scheduler_recent_failures: u32 = 0,
+    session_tokens: u64 = 0,
+    rate_budget_remaining: u32 = 0,
+    rate_budget_max: u32 = 0,
+};
+
+/// Build a compact sensorium prefix line. Caller owns returned slice.
+/// Fields with zero/null values are omitted to avoid noise.
+/// Output is ≤ 256 bytes under normal conditions.
+pub fn buildSensoriumPrefix(allocator: std.mem.Allocator, data: SensoriumData) ![]u8 {
+    var buf: std.ArrayList(u8) = .{};
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeAll("<sensorium");
+
+    // Timestamp and timezone
+    if (data.now_secs > 0) {
+        try w.print(" ts=\"{d}\"", .{data.now_secs});
+    }
+    if (data.tz_offset_s != 0) {
+        const sign: u8 = if (data.tz_offset_s >= 0) '+' else '-';
+        const abs_s: u32 = @intCast(@abs(data.tz_offset_s));
+        const h = abs_s / 3600;
+        const m = (abs_s % 3600) / 60;
+        if (m == 0) {
+            try w.print(" tz=\"{c}{d:0>2}00\"", .{ sign, h });
+        } else {
+            try w.print(" tz=\"{c}{d:0>2}{d:0>2}\"", .{ sign, h, m });
+        }
+    }
+
+    // Scheduler fields — omit when all zero
+    if (data.scheduler_jobs > 0) {
+        try w.print(" jobs=\"{d}\"", .{data.scheduler_jobs});
+    }
+    if (data.scheduler_next_fire_secs) |nf| {
+        const delta = nf - data.now_secs;
+        if (delta > 0) {
+            if (delta < 3600) {
+                try w.print(" next_fire_in=\"{d}m\"", .{@divTrunc(delta, 60)});
+            } else {
+                try w.print(" next_fire_in=\"{d}h\"", .{@divTrunc(delta, 3600)});
+            }
+        } else {
+            try w.writeAll(" next_fire_in=\"now\"");
+        }
+    }
+    if (data.scheduler_recent_failures > 0) {
+        try w.print(" failures=\"{d}\"", .{data.scheduler_recent_failures});
+    }
+
+    // Cost / token fields
+    if (data.session_tokens > 0) {
+        try w.print(" tokens=\"{d}\"", .{data.session_tokens});
+    }
+
+    // Rate budget — only show when there is a limit
+    if (data.rate_budget_max > 0) {
+        try w.print(" rate=\"{d}/{d}\"", .{ data.rate_budget_remaining, data.rate_budget_max });
+    }
+
+    try w.writeAll("/>\n");
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Prepend a sensorium block to `user_message`. Caller owns returned slice.
+/// If the sensorium block would be empty (all-zero data), returns a copy of user_message.
+pub fn enrichMessageWithSensorium(
+    allocator: std.mem.Allocator,
+    user_message: []const u8,
+    data: SensoriumData,
+) ![]u8 {
+    // Only emit if there is something meaningful to show
+    const has_data = data.now_secs > 0 or data.scheduler_jobs > 0 or
+        data.session_tokens > 0 or data.rate_budget_max > 0;
+    if (!has_data) return try allocator.dupe(u8, user_message);
+
+    const prefix = try buildSensoriumPrefix(allocator, data);
+    defer allocator.free(prefix);
+    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, user_message });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -509,4 +603,71 @@ test "loadContextWithRuntime with session_id includes global entries but not oth
     try std.testing.expect(std.mem.indexOf(u8, context, "sess_a_fact") != null);
     try std.testing.expect(std.mem.indexOf(u8, context, "global_fact") != null);
     try std.testing.expect(std.mem.indexOf(u8, context, "sess_b_fact") == null);
+}
+
+test "buildSensoriumPrefix with known data produces expected output" {
+    const allocator = std.testing.allocator;
+    const data = SensoriumData{
+        .now_secs = 1744200180,
+        .tz_offset_s = 8 * 3600, // +0800
+        .scheduler_jobs = 5,
+        .scheduler_next_fire_secs = 1744200180 + 12 * 60, // 12m from now
+        .scheduler_recent_failures = 0,
+        .session_tokens = 24035,
+        .rate_budget_remaining = 17,
+        .rate_budget_max = 20,
+    };
+    const prefix = try buildSensoriumPrefix(allocator, data);
+    defer allocator.free(prefix);
+
+    try std.testing.expect(std.mem.indexOf(u8, prefix, "ts=\"1744200180\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prefix, "tz=\"+0800\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prefix, "jobs=\"5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prefix, "next_fire_in=\"12m\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prefix, "failures") == null); // 0 failures omitted
+    try std.testing.expect(std.mem.indexOf(u8, prefix, "tokens=\"24035\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prefix, "rate=\"17/20\"") != null);
+    // Must end with "/>\n"
+    try std.testing.expect(std.mem.endsWith(u8, prefix, "/>\n"));
+}
+
+test "buildSensoriumPrefix with all-zero data omits noise fields" {
+    const allocator = std.testing.allocator;
+    const data = SensoriumData{};
+    const prefix = try buildSensoriumPrefix(allocator, data);
+    defer allocator.free(prefix);
+
+    // Should still produce a minimal tag, just with no attributes
+    try std.testing.expect(std.mem.indexOf(u8, prefix, "<sensorium") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prefix, "jobs=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prefix, "tokens=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prefix, "rate=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prefix, "failures=") == null);
+}
+
+test "enrichMessageWithSensorium prepends sensorium prefix before message" {
+    const allocator = std.testing.allocator;
+    const data = SensoriumData{
+        .now_secs = 1744200180,
+        .session_tokens = 100,
+        .rate_budget_remaining = 5,
+        .rate_budget_max = 20,
+    };
+    const enriched = try enrichMessageWithSensorium(allocator, "hello world", data);
+    defer allocator.free(enriched);
+
+    // Sensorium line comes first, then the original message
+    try std.testing.expect(std.mem.startsWith(u8, enriched, "<sensorium"));
+    try std.testing.expect(std.mem.indexOf(u8, enriched, "hello world") != null);
+    const prefix_end = std.mem.indexOf(u8, enriched, "\n") orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, enriched[prefix_end..], "hello world") != null);
+}
+
+test "enrichMessageWithSensorium with all-zero data returns copy of message" {
+    const allocator = std.testing.allocator;
+    const data = SensoriumData{};
+    const enriched = try enrichMessageWithSensorium(allocator, "unchanged", data);
+    defer allocator.free(enriched);
+
+    try std.testing.expectEqualStrings("unchanged", enriched);
 }

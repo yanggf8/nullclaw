@@ -319,6 +319,7 @@ pub const Agent = struct {
     compaction_keep_recent: u32 = compaction.DEFAULT_COMPACTION_KEEP_RECENT,
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     compaction_max_source_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
+    sensorium_enabled: bool = false,
 
     /// Per-turn MCP tool filter groups (slice into config-owned memory; not freed by Agent).
     /// Empty = no filtering; all tool specs are sent as-is.
@@ -349,6 +350,10 @@ pub const Agent = struct {
 
     /// Total tokens used across all turns.
     total_tokens: u64 = 0,
+
+    /// Snapshot of scheduler state set externally before agent.turn().
+    /// When set, sensorium includes job count and next fire time.
+    scheduler_snapshot: ?memory_loader.SensoriumData = null,
 
     /// Whether the system prompt has been injected.
     has_system_prompt: bool = false,
@@ -501,6 +506,7 @@ pub const Agent = struct {
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
+            .sensorium_enabled = cfg.agent.sensorium_enabled,
             .tool_filter_groups = cfg.agent.tool_filter_groups,
             .default_exec_security = resolved_exec_security,
             .exec_security = resolved_exec_security,
@@ -1745,12 +1751,34 @@ pub const Agent = struct {
             }
         }
 
+        // Prepend sensorium self-state prefix when enabled (per-turn, must not go in cached system prompt)
+        const sensorium_message = if (self.sensorium_enabled) blk: {
+            var sd = memory_loader.SensoriumData{
+                .now_secs = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_s)),
+                .session_tokens = self.total_tokens,
+            };
+            if (self.policy) |pol| {
+                if (pol.tracker) |tracker| {
+                    sd.rate_budget_remaining = tracker.remaining();
+                    sd.rate_budget_max = pol.max_actions_per_hour;
+                }
+            }
+            if (self.scheduler_snapshot) |snap| {
+                sd.scheduler_jobs = snap.scheduler_jobs;
+                sd.scheduler_next_fire_secs = snap.scheduler_next_fire_secs;
+                sd.scheduler_recent_failures = snap.scheduler_recent_failures;
+            }
+            break :blk try memory_loader.enrichMessageWithSensorium(self.allocator, effective_user_message, sd);
+        } else null;
+        defer if (sensorium_message) |sm| self.allocator.free(sm);
+        const pre_enrich_message = sensorium_message orelse effective_user_message;
+
         // Enrich message with memory context (always returns owned slice; ownership → history)
         // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
         const enriched = if (self.mem) |mem|
-            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, effective_user_message, self.memory_session_id)
+            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, pre_enrich_message, self.memory_session_id)
         else
-            try self.allocator.dupe(u8, effective_user_message);
+            try self.allocator.dupe(u8, pre_enrich_message);
 
         // Keep the user message retained even if provider/tool steps fail.
         try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });

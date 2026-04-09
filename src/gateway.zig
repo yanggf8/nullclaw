@@ -40,6 +40,7 @@ const channel_adapters = @import("channel_adapters.zig");
 const cron_mod = @import("cron.zig");
 const cron_backend_mod = @import("cron/root.zig");
 const cron_db_mod = @import("cron/db.zig");
+const memory_loader = @import("agent/memory_loader.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 
@@ -97,6 +98,30 @@ fn auditPolicyCallback(ctx: *anyopaque, entry: security.PolicyAuditEntry) void {
         .sandbox_backend = null,
     };
     logger.log(&ev) catch {};
+}
+
+/// Scheduler snapshot callback for sensorium injection.
+/// ctx points to GatewayState. Acquires scheduler_mutex briefly to read job state.
+fn schedulerSnapshotCallback(ctx: *anyopaque) memory_loader.SensoriumData {
+    const state: *GatewayState = @ptrCast(@alignCast(ctx));
+    var sd = memory_loader.SensoriumData{};
+    if (!state.scheduler_mutex.tryLock()) return sd;
+    defer state.scheduler_mutex.unlock();
+    const sched = state.scheduler orelse return sd;
+    const jobs = sched.listJobs();
+    sd.scheduler_jobs = @intCast(jobs.len);
+    var nearest: ?i64 = null;
+    var failures: u32 = 0;
+    for (jobs) |job| {
+        const nr = job.next_run_secs;
+        if (nr > 0 and (nearest == null or nr < nearest.?)) nearest = nr;
+        if (job.last_status) |status| {
+            if (std.mem.eql(u8, status, "failed")) failures += 1;
+        }
+    }
+    if (nearest) |nr| sd.scheduler_next_fire_secs = nr;
+    sd.scheduler_recent_failures = failures;
+    return sd;
 }
 
 fn simpleConversationContext(
@@ -6684,6 +6709,10 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 if (mem_rt) |*rt| {
                     sm.mem_rt = rt;
                     tools_mod.bindMemoryRuntime(tools_slice, rt);
+                }
+                if (cfg.agent.sensorium_enabled) {
+                    sm.scheduler_snapshot_fn = schedulerSnapshotCallback;
+                    sm.scheduler_snapshot_ctx = @ptrCast(&state);
                 }
                 session_mgr_opt = sm;
                 // Eagerly probe whether the model accepts image input so we can

@@ -261,6 +261,9 @@ pub const AgentConfig = struct {
     /// When true, automatically adds the current model to vision_disabled_models
     /// upon receiving a "model does not support vision" error.
     auto_disable_vision_on_error: bool = true,
+    /// Prepend per-turn ambient self-state (sensorium) to each user message.
+    /// Includes scheduler job count, session tokens, and rate budget.
+    sensorium_enabled: bool = false,
 
     pub fn parseTimezoneOffsetSeconds(raw: []const u8) ?i64 {
         if (std.ascii.eqlIgnoreCase(raw, "UTC")) return 0;
