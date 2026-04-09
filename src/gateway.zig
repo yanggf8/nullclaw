@@ -2920,6 +2920,11 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
         // For shell and agent jobs, command or prompt is required.
         const is_skill_job = skill_name_opt != null or
             (job_type_opt != null and std.mem.eql(u8, job_type_opt.?, "skill"));
+        if (is_skill_job and (skill_name_opt == null or skill_name_opt.?.len == 0)) {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"skill jobs require skill_name\"}";
+            return;
+        }
         const cmd: []const u8 = if (prompt_opt != null)
             prompt_opt.?
         else if (command_opt) |c|

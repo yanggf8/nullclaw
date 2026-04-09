@@ -1965,6 +1965,18 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             }
             break :blk null;
         };
+        const delivery_best_effort_json: bool = blk: {
+            if (obj.get("delivery_best_effort")) |v| {
+                if (v == .bool) break :blk v.bool;
+            }
+            break :blk false;
+        };
+        const tz_offset_s_json: i32 = blk: {
+            if (obj.get("tz_offset_s")) |v| {
+                if (v == .integer) break :blk @intCast(v.integer);
+            }
+            break :blk 0;
+        };
 
         try scheduler.jobs.append(scheduler.allocator, .{
             .id = try scheduler.allocator.dupe(u8, id),
@@ -1984,6 +1996,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .timeout_secs = timeout_secs_json,
             .enabled = enabled,
             .delete_after_run = delete_after_run,
+            .tz_offset_s = tz_offset_s_json,
             .last_output = if (last_output_json) |lo| try scheduler.allocator.dupe(u8, lo) else null,
             .delivery = .{
                 .mode = delivery_mode,
@@ -1998,6 +2011,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
                 .to_owned = delivery_to != null,
                 .peer_id_owned = delivery_peer_id != null,
                 .thread_id_owned = delivery_thread_id != null,
+                .best_effort = delivery_best_effort_json,
             },
         });
     }
@@ -2997,6 +3011,25 @@ fn saveJobsToJson(scheduler: *const CronScheduler) !void {
         } else {
             try buf.appendSlice(scheduler.allocator, "null");
         }
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_best_effort");
+        try buf.appendSlice(scheduler.allocator, if (job.delivery.best_effort) "true" else "false");
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "skill_name");
+        if (job.skill_name) |sn| {
+            try json_util.appendJsonString(&buf, scheduler.allocator, sn);
+        } else {
+            try buf.appendSlice(scheduler.allocator, "null");
+        }
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "skill_args");
+        if (job.skill_args) |sa| {
+            try json_util.appendJsonString(&buf, scheduler.allocator, sa);
+        } else {
+            try buf.appendSlice(scheduler.allocator, "null");
+        }
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonInt(&buf, scheduler.allocator, "tz_offset_s", job.tz_offset_s);
         try buf.appendSlice(scheduler.allocator, ",");
         try json_util.appendJsonKey(&buf, scheduler.allocator, "last_output");
         if (job.last_output) |lo| {
@@ -5231,7 +5264,8 @@ pub fn dbLoadJobSpec(db: *c.sqlite3, arena: std.mem.Allocator, job_id: []const u
     const sql =
         "SELECT job_type, command, prompt, model, one_shot, delete_after_run, " ++
         "timeout_secs, delivery_mode, delivery_channel, delivery_account_id, delivery_to, " ++
-        "delivery_best_effort, session_target, skill_name, skill_args " ++
+        "delivery_best_effort, session_target, skill_name, skill_args, " ++
+        "delivery_peer_kind, delivery_peer_id, delivery_thread_id " ++
         "FROM cron_jobs WHERE id=?1";
     var stmt: ?*c.sqlite3_stmt = null;
     var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
@@ -5248,6 +5282,7 @@ pub fn dbLoadJobSpec(db: *c.sqlite3, arena: std.mem.Allocator, job_id: []const u
     const job_type_raw = try dbColumnTextOpt(stmt, 0, arena);
     const command_raw = try dbColumnTextOpt(stmt, 1, arena);
     const delivery_mode_raw = try dbColumnTextOpt(stmt, 7, arena);
+    const delivery_peer_kind_raw = try dbColumnTextOpt(stmt, 15, arena);
 
     return CronJobSpec{
         .id = try arena.dupe(u8, job_id),
@@ -5272,6 +5307,11 @@ pub fn dbLoadJobSpec(db: *c.sqlite3, arena: std.mem.Allocator, job_id: []const u
             .channel_owned = false,
             .account_id_owned = false,
             .to_owned = false,
+            .peer_kind = if (delivery_peer_kind_raw) |s| parseChatType(s) else null,
+            .peer_id = try dbColumnTextOpt(stmt, 16, arena),
+            .thread_id = try dbColumnTextOpt(stmt, 17, arena),
+            .peer_id_owned = false,
+            .thread_id_owned = false,
         },
         .session_target = blk: {
             const raw = try dbColumnTextOpt(stmt, 12, arena);
