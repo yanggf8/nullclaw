@@ -1,28 +1,28 @@
-# 使用與運維
+# 使用与运维
 
-本頁聚焦日常操作、服務化執行和常見故障排查。
+本页聚焦日常操作、服务化运行和常见故障排查。
 
-## 頁面導航
+## 页面导航
 
-- 這頁適合誰：已經完成安裝與基礎設定，準備日常使用、服務化執行或排障的人。
-- 看完去哪裡：命令細節繼續看 [命令參考](./commands.md)；要核對設定欄位看 [設定指南](./configuration.md)；涉及 webhook 與對外接入看 [Gateway API](./gateway-api.md)。
-- 如果你是從某頁來的：從 [安裝指南](./installation.md) 來，這頁就是首次跑通的下一站；從 [設定指南](./configuration.md) 來，這頁用來驗證設定是否真能工作；從 [Gateway API](./gateway-api.md) 來，可回到這裡看長期執行與排障順序。
+- 这页适合谁：已经完成安装与基础配置，准备日常使用、服务化运行或排障的人。
+- 看完去哪里：命令细节继续看 [命令参考](./commands.md)；要核对配置字段看 [配置指南](./configuration.md)；涉及 webhook 与对外接入看 [Gateway API](./gateway-api.md)。
+- 如果你是从某页来的：从 [安装指南](./installation.md) 来，这页就是首次跑通的下一站；从 [配置指南](./configuration.md) 来，这页用来验证配置是否真能工作；从 [Gateway API](./gateway-api.md) 来，可回到这里看长期运行与排障顺序。
 
-## 首次啟動流程
+## 首次启动流程
 
-1. 執行初始化：
+1. 执行初始化：
 
 ```bash
 nullclaw onboard --interactive
 ```
 
-2. 傳送一條測試訊息：
+2. 发送一条测试消息：
 
 ```bash
 nullclaw agent -m "你好，nullclaw"
 ```
 
-3. 啟動長期執行網關：
+3. 启动长期运行网关：
 
 ```bash
 nullclaw gateway
@@ -32,34 +32,34 @@ nullclaw gateway
 
 | 命令 | 用途 |
 |---|---|
-| `nullclaw onboard --api-key sk-... --provider openrouter` | 快速寫入 provider 與 API Key |
-| `nullclaw onboard --interactive` | 互動式完整初始化 |
-| `nullclaw onboard --channels-only` | 只重設 channel / allowlist |
-| `nullclaw agent -m "..."` | 單條訊息模式 |
-| `nullclaw agent` | 互動會話模式 |
-| `nullclaw gateway` | 啟動長期執行 runtime（預設 `127.0.0.1:3000`） |
-| `nullclaw service install` | 安裝背景服務 |
-| `nullclaw service start` | 啟動背景服務 |
-| `nullclaw service status` | 查看背景服務狀態 |
-| `nullclaw service stop` | 停止背景服務 |
-| `nullclaw service uninstall` | 卸載背景服務 |
-| `nullclaw doctor` | 系統診斷 |
-| `nullclaw status` | 全域狀態 |
-| `nullclaw channel status` | 頻道健康狀態 |
-| `nullclaw channel start telegram` | 啟動指定頻道 |
-| `nullclaw migrate openclaw --dry-run` | 預演遷移 OpenClaw 資料 |
-| `nullclaw migrate openclaw` | 執行遷移 |
-| `nullclaw history list [--limit N] [--offset N] [--json]` | 列出會話記錄 |
-| `nullclaw history show <session_id> [--limit N] [--offset N] [--json]` | 查看指定會話的訊息詳情 |
+| `nullclaw onboard --api-key sk-... --provider openrouter` | 快速写入 provider 与 API Key |
+| `nullclaw onboard --interactive` | 交互式完整初始化 |
+| `nullclaw onboard --channels-only` | 只重配 channel / allowlist |
+| `nullclaw agent -m "..."` | 单条消息模式 |
+| `nullclaw agent` | 交互会话模式 |
+| `nullclaw gateway` | 启动长期运行 runtime（默认 `127.0.0.1:3000`） |
+| `nullclaw service install` | 安装后台服务 |
+| `nullclaw service start` | 启动后台服务 |
+| `nullclaw service status` | 查看后台服务状态 |
+| `nullclaw service stop` | 停止后台服务 |
+| `nullclaw service uninstall` | 卸载后台服务 |
+| `nullclaw doctor` | 系统诊断 |
+| `nullclaw status` | 全局状态 |
+| `nullclaw channel status` | 渠道健康状态 |
+| `nullclaw channel start telegram` | 启动指定渠道 |
+| `nullclaw migrate openclaw --dry-run` | 预演迁移 OpenClaw 数据 |
+| `nullclaw migrate openclaw` | 执行迁移 |
+| `nullclaw history list [--limit N] [--offset N] [--json]` | 列出会话记录 |
+| `nullclaw history show <session_id> [--limit N] [--offset N] [--json]` | 查看指定会话的消息详情 |
 
-## 服務化執行建議
+## 服务化运行建议
 
-建議在長期執行場景使用 service 子命令：
+建议在长期运行场景使用 service 子命令：
 
 - macOS 走 `launchctl`。
-- Linux 環境會優先使用 `systemd --user`，在 Alpine / OpenRC 系統上會自動切換為 OpenRC。
+- Linux 环境会优先使用 `systemd --user`，在 Alpine / OpenRC 系统上会自动切换为 OpenRC。
 - Windows 走 Service Control Manager。
-- 如果 Linux 上既沒有可用的 `systemd --user`，也缺少必需的 OpenRC 命令，這組子命令會失敗；此時應改用前台 `nullclaw gateway` 或其他外部 supervisor。
+- 如果 Linux 上既没有可用的 `systemd --user`，也缺少必需的 OpenRC 命令，这组子命令会失败；此时应改用前台 `nullclaw gateway` 或其他外部 supervisor。
 
 ```bash
 nullclaw service install
@@ -67,89 +67,89 @@ nullclaw service start
 nullclaw service status
 ```
 
-如果設定改動較大，建議重啟服務：
+如果配置改动较大，建议重启服务：
 
 ```bash
 nullclaw service stop
 nullclaw service start
 ```
 
-## 網關與配對（Pairing）
+## 网关与配对（Pairing）
 
-- 預設網關位址：`127.0.0.1:3000`
-- 推薦保持 `gateway.require_pairing = true`
-- 建議透過 tunnel 暴露外網存取，不直接公網監聽網關
-- `/pair` 僅支援 POST，並使用 `X-Pairing-Code`；多次錯誤嘗試會觸發限流，且可能進入臨時鎖定
+- 默认网关地址：`127.0.0.1:3000`
+- 推荐保持 `gateway.require_pairing = true`
+- 建议通过 tunnel 暴露外网访问，不直接公网监听网关
+- `/pair` 仅支持 POST，并使用 `X-Pairing-Code`；多次错误尝试会触发限流，且可能进入临时锁定
 
-網關健康檢查：
+网关健康检查：
 
 ```bash
 curl http://127.0.0.1:3000/health
 ```
 
-## 常見問題（FAQ）
+## 常见问题（FAQ）
 
-### 1) 啟動失敗，提示設定錯誤
+### 1) 启动失败，提示配置错误
 
-處理步驟：
+处理步骤：
 
-1. 先跑 `nullclaw doctor` 看具體報錯。
-2. 對照 `config.example.json` 檢查欄位拼寫與層級。
-3. 檢查 JSON 語法（逗號、引號、括號）。
+1. 先跑 `nullclaw doctor` 看具体报错。
+2. 对照 `config.example.json` 检查字段拼写与层级。
+3. 检查 JSON 语法（逗号、引号、括号）。
 
-### 2) 模型呼叫失敗（401/403）
+### 2) 模型调用失败（401/403）
 
-常見原因：
+常见原因：
 
-- API Key 無效或過期。
-- provider 寫錯（例如填了 `openrouter` 但 key 屬於其他平台）。
-- 模型路由字串不匹配 provider。
+- API Key 无效或过期。
+- provider 写错（例如填了 `openrouter` 但 key 属于其他平台）。
+- 模型路由字符串不匹配 provider。
 
-建議排查：
+建议排查：
 
 ```bash
 nullclaw status
 ```
 
-並重新執行：
+并重新执行：
 
 ```bash
 nullclaw onboard --interactive
 ```
 
-### 3) 收不到頻道訊息
+### 3) 收不到渠道消息
 
-重點檢查：
+重点检查：
 
-- `channels.<name>.accounts.*` 的 token / webhook / account 欄位是否正確。
-- `allow_from` 是否誤設為空陣列。
-- `nullclaw channel status` 是否有 unhealthy 標記。
-- 如果是 DingTalk，進一步看
-  [DingTalk 運維就緒](./ops/dingtalk-ops-readiness.md)。
+- `channels.<name>.accounts.*` 的 token / webhook / account 字段是否正确。
+- 是否存在渠道级 allowlist / gating 配置不匹配（如 `allow_from`、`group_allow_from`、`require_mention` 等）。空 `allow_from` 不是通用的“拒绝所有”开关。
+- `nullclaw channel status` 是否有 unhealthy 标记。
+- 如果是 DingTalk，进一步看
+  [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md)。
 
-### 4) 網關啟動但外部不可存取
+### 4) 网关启动但外部不可访问
 
-常見原因：
+常见原因：
 
-- 仍綁定在 `127.0.0.1`。
-- 未設定 tunnel 或反向代理。
-- 防火牆未放行連接埠。
+- 仍绑定在 `127.0.0.1`。
+- 未配置 tunnel 或反向代理。
+- 防火墙未放行端口。
 
-### 5) provider 回傳 429 / "rate limit exceeded"
+### 5) provider 返回 429 / “rate limit exceeded”
 
-常見原因：
+常见原因：
 
-- 額度較低的 coding plan 往往扛不住 tool-heavy 的 agent 回合，即使普通聊天還看起來能用。
-- 目前 provider 計劃對重試頻率很敏感。
-- 主 provider 被限流後，沒有設定可切換的 fallback。
+- 额度较低的 coding plan 往往扛不住 tool-heavy 的 agent 回合，即使普通聊天还看起来能用。
+- 当前 provider 计划对重试频率很敏感。
+- 主 provider 被限流后，没有配置可切换的 fallback。
 
-建議排查：
+建议排查：
 
-- 前台執行時先用 `nullclaw agent --verbose`。
-- service 模式下查看 `~/.nullclaw/logs/daemon.stdout.log` 與 `~/.nullclaw/logs/daemon.stderr.log`。
-- 跑一次 `nullclaw status`，確認目前實際使用的 provider / model。
+- 前台运行时先用 `nullclaw agent --verbose`。
+- service 模式下查看 `~/.nullclaw/logs/daemon.stdout.log` 与 `~/.nullclaw/logs/daemon.stderr.log`。
+- 跑一次 `nullclaw status`，确认当前实际使用的 provider / model。
 
-如果 plan 本身可用但限流很嚴，建議保守調整 reliability：
+如果 plan 本身可用但限流很严，建议保守调整 reliability：
 
 ```json
 {
@@ -161,11 +161,11 @@ nullclaw onboard --interactive
 }
 ```
 
-如果同一 provider 有多把 key，可以設定 `reliability.api_keys` 讓 NullClaw 在限流時輪轉。
+如果同一 provider 有多把 key，可以配置 `reliability.api_keys` 让 NullClaw 在限流时轮转。
 
-## 變更後回歸檢查清單
+## 变更后回归检查清单
 
-每次改設定後，建議按順序執行：
+每次改配置后，建议按顺序执行：
 
 ```bash
 nullclaw doctor
@@ -174,7 +174,7 @@ nullclaw channel status
 nullclaw agent -m "self-check"
 ```
 
-對 gateway 場景，額外驗證：
+对 gateway 场景，额外验证：
 
 ```bash
 nullclaw gateway
@@ -183,13 +183,13 @@ curl http://127.0.0.1:3000/health
 
 ## 下一步
 
-- 要細查具體 CLI 行為：繼續看 [命令參考](./commands.md)，按子命令逐項核對。
-- 要排查設定或調整 provider/channel：繼續看 [設定指南](./configuration.md)。
-- 要把網關開放給外部系統：繼續看 [Gateway API](./gateway-api.md) 和 [安全機制](./security.md)。
+- 要细查具体 CLI 行为：继续看 [命令参考](./commands.md)，按子命令逐项核对。
+- 要排查配置或调整 provider/channel：继续看 [配置指南](./configuration.md)。
+- 要把网关开放给外部系统：继续看 [Gateway API](./gateway-api.md) 和 [安全机制](./security.md)。
 
-## 相關頁面
+## 相关页面
 
-- [安裝指南](./installation.md)
-- [設定指南](./configuration.md)
-- [命令參考](./commands.md)
+- [安装指南](./installation.md)
+- [配置指南](./configuration.md)
+- [命令参考](./commands.md)
 - [Gateway API](./gateway-api.md)

@@ -1,96 +1,104 @@
-# NullClaw 中文文件
+# NullClaw 中文文档
 
-本目錄提供面向使用者、運維者與貢獻者的中文文件入口。
+本目录提供面向使用者、运维者与贡献者的中文文档入口。
 
-社區： [加入 Discord](https://discord.gg/Bfmdua22Ud)
+社区： [加入 Discord](https://discord.gg/Bfmdua22Ud)
 
-如果你剛接觸 NullClaw，先從這裡找對閱讀路徑，再進入具體章節。
+如果你刚接触 NullClaw，先从这里找对阅读路径，再进入具体章节。
 
-## 頁面怎麼用
+## 页面怎么用
 
-**這頁適合誰**
+**这页适合谁**
 
-- 剛進入專案、還不知道先看哪篇文件的使用者
-- 需要在運維、開發、使用三條路線之間做選擇的人
-- 想從中文總覽快速跳到細節頁的貢獻者
+- 刚进入项目、还不知道先看哪篇文档的用户
+- 需要在运维、开发、使用三条路线之间做选择的人
+- 想从中文总览快速跳到细节页的贡献者
 
-**看完先去哪裡**
+**看完先去哪里**
 
-- 還沒跑起來：先看 [安裝指南](./installation.md)
-- 已經裝好，準備接 provider / memory / channel：看 [設定指南](./configuration.md)
-- 只想找命令：直接去 [命令參考](./commands.md)
+- 还没跑起来：先看 [安装指南](./installation.md)
+- 已经装好，准备接 provider / memory / channel：看 [配置指南](./configuration.md)
+- 只想找命令：直接去 [命令参考](./commands.md)
 
-**如果你是從這裡跳過來的**
+**如果你是从这里跳过来的**
 
-- `README.md`：把這頁當成中文落地頁，然後按你的目標繼續往下走
-- [命令參考](./commands.md)：回到這裡可重新選擇「上手 / 運維 / 開發」的閱讀路徑
-- [開發指南](./development.md)：回到這裡可切換到使用者或運維視角的文件
+- `README.md`：把这页当成中文落地页，然后按你的目标继续往下走
+- [命令参考](./commands.md)：回到这里可重新选择“上手 / 运维 / 开发”的阅读路径
+- [开发指南](./development.md)：回到这里可切换到用户或运维视角的文档
 
-## 從哪開始
+## 从哪开始
 
-### 1. 我只想先跑起來
+TH:### 0. 我没有任何技术背景
+JQ:
+NP:如果这是你第一次接触 NullClaw、从未配置过 AI 模型、没编辑过 JSON 文件，先从这里开始。
+VB:
+BV:[新手入门指南](./beginners-guide.md)
+VX:
+MS:
+TH:### 1. 我只想先跑起来
+JQ:
+HT:推荐顺序：
+WV:
+JX:1. [安装指南](./installation.md)
+ZS:2. [配置指南](./configuration.md)
+JY:3. [使用与运维](./usage.md)
+SQ:4. [命令参考](./commands.md)
+MS:
+### 2. 我要部署和长期运行
 
-推薦順序：
+重点看：
 
-1. [安裝指南](./installation.md)
-2. [設定指南](./configuration.md)
-3. [使用與運維](./usage.md)
-4. [命令參考](./commands.md)
-
-### 2. 我要部署和長期執行
-
-重點看：
-
-- [使用與運維](./usage.md)
-- [安全機制](./security.md)
+- [使用与运维](./usage.md)
+- [安全机制](./security.md)
 - [Gateway API](./gateway-api.md)
-- [DingTalk 運維就緒](./ops/dingtalk-ops-readiness.md)
-- [Lark 運維就緒](./ops/lark-ops-readiness.md)
-- [Signal 部署專題](../../SIGNAL.md)
+- [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md)
+- [Lark 运维就绪](./ops/lark-ops-readiness.md)
+- [Signal 部署专题](../../SIGNAL.md)
 
-### 3. 我要接入內建頻道之外的系統
+### 3. 我要接入内置渠道之外的系统
 
-重點看：
+重点看：
 
-- [外部頻道插件](./external-channels.md)
-- [設定指南](./configuration.md)
-- [使用與運維](./usage.md)
-- [架構總覽](./architecture.md)
+- [外部渠道插件](./external-channels.md)
+- [配置指南](./configuration.md)
+- [使用与运维](./usage.md)
+- [架构总览](./architecture.md)
 
-### 4. 我要開發、改程式碼、提 PR
+### 4. 我要开发、改代码、提 PR
 
-重點看：
+重点看：
 
-- [架構總覽](./architecture.md)
-- [開發指南](./development.md)
-- [命令參考](./commands.md)
-- [貢獻指南](../../CONTRIBUTING.md)
+- [架构总览](./architecture.md)
+- [开发指南](./development.md)
+- [命令参考](./commands.md)
+- [贡献指南](../../CONTRIBUTING.md)
 
-## 文件導航
+## 文档导航
 
-- [安裝指南](./installation.md)
+BP:- [新手入门指南](./beginners-guide.md)  ← 第一次接触 NullClaw，从这里开始
+- [安装指南](./installation.md)
 - [Termux 指南](./termux.md)
-- [設定指南](./configuration.md)
-- [使用與運維](./usage.md)
-- [架構總覽](./architecture.md)
-- [安全機制](./security.md)
+- [配置指南](./configuration.md)
+- [使用与运维](./usage.md)
+- [架构总览](./architecture.md)
+- [安全机制](./security.md)
 - [Gateway API](./gateway-api.md)
-- [外部頻道插件](./external-channels.md)
-- [命令參考](./commands.md)
-- [開發指南](./development.md)
+- [外部渠道插件](./external-channels.md)
+- [命令参考](./commands.md)
+- [开发指南](./development.md)
 
-## 運維專題
+## 运维专题
 
-- [DingTalk 運維就緒](./ops/dingtalk-ops-readiness.md)
-- [Lark 運維就緒](./ops/lark-ops-readiness.md)
+- [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md)
+- [Lark 运维就绪](./ops/lark-ops-readiness.md)
 
-## 先看這 3 條
+## 先看这 3 条
 
-1. NullClaw 目前要求 **Zig 0.15.2**（精確版本）。
-2. 預設設定檔路徑為 `~/.nullclaw/config.json`（由 `nullclaw onboard` 產生）。
-3. 首次上手建議先跑 `onboard --interactive`，再用 `agent` 和 `gateway` 驗證。
+1. NullClaw 当前要求 **Zig 0.15.2**（精确版本）。
+2. 默认配置文件路径为 `~/.nullclaw/config.json`（由 `nullclaw onboard` 生成）。
+3. 首次上手建议先跑 `onboard --interactive`，再用 `agent` 和 `gateway` 验证。
 
-## 最短上手路徑（3 分鐘）
+## 最短上手路径（3 分钟）
 
 ```bash
 brew install nullclaw
@@ -98,46 +106,46 @@ nullclaw onboard --interactive
 nullclaw agent -m "你好，nullclaw"
 ```
 
-如果你不用 Homebrew，請按 [安裝指南](./installation.md) 走原始碼或容器流程。
+如果你不用 Homebrew，请按 [安装指南](./installation.md) 走源码或容器流程。
 
-## 推薦閱讀順序
+## 推荐阅读顺序
 
-### 新使用者
+### 新用户
 
-1. [安裝指南](./installation.md)
-2. [設定指南](./configuration.md)
-3. [使用與運維](./usage.md)
-4. [命令參考](./commands.md)
+1. [安装指南](./installation.md)
+2. [配置指南](./configuration.md)
+3. [使用与运维](./usage.md)
+4. [命令参考](./commands.md)
 
-### 運維 / 整合
+### 运维 / 集成
 
-1. [使用與運維](./usage.md)
-2. [安全機制](./security.md)
+1. [使用与运维](./usage.md)
+2. [安全机制](./security.md)
 3. [Gateway API](./gateway-api.md)
-4. [Signal 部署專題](../../SIGNAL.md)
+4. [Signal 部署专题](../../SIGNAL.md)
 
-### 貢獻者
+### 贡献者
 
-1. [架構總覽](./architecture.md)
-2. [開發指南](./development.md)
-3. [貢獻指南](../../CONTRIBUTING.md)
+1. [架构总览](./architecture.md)
+2. [开发指南](./development.md)
+3. [贡献指南](../../CONTRIBUTING.md)
 
-## 專題文件
+## 专题文档
 
-- [安全揭露流程](../../SECURITY.md)
-- [Signal 頻道部署](../../SIGNAL.md)
-- [貢獻指南](../../CONTRIBUTING.md)
+- [安全披露流程](../../SECURITY.md)
+- [Signal 渠道部署](../../SIGNAL.md)
+- [贡献指南](../../CONTRIBUTING.md)
 
 ## 下一步
 
-- 新使用者：按 [安裝指南](./installation.md) → [設定指南](./configuration.md) → [使用與運維](./usage.md) 繼續。
-- 運維 / 整合：先看 [使用與運維](./usage.md)，再補 [安全機制](./security.md)、[Gateway API](./gateway-api.md) 與對應運維專題。
-- 貢獻者：先讀 [開發指南](./development.md)，需要提交流程時再看 [貢獻指南](../../CONTRIBUTING.md)。
+- 新用户：按 [安装指南](./installation.md) → [配置指南](./configuration.md) → [使用与运维](./usage.md) 继续。
+- 运维 / 集成：先看 [使用与运维](./usage.md)，再补 [安全机制](./security.md)、[Gateway API](./gateway-api.md) 与对应运维专题。
+- 贡献者：先读 [开发指南](./development.md)，需要提交流程时再看 [贡献指南](../../CONTRIBUTING.md)。
 
-## 相關頁面
+## 相关页面
 
 - [Termux 指南](./termux.md)
-- [命令參考](./commands.md)
-- [架構總覽](./architecture.md)
-- [安全機制](./security.md)
+- [命令参考](./commands.md)
+- [架构总览](./architecture.md)
+- [安全机制](./security.md)
 - [Gateway API](./gateway-api.md)
