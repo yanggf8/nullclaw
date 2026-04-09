@@ -1,36 +1,36 @@
-# Lark 运维就绪
+# Lark 運維就緒
 
-本指南定义 Lark/飞书通道的专项运维检查项。
+本指南定義 Lark/飛書頻道的專項運維檢查項。
 
-## 健康语义
+## 健康語義
 
-- websocket 模式下，仅当 running 与 connected 同时为真时才算健康。
-- webhook 模式下，运行态有效且回调路径可达才算健康。
+- websocket 模式下，僅當 running 與 connected 同時為真時才算健康。
+- webhook 模式下，執行態有效且回呼路徑可達才算健康。
 
-## 认证与权限
+## 認證與權限
 
-1. 校验租户 token 获取与刷新行为。
-2. 业务码非零应视为运行失败。
-3. 权限/scope 类错误应立即升级处理。
+1. 校驗租戶 token 取得與刷新行為。
+2. 業務碼非零應視為執行失敗。
+3. 權限/scope 類錯誤應立即升級處理。
 
 ## `error.LarkApiError` 快速排查
 
-1. 先运行 `nullclaw doctor`，确认渠道配置在结构上是有效的。
-2. 启动后运行 `nullclaw channel status`，确认是否处于 running 但未 connected 的状态。
-3. 如果持续出现 `warning(lark): lark websocket cycle failed: error.LarkApiError`，优先按下面三类排查：
-   - Lark/飞书应用权限或 scope 缺失
-   - 区域端点选择错误（`use_feishu`）
-   - websocket 回调配置下发失败
-4. 如果旧版 Linux 二进制在进入稳定重连日志前就直接崩溃，先升级版本，再继续做权限排查。
+1. 先執行 `nullclaw doctor`，確認頻道設定在結構上是有效的。
+2. 啟動後執行 `nullclaw channel status`，確認是否處於 running 但未 connected 的狀態。
+3. 如果持續出現 `warning(lark): lark websocket cycle failed: error.LarkApiError`，優先按下面三類排查：
+   - Lark/飛書應用權限或 scope 缺失
+   - 區域端點選擇錯誤（`use_feishu`）
+   - websocket 回呼設定下發失敗
+4. 如果舊版 Linux 二進位在進入穩定重連日誌前就直接崩潰，先升級版本，再繼續做權限排查。
 
-## 事件处置步骤
+## 事件處置步驟
 
-1. 在飞书/Lark 控制台检查应用权限与 scope。
-2. 验证回调端点与 websocket 路径可达。
-3. 确认发送者白名单（`allow_from`）与群聊 @ 触发逻辑。
-4. 仅在完成根因记录后重启通道实例。
+1. 在飛書/Lark 控制台檢查應用權限與 scope。
+2. 驗證回呼端點與 websocket 路徑可達。
+3. 確認傳送者白名單（`allow_from`）與群聊 @ 觸發邏輯。
+4. 僅在完成根因記錄後重啟頻道實例。
 
-## SLO 信号
+## SLO 信號
 
 - auth_fail_total
 - reconnect_total
