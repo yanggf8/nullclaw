@@ -27,6 +27,7 @@ const subagent_runner = @import("subagent_runner.zig");
 const observability = @import("observability.zig");
 const agent_routing = @import("agent_routing.zig");
 const security = @import("security/policy.zig");
+const audit_mod = @import("security/audit.zig");
 const tencent_crypto = @import("security/tencent_crypto.zig");
 const root_mod = @import("root.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
@@ -79,6 +80,24 @@ const WebhookRouting = struct {
         if (self.metadata_json) |owned| allocator.free(owned);
     }
 };
+
+/// Audit callback for SecurityPolicy — bridges PolicyAuditEntry to AuditLogger.
+fn auditPolicyCallback(ctx: *anyopaque, entry: security.PolicyAuditEntry) void {
+    const logger: *audit_mod.AuditLogger = @ptrCast(@alignCast(ctx));
+    var ev = audit_mod.AuditEvent.init(.policy_violation);
+    ev.action = .{
+        .command = entry.command,
+        .risk_level = entry.risk_level.toString(),
+        .approved = false,
+        .allowed = entry.decision == .allowed,
+    };
+    ev.security = .{
+        .policy_violation = entry.decision == .denied,
+        .rate_limit_remaining = null,
+        .sandbox_backend = null,
+    };
+    logger.log(&ev) catch {};
+}
 
 fn simpleConversationContext(
     channel: []const u8,
@@ -6494,6 +6513,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var subagent_manager_opt: ?*subagent_mod.SubagentManager = null;
     var sec_tracker_opt: ?security.RateTracker = null;
     var sec_policy_opt: ?security.SecurityPolicy = null;
+    var sec_audit_log_opt: ?audit_mod.AuditLogger = null;
     var gateway_thread_observer = GatewayThreadObserver.init(allocator);
     defer gateway_thread_observer.deinit();
     var runtime_observer: ?*observability.RuntimeObserver = null;
@@ -6591,6 +6611,22 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 .tracker = if (sec_tracker_opt) |*tracker| tracker else null,
             };
 
+            // Wire policy audit log if enabled.
+            if (cfg.security.audit.enabled) {
+                const audit_base = std.fs.path.dirname(cfg.config_path) orelse ".";
+                if (audit_mod.AuditLogger.init(allocator, .{
+                    .enabled = true,
+                    .log_path = if (cfg.security.audit.log_path.len > 0) cfg.security.audit.log_path else "policy_audit.jsonl",
+                    .max_size_mb = cfg.security.audit.max_size_mb,
+                }, audit_base)) |al| {
+                    sec_audit_log_opt = al;
+                    if (sec_policy_opt) |*pol| {
+                        pol.audit_fn = auditPolicyCallback;
+                        pol.audit_ctx = &sec_audit_log_opt.?;
+                    }
+                } else |_| {}
+            }
+
             provider_bundle_opt = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, cfg);
 
             if (provider_bundle_opt) |*bundle| {
@@ -6672,6 +6708,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     defer if (tools_slice.len > 0) tools_mod.deinitTools(allocator, tools_slice);
     defer if (session_mgr_opt) |*sm| sm.deinit();
     defer if (sec_tracker_opt) |*tracker| tracker.deinit();
+    defer if (sec_audit_log_opt) |*al| al.deinit();
 
     // Resolve the listen address
     const addr = try std.net.Address.resolveIp(host, port);

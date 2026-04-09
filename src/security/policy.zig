@@ -78,7 +78,30 @@ pub fn resolveAllowedCommands(
     return &default_allowed_commands;
 }
 
-/// Security policy enforced on all tool executions
+/// Gates that fired during a policy decision.
+pub const PolicyGates = packed struct(u8) {
+    command_not_allowed: bool = false,
+    high_risk_blocked: bool = false,
+    approval_required: bool = false,
+    rate_limited: bool = false,
+    autonomy_blocked: bool = false,
+    _pad: u3 = 0,
+};
+
+/// Structured audit entry emitted for every policy decision.
+/// Slices point into caller-owned memory and must not be stored beyond the callback.
+pub const PolicyAuditEntry = struct {
+    timestamp_ns: i128,
+    action_type: enum { command, rate_check, autonomy },
+    command: ?[]const u8,
+    risk_level: CommandRiskLevel,
+    gates_fired: PolicyGates,
+    decision: enum { allowed, denied },
+    denial_reason: ?[]const u8,
+};
+
+/// Security policy enforced on all tool executions.
+/// If audit_fn is set, audit_ctx must outlive this struct — do not copy without updating audit_ctx.
 pub const SecurityPolicy = struct {
     autonomy: AutonomyLevel = .supervised,
     workspace_dir: []const u8 = ".",
@@ -91,6 +114,16 @@ pub const SecurityPolicy = struct {
     /// `&` in URLs (e.g. `curl https://...?a=1&b=2`) is permitted.
     allow_raw_url_chars: bool = false,
     tracker: ?*RateTracker = null,
+    /// Optional audit callback. Called synchronously on every policy decision.
+    audit_fn: ?*const fn (*anyopaque, PolicyAuditEntry) void = null,
+    audit_ctx: ?*anyopaque = null,
+
+    /// Fire the audit callback if configured.
+    fn audit(self: *const SecurityPolicy, entry: PolicyAuditEntry) void {
+        if (self.audit_fn) |f| {
+            if (self.audit_ctx) |ctx| f(ctx, entry);
+        }
+    }
 
     /// Classify command risk level.
     pub fn commandRiskLevel(self: *const SecurityPolicy, command: []const u8) CommandRiskLevel {
@@ -151,6 +184,15 @@ pub const SecurityPolicy = struct {
     ) error{ CommandNotAllowed, HighRiskBlocked, ApprovalRequired }!CommandRiskLevel {
         if (self.autonomy == .yolo) return .low;
         if (!self.isCommandAllowed(command)) {
+            self.audit(.{
+                .timestamp_ns = std.time.nanoTimestamp(),
+                .action_type = .command,
+                .command = command,
+                .risk_level = .low,
+                .gates_fired = .{ .command_not_allowed = true },
+                .decision = .denied,
+                .denial_reason = "command not on allowlist",
+            });
             return error.CommandNotAllowed;
         }
 
@@ -158,9 +200,27 @@ pub const SecurityPolicy = struct {
 
         if (risk == .high) {
             if (self.block_high_risk_commands) {
+                self.audit(.{
+                    .timestamp_ns = std.time.nanoTimestamp(),
+                    .action_type = .command,
+                    .command = command,
+                    .risk_level = risk,
+                    .gates_fired = .{ .high_risk_blocked = true },
+                    .decision = .denied,
+                    .denial_reason = "high-risk command blocked",
+                });
                 return error.HighRiskBlocked;
             }
             if (self.autonomy == .supervised and !approved) {
+                self.audit(.{
+                    .timestamp_ns = std.time.nanoTimestamp(),
+                    .action_type = .command,
+                    .command = command,
+                    .risk_level = risk,
+                    .gates_fired = .{ .approval_required = true },
+                    .decision = .denied,
+                    .denial_reason = "approval required for high-risk command",
+                });
                 return error.ApprovalRequired;
             }
         }
@@ -170,9 +230,27 @@ pub const SecurityPolicy = struct {
             self.require_approval_for_medium_risk and
             !approved)
         {
+            self.audit(.{
+                .timestamp_ns = std.time.nanoTimestamp(),
+                .action_type = .command,
+                .command = command,
+                .risk_level = risk,
+                .gates_fired = .{ .approval_required = true },
+                .decision = .denied,
+                .denial_reason = "approval required for medium-risk command",
+            });
             return error.ApprovalRequired;
         }
 
+        self.audit(.{
+            .timestamp_ns = std.time.nanoTimestamp(),
+            .action_type = .command,
+            .command = command,
+            .risk_level = risk,
+            .gates_fired = .{},
+            .decision = .allowed,
+            .denial_reason = null,
+        });
         return risk;
     }
 
@@ -271,7 +349,19 @@ pub const SecurityPolicy = struct {
     pub fn recordAction(self: *const SecurityPolicy) !bool {
         if (self.autonomy == .yolo) return true;
         if (self.tracker) |tracker| {
-            return tracker.recordAction();
+            const allowed = try tracker.recordAction();
+            if (!allowed) {
+                self.audit(.{
+                    .timestamp_ns = std.time.nanoTimestamp(),
+                    .action_type = .rate_check,
+                    .command = null,
+                    .risk_level = .low,
+                    .gates_fired = .{ .rate_limited = true },
+                    .decision = .denied,
+                    .denial_reason = "rate limit exceeded",
+                });
+            }
+            return allowed;
         }
         return true;
     }
@@ -1719,4 +1809,81 @@ test "yolo isRateLimited always false" {
     };
     _ = try tracker.recordAction();
     try std.testing.expect(p.isRateLimited() == false);
+}
+
+// ── Audit callback tests ─────────────────────────────────────────
+
+const TestAuditCapture = struct {
+    entry: ?PolicyAuditEntry = null,
+    count: usize = 0,
+
+    fn callback(ctx: *anyopaque, entry: PolicyAuditEntry) void {
+        const self: *TestAuditCapture = @ptrCast(@alignCast(ctx));
+        self.entry = entry;
+        self.count += 1;
+    }
+};
+
+test "audit callback fires on high_risk_blocked" {
+    var cap = TestAuditCapture{};
+    // curl is in high_risk_commands; add it to allowed_commands so it passes isCommandAllowed
+    // but then hits the block_high_risk_commands gate.
+    const p = SecurityPolicy{
+        .autonomy = .supervised,
+        .allowed_commands = &.{"curl"},
+        .allow_raw_url_chars = true,
+        .block_high_risk_commands = true,
+        .audit_fn = TestAuditCapture.callback,
+        .audit_ctx = &cap,
+    };
+    _ = p.validateCommandExecution("curl https://example.com", false) catch {};
+    try std.testing.expectEqual(@as(usize, 1), cap.count);
+    const e = cap.entry.?;
+    try std.testing.expectEqual(e.decision, .denied);
+    try std.testing.expect(e.gates_fired.high_risk_blocked);
+}
+
+test "audit callback fires on command_not_allowed" {
+    var cap = TestAuditCapture{};
+    const p = SecurityPolicy{
+        .autonomy = .supervised,
+        .allowed_commands = &.{"ls"},
+        .audit_fn = TestAuditCapture.callback,
+        .audit_ctx = &cap,
+    };
+    _ = p.validateCommandExecution("curl https://example.com", false) catch {};
+    try std.testing.expectEqual(@as(usize, 1), cap.count);
+    try std.testing.expect(cap.entry.?.gates_fired.command_not_allowed);
+    try std.testing.expectEqual(cap.entry.?.decision, .denied);
+}
+
+test "audit callback fires allowed decision" {
+    var cap = TestAuditCapture{};
+    const p = SecurityPolicy{
+        .autonomy = .supervised,
+        .allowed_commands = &.{"ls"},
+        .audit_fn = TestAuditCapture.callback,
+        .audit_ctx = &cap,
+    };
+    _ = try p.validateCommandExecution("ls -la", false);
+    try std.testing.expectEqual(@as(usize, 1), cap.count);
+    try std.testing.expectEqual(cap.entry.?.decision, .allowed);
+}
+
+test "audit callback fires on rate_limited" {
+    var tracker = RateTracker.init(std.testing.allocator, 1);
+    defer tracker.deinit();
+    _ = try tracker.recordAction(); // fill the limit
+    var cap = TestAuditCapture{};
+    const p = SecurityPolicy{
+        .autonomy = .supervised,
+        .tracker = &tracker,
+        .audit_fn = TestAuditCapture.callback,
+        .audit_ctx = &cap,
+    };
+    const allowed = try p.recordAction();
+    try std.testing.expect(!allowed);
+    try std.testing.expectEqual(@as(usize, 1), cap.count);
+    try std.testing.expect(cap.entry.?.gates_fired.rate_limited);
+    try std.testing.expectEqual(cap.entry.?.decision, .denied);
 }
