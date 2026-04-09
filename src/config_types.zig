@@ -1305,6 +1305,9 @@ pub const MemoryRetrievalStagesConfig = struct {
     llm_reranker_enabled: bool = false,
     llm_reranker_max_candidates: u32 = 10,
     llm_reranker_timeout_ms: u32 = 5_000,
+    /// Apply Laplace-smoothed outcome score as a post-RRF multiplicative weight.
+    /// Requires SQLite or PostgreSQL backend.
+    utility_weighting_enabled: bool = false,
 };
 
 pub const MemorySummarizerConfig = struct {

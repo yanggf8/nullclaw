@@ -309,6 +309,8 @@ pub const MemoryEntry = struct {
     timestamp: []const u8,
     session_id: ?[]const u8 = null,
     score: ?f64 = null,
+    /// Laplace-smoothed outcome score: (successes+1)/(recalls+2). Populated by SQLite/Postgres.
+    utility_score: f32 = 0.5,
 
     /// Free all allocated strings owned by this entry.
     pub fn deinit(self: *const MemoryEntry, allocator: std.mem.Allocator) void {
@@ -424,6 +426,10 @@ pub const Memory = struct {
         count: *const fn (ptr: *anyopaque) anyerror!usize,
         healthCheck: *const fn (ptr: *anyopaque) bool,
         deinit: *const fn (ptr: *anyopaque) void,
+        /// Optional: fetch Laplace-smoothed utility score for a key.
+        /// Returns (success_count+1) / (recall_count+2) as f32.
+        /// null = not supported by this backend.
+        fetchUtilityScore: ?*const fn (ptr: *anyopaque, key: []const u8) f32 = null,
     };
 
     pub fn name(self: Memory) []const u8 {
@@ -501,6 +507,13 @@ pub const Memory = struct {
         self.vtable.deinit(self.ptr);
     }
 
+    /// Fetch Laplace-smoothed utility score for a key: (success+1)/(recall+2).
+    /// Returns 0.5 (neutral) if the backend does not support it.
+    pub fn fetchUtilityScore(self: Memory, key: []const u8) f32 {
+        if (self.vtable.fetchUtilityScore) |f| return f(self.ptr, key);
+        return 0.5;
+    }
+
     /// Hybrid search: combine keyword recall with optional vector similarity.
     /// This is a convenience method that wraps recall() and merges results.
     /// If an embedding provider is available, it can be used for vector search;
@@ -556,6 +569,11 @@ pub const MemoryRuntime = struct {
     // Lifecycle: semantic cache (optional, extends response cache with cosine similarity)
     _semantic_cache: ?*semantic_cache.SemanticCache = null,
     _semantic_cache_db_path: ?[*:0]const u8 = null,
+
+    // Utility tracking — optional, wired only for SQLite/PostgreSQL backends
+    _record_recall_fn: ?*const fn (ptr: *anyopaque, key: []const u8) anyerror!void = null,
+    _record_success_fn: ?*const fn (ptr: *anyopaque, key: []const u8) anyerror!void = null,
+    _utility_ctx: ?*anyopaque = null,
 
     // P3: vector plane components (all optional)
     _embedding_provider: ?embeddings.EmbeddingProvider = null,
@@ -772,6 +790,30 @@ pub const MemoryRuntime = struct {
     /// Run memory doctor diagnostics and return a report.
     pub fn diagnose(self: *MemoryRuntime) diagnostics.DiagnosticReport {
         return diagnostics.diagnose(self);
+    }
+
+    /// Record that a memory key was retrieved. Best-effort: logs and continues on error.
+    /// Only functional for SQLite/PostgreSQL backends; others are no-ops.
+    pub fn recordRecall(self: *MemoryRuntime, key: []const u8) void {
+        if (self._record_recall_fn) |f| {
+            if (self._utility_ctx) |ctx| {
+                f(ctx, key) catch |err| {
+                    log.debug("recordRecall key={s} err={}", .{ key, err });
+                };
+            }
+        }
+    }
+
+    /// Record that a retrieved memory contributed to a successful turn.
+    /// Best-effort: logs and continues on error.
+    pub fn recordSuccess(self: *MemoryRuntime, key: []const u8) void {
+        if (self._record_success_fn) |f| {
+            if (self._utility_ctx) |ctx| {
+                f(ctx, key) catch |err| {
+                    log.debug("recordSuccess key={s} err={}", .{ key, err });
+                };
+            }
+        }
     }
 
     pub fn deinit(self: *MemoryRuntime) void {
@@ -1399,6 +1441,21 @@ pub fn initRuntime(
         ._circuit_breaker = cb_inst,
         ._outbox = outbox_inst,
         ._sidecar_db_path = sidecar_db_path,
+        ._record_recall_fn = if (build_options.enable_sqlite and
+            std.mem.eql(u8, config.backend, "sqlite"))
+            &sqlite.SqliteMemory.recordRecallImpl
+        else
+            null,
+        ._record_success_fn = if (build_options.enable_sqlite and
+            std.mem.eql(u8, config.backend, "sqlite"))
+            &sqlite.SqliteMemory.recordSuccessImpl
+        else
+            null,
+        ._utility_ctx = if (build_options.enable_sqlite and
+            std.mem.eql(u8, config.backend, "sqlite"))
+            instance.memory.ptr
+        else
+            null,
     };
 }
 

@@ -79,6 +79,8 @@ pub const RetrievalCandidate = struct {
     start_line: u32,
     end_line: u32,
     created_at: i64 = 0,
+    /// Laplace-smoothed outcome score: (successes+1)/(recalls+2). Default 0.5 (neutral).
+    utility_score: f32 = 0.5,
 
     pub fn deinit(self: *const RetrievalCandidate, allocator: Allocator) void {
         allocator.free(self.id);
@@ -146,6 +148,7 @@ pub fn entriesToCandidates(allocator: Allocator, entries: []const MemoryEntry) !
             .start_line = 0,
             .end_line = 0,
             .created_at = created_at,
+            .utility_score = entry.utility_score,
         };
         initialized += 1;
     }
@@ -286,6 +289,7 @@ pub const RetrievalEngine = struct {
     query_expansion_enabled: bool = false,
     adaptive_cfg: adaptive_mod.AdaptiveConfig = .{},
     llm_reranker_cfg: llm_reranker_mod.LlmRerankerConfig = .{},
+    utility_weighting_enabled: bool = false,
 
     /// Optional callback for LLM reranking. If set and llm_reranker is enabled,
     /// the engine calls this with a prompt and expects ranked indices in response.
@@ -319,6 +323,7 @@ pub const RetrievalEngine = struct {
             .max_candidates = stages_cfg.llm_reranker_max_candidates,
             .timeout_ms = stages_cfg.llm_reranker_timeout_ms,
         };
+        self.utility_weighting_enabled = stages_cfg.utility_weighting_enabled;
     }
 
     pub fn addSource(self: *RetrievalEngine, source: RetrievalSourceAdapter) !void {
@@ -492,6 +497,7 @@ pub const RetrievalEngine = struct {
                     // Apply pipeline stages 4-8
                     var merged = result;
                     merged = applyMinRelevance(allocator, merged, self.min_score);
+                    if (self.utility_weighting_enabled) applyUtilityWeighting(merged);
                     temporal_decay_mod.applyTemporalDecay(merged, self.temporal_decay_cfg, std.time.timestamp());
 
                     if (self.mmr_cfg.enabled and merged.len > 1) {
@@ -533,6 +539,9 @@ pub const RetrievalEngine = struct {
 
         // ── Stage 4: min_relevance ──
         merged = applyMinRelevance(allocator, merged, self.min_score);
+
+        // ── Stage 4.5: utility weighting ──
+        if (self.utility_weighting_enabled) applyUtilityWeighting(merged);
 
         // ── Stage 5: temporal_decay ──
         temporal_decay_mod.applyTemporalDecay(merged, self.temporal_decay_cfg, std.time.timestamp());
@@ -652,6 +661,14 @@ fn applyMinRelevance(allocator: Allocator, candidates: []RetrievalCandidate, min
         }
     }
     return shrinkAlloc(allocator, candidates, keep);
+}
+
+/// Apply Laplace-smoothed utility score as a multiplicative weight on final_score.
+/// In-place: no allocation. Modifies candidates[].final_score directly.
+fn applyUtilityWeighting(candidates: []RetrievalCandidate) void {
+    for (candidates) |*c| {
+        c.final_score *= @as(f64, @floatCast(c.utility_score));
+    }
 }
 
 /// Shrink a candidate slice to `new_len`, maintaining correct allocation metadata.
@@ -1252,4 +1269,64 @@ test {
     _ = embeddings_mod;
     _ = temporal_decay_mod;
     _ = mmr_mod;
+}
+
+test "utility_score neutral default is 0.5" {
+    // (0+1)/(0+2) = 0.5
+    const c = RetrievalCandidate{
+        .id = "",
+        .key = "",
+        .content = "",
+        .snippet = "",
+        .category = .core,
+        .keyword_rank = null,
+        .vector_score = null,
+        .final_score = 1.0,
+        .source = "",
+        .source_path = "",
+        .start_line = 0,
+        .end_line = 0,
+    };
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), c.utility_score, 0.001);
+}
+
+test "applyUtilityWeighting multiplies final_score by utility_score" {
+    // High-utility candidate should outrank equal-RRF low-utility candidate
+    var candidates = [_]RetrievalCandidate{
+        .{
+            .id = "",
+            .key = "high",
+            .content = "",
+            .snippet = "",
+            .category = .core,
+            .keyword_rank = null,
+            .vector_score = null,
+            .final_score = 1.0,
+            .source = "",
+            .source_path = "",
+            .start_line = 0,
+            .end_line = 0,
+            .utility_score = 0.9,
+        },
+        .{
+            .id = "",
+            .key = "low",
+            .content = "",
+            .snippet = "",
+            .category = .core,
+            .keyword_rank = null,
+            .vector_score = null,
+            .final_score = 1.0,
+            .source = "",
+            .source_path = "",
+            .start_line = 0,
+            .end_line = 0,
+            .utility_score = 0.3,
+        },
+    };
+    applyUtilityWeighting(&candidates);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9), candidates[0].final_score, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.3), candidates[1].final_score, 0.001);
+    // high-utility still ranks ahead of low-utility
+    try std.testing.expect(candidates[0].final_score > candidates[1].final_score);
 }

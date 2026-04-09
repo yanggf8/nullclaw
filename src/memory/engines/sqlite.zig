@@ -231,6 +231,7 @@ pub const SqliteMemory = struct {
         try self_.migrate();
         try self_.migrateSessionId();
         try self_.migrateAgentNamespace();
+        self_.migrateUtilityCounters();
         return self_;
     }
 
@@ -503,6 +504,69 @@ pub const SqliteMemory = struct {
         }
     }
 
+    /// Migration: add recall_count and success_count columns for utility weighting.
+    /// Safe to run repeatedly; silently ignores duplicate column errors.
+    pub fn migrateUtilityCounters(self: *Self) void {
+        const alters = [_][:0]const u8{
+            "ALTER TABLE memories ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE memories ADD COLUMN success_count INTEGER NOT NULL DEFAULT 0;",
+        };
+        for (alters) |sql| {
+            var err_msg: [*c]u8 = null;
+            const rc = c.sqlite3_exec(self.db, sql, null, null, &err_msg);
+            if (rc != c.SQLITE_OK) {
+                if (err_msg) |msg| {
+                    const msg_text = std.mem.span(msg);
+                    if (std.mem.indexOf(u8, msg_text, "duplicate column name") == null) {
+                        self.logExecFailure("utility counters migration", sql, rc, err_msg);
+                    }
+                    c.sqlite3_free(msg);
+                }
+            }
+        }
+    }
+
+    /// Increment recall_count for a memory key.
+    pub fn recordRecallImpl(ptr: *anyopaque, key: []const u8) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const sql = "UPDATE memories SET recall_count = recall_count + 1 WHERE key = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), c.SQLITE_STATIC);
+        const step_rc = c.sqlite3_step(stmt);
+        if (step_rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    /// Increment success_count for a memory key.
+    pub fn recordSuccessImpl(ptr: *anyopaque, key: []const u8) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const sql = "UPDATE memories SET success_count = success_count + 1 WHERE key = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), c.SQLITE_STATIC);
+        const step_rc = c.sqlite3_step(stmt);
+        if (step_rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    /// Return Laplace-smoothed utility score: CAST(success+1 AS REAL) / CAST(recall+2 AS REAL).
+    pub fn fetchUtilityScoreImpl(ptr: *anyopaque, key: []const u8) f32 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const sql = "SELECT CAST(COALESCE(success_count,0)+1 AS REAL) / CAST(COALESCE(recall_count,0)+2 AS REAL) FROM memories WHERE key = ?1 LIMIT 1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return 0.5;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), c.SQLITE_STATIC);
+        if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            return @floatCast(c.sqlite3_column_double(stmt, 0));
+        }
+        return 0.5;
+    }
+
     // ── Memory trait implementation ────────────────────────────────
 
     fn implName(_: *anyopaque) []const u8 {
@@ -745,6 +809,7 @@ pub const SqliteMemory = struct {
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
+        .fetchUtilityScore = &fetchUtilityScoreImpl,
     };
 
     pub fn memory(self: *Self) Memory {
@@ -1112,7 +1177,8 @@ pub const SqliteMemory = struct {
         if (fts_query.items.len == 0) return allocator.alloc(MemoryEntry, 0);
 
         const sql =
-            "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score, m.session_id " ++
+            "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score, m.session_id," ++
+            " CAST(COALESCE(m.success_count,0)+1 AS REAL)/CAST(COALESCE(m.recall_count,0)+2 AS REAL) " ++
             "FROM memories_fts f " ++
             "JOIN memories m ON m.rowid = f.rowid " ++
             "WHERE memories_fts MATCH ?1 " ++
@@ -1142,6 +1208,7 @@ pub const SqliteMemory = struct {
                 const score_raw = c.sqlite3_column_double(stmt.?, 5);
                 var entry = try readEntryFromRowWithSessionCol(stmt.?, allocator, 6);
                 entry.score = -score_raw; // BM25 returns negative (lower = better)
+                entry.utility_score = @floatCast(c.sqlite3_column_double(stmt.?, 7));
                 // Filter by session_id if requested
                 if (session_id) |sid| {
                     if (entry.session_id == null or !std.mem.eql(u8, entry.session_id.?, sid)) {
@@ -1170,7 +1237,9 @@ pub const SqliteMemory = struct {
         var sql_buf: std.ArrayList(u8) = .empty;
         defer sql_buf.deinit(allocator);
 
-        try sql_buf.appendSlice(allocator, "SELECT id, key, content, category, created_at, session_id FROM memories WHERE ");
+        try sql_buf.appendSlice(allocator, "SELECT id, key, content, category, created_at, session_id," ++
+            " CAST(COALESCE(success_count,0)+1 AS REAL)/CAST(COALESCE(recall_count,0)+2 AS REAL)" ++
+            " FROM memories WHERE ");
 
         for (keywords.items, 0..) |_, i| {
             if (i > 0) try sql_buf.appendSlice(allocator, " OR ");
@@ -1215,6 +1284,7 @@ pub const SqliteMemory = struct {
             if (rc == c.SQLITE_ROW) {
                 var entry = try readEntryFromRow(stmt.?, allocator);
                 entry.score = 1.0;
+                entry.utility_score = @floatCast(c.sqlite3_column_double(stmt.?, 6));
                 // Filter by session_id if requested
                 if (session_id) |sid| {
                     if (entry.session_id == null or !std.mem.eql(u8, entry.session_id.?, sid)) {
@@ -2548,4 +2618,61 @@ test "sqlite clearMessages does not affect other sessions" {
     const s2_msgs = try mem.loadMessages(std.testing.allocator, "s2");
     defer root.freeMessages(std.testing.allocator, s2_msgs);
     try std.testing.expectEqual(@as(usize, 1), s2_msgs.len);
+}
+
+test "migrateUtilityCounters adds columns with DEFAULT 0" {
+    const allocator = std.testing.allocator;
+    var mem = try SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    // Migration runs automatically during init — verify columns exist and default to 0
+    try mem.memory().store("util_test_key", "some content", .core, null);
+
+    // recordRecall should succeed (column exists)
+    try SqliteMemory.recordRecallImpl(@ptrCast(&mem), "util_test_key");
+    try SqliteMemory.recordRecallImpl(@ptrCast(&mem), "util_test_key");
+    try SqliteMemory.recordSuccessImpl(@ptrCast(&mem), "util_test_key");
+
+    // fetchUtilityScore: (success+1)/(recall+2) = (1+1)/(2+2) = 0.5
+    const score = SqliteMemory.fetchUtilityScoreImpl(@ptrCast(&mem), "util_test_key");
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), score, 0.001);
+}
+
+test "migrateUtilityCounters is idempotent" {
+    const allocator = std.testing.allocator;
+    var mem = try SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    // Calling migration again on existing DB should not fail
+    mem.migrateUtilityCounters();
+    mem.migrateUtilityCounters();
+}
+
+test "fetchUtilityScoreImpl neutral for new key" {
+    const allocator = std.testing.allocator;
+    var mem = try SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    // Key with no entries: score defaults to 0.5
+    const score = SqliteMemory.fetchUtilityScoreImpl(@ptrCast(&mem), "nonexistent_key");
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), score, 0.001);
+}
+
+test "recordRecall and recordSuccess increment counters" {
+    const allocator = std.testing.allocator;
+    var mem = try SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    try mem.memory().store("counter_key", "test", .core, null);
+
+    // Initially neutral
+    const initial = SqliteMemory.fetchUtilityScoreImpl(@ptrCast(&mem), "counter_key");
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), initial, 0.001);
+
+    // After 10 recalls, 8 successes: (8+1)/(10+2) = 9/12 = 0.75
+    for (0..10) |_| try SqliteMemory.recordRecallImpl(@ptrCast(&mem), "counter_key");
+    for (0..8) |_| try SqliteMemory.recordSuccessImpl(@ptrCast(&mem), "counter_key");
+
+    const learned = SqliteMemory.fetchUtilityScoreImpl(@ptrCast(&mem), "counter_key");
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), learned, 0.001);
 }

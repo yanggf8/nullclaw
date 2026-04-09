@@ -154,6 +154,11 @@ pub fn loadContextWithRuntime(
     };
     defer memory_mod.retrieval.freeCandidates(allocator, scoped_candidates);
 
+    // Record each recalled key for utility tracking (best-effort, errors logged inside)
+    for (scoped_candidates) |cand| {
+        if (!isInternalMemoryKey(cand.key)) rt.recordRecall(cand.key);
+    }
+
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
@@ -322,6 +327,24 @@ pub fn buildSensoriumPrefix(allocator: std.mem.Allocator, data: SensoriumData) !
 
     try w.writeAll("/>\n");
     return try buf.toOwnedSlice(allocator);
+}
+
+/// Return the top recalled memory key (non-internal, highest final_score) for success attribution.
+/// Returns null if no eligible candidates found or search fails. Caller owns returned slice.
+pub fn topRecalledKey(
+    allocator: std.mem.Allocator,
+    rt: *MemoryRuntime,
+    user_message: []const u8,
+    session_id: ?[]const u8,
+) ?[]u8 {
+    const candidates = rt.search(allocator, user_message, DEFAULT_RECALL_LIMIT, session_id) catch return null;
+    defer memory_mod.retrieval.freeCandidates(allocator, candidates);
+    for (candidates) |cand| {
+        if (!isInternalMemoryKey(cand.key)) {
+            return allocator.dupe(u8, cand.key) catch null;
+        }
+    }
+    return null;
 }
 
 /// Prepend a sensorium block to `user_message`. Caller owns returned slice.

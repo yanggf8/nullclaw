@@ -320,6 +320,8 @@ pub const Agent = struct {
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     compaction_max_source_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
     sensorium_enabled: bool = false,
+    /// Top recalled memory key from the last turn (for success attribution). Owned.
+    last_recalled_top_key: ?[]u8 = null,
 
     /// Per-turn MCP tool filter groups (slice into config-owned memory; not freed by Agent).
     /// Empty = no filtering; all tool specs are sent as-is.
@@ -527,6 +529,7 @@ pub const Agent = struct {
         if (self.workspace_dir_owned) self.allocator.free(self.workspace_dir);
         if (self.system_prompt_model_name) |model| self.allocator.free(model);
         if (self.last_route_trace) |trace| self.allocator.free(trace);
+        if (self.last_recalled_top_key) |key| self.allocator.free(key);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
         if (self.tts_provider_owned and self.tts_provider != null) self.allocator.free(self.tts_provider.?);
         if (self.pending_exec_command_owned and self.pending_exec_command != null) self.allocator.free(self.pending_exec_command.?);
@@ -1780,6 +1783,13 @@ pub const Agent = struct {
         else
             try self.allocator.dupe(u8, pre_enrich_message);
 
+        // Stash top recalled key for success attribution after a successful turn.
+        if (self.last_recalled_top_key) |old_key| self.allocator.free(old_key);
+        self.last_recalled_top_key = if (self.mem_rt) |rt|
+            memory_loader.topRecalledKey(self.allocator, rt, effective_user_message, self.memory_session_id)
+        else
+            null;
+
         // Keep the user message retained even if provider/tool steps fail.
         try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
 
@@ -2278,6 +2288,13 @@ pub const Agent = struct {
                     const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, turn_model_name, sys_prompt, effective_user_message);
                     const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
                     rc.put(self.allocator, store_key_hex, turn_model_name, final_text, token_count) catch {};
+                }
+
+                // Record memory success attribution when at least one tool iteration ran
+                if (iteration > 0) {
+                    if (self.mem_rt) |rt| {
+                        if (self.last_recalled_top_key) |key| rt.recordSuccess(key);
+                    }
                 }
 
                 return final_text;
