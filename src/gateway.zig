@@ -3835,7 +3835,7 @@ fn runQueueWorker(state: *GatewayState) void {
             const spec = dr.spec;
 
             log.info("running queued job '{s}'", .{spec.id});
-            const now = std.time.timestamp();
+            const start_ts = std.time.timestamp();
             const timeout: u64 = spec.timeout_secs orelse 0;
 
             // Convert delivery for deliverResult (same fields, different namespace).
@@ -3897,7 +3897,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     shell_child.cwd = state.cron_workspace_dir;
                     shell_child.spawn() catch |err| {
                         log.err("[{s}] exec failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false, null);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, null);
                         continue;
                     };
                     errdefer {
@@ -3918,12 +3918,12 @@ fn runQueueWorker(state: *GatewayState) void {
                         shell_start_ns,
                     ) catch |err| {
                         log.err("[{s}] collect failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false, null);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, null);
                         continue;
                     };
                     const shell_term = shell_child.wait() catch |err| {
                         log.err("[{s}] wait failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false, null);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, null);
                         continue;
                     };
                     if (shell_timed_out) log.warn("[{s}] timed out after {d}s", .{ spec.id, timeout });
@@ -3945,7 +3945,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         }
                     }
                     const status = if (success) "ok" else "error";
-                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, status, if (raw_output.len > 0) raw_output else null, spec.delete_after_run, delivered, null);
+                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std.time.timestamp(), status, if (raw_output.len > 0) raw_output else null, spec.delete_after_run, delivered, null);
                     log.info("[{s}] completed ({s})", .{ spec.id, status });
                 },
                 .agent => {
@@ -3955,7 +3955,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     const p = resolved_p orelse raw_p;
                     const agent_result = cron_mod.runAgentJob(arena, state.cron_workspace_dir, p, spec.model, timeout) catch |err| {
                         log.err("[{s}] agent failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false, null);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, null);
                         continue;
                     };
                     defer arena.free(agent_result.output);
@@ -3980,7 +3980,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         }
                     }
                     const status = if (agent_result.success) "ok" else "error";
-                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, status, if (raw_agent.len > 0) raw_agent else null, spec.delete_after_run, delivered, null);
+                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std.time.timestamp(), status, if (raw_agent.len > 0) raw_agent else null, spec.delete_after_run, delivered, null);
                     log.info("[{s}] completed ({s})", .{ spec.id, status });
                 },
                 .skill => {
@@ -4002,7 +4002,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         state.alert_delivery orelse cron_mod.DeliveryConfig{};
                     const raw_skill_cmd = cron_mod.resolveSkillExec(arena, spec.skill_name, spec.skill_args) catch |err| {
                         log.err("[{s}] skill resolution failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false, null);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, null);
                         if (state.event_bus) |eb| {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' resolution failed: {s}", .{ spec.skill_name orelse "?", @errorName(err) }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
@@ -4022,7 +4022,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     skill_child.cwd = state.cron_workspace_dir;
                     skill_child.spawn() catch |err| {
                         log.err("[{s}] skill exec failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false, null);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, null);
                         if (state.event_bus) |eb| {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' failed to start: {s}", .{ spec.skill_name orelse "?", @errorName(err) }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
@@ -4047,7 +4047,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         skill_start_ns,
                     ) catch |err| {
                         log.err("[{s}] skill collect failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false, null);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, null);
                         if (state.event_bus) |eb| {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' output collection failed: {s}", .{ spec.skill_name orelse "?", @errorName(err) }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
@@ -4056,7 +4056,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     };
                     const skill_term = skill_child.wait() catch |err| {
                         log.err("[{s}] skill wait failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, "error", null, spec.delete_after_run, false, null);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, null);
                         if (state.event_bus) |eb| {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' wait failed: {s}", .{ spec.skill_name orelse "?", @errorName(err) }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
@@ -4123,7 +4123,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     const skill_output = if (skill_stdout.items.len > 0) skill_stdout.items else skill_stderr.items;
                     const skill_status = if (skill_ok) "ok" else "error";
                     // Skills self-deliver — no cron delivery needed.
-                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, skill_status, if (skill_output.len > 0) skill_output else null, spec.delete_after_run, false, run_result);
+                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std.time.timestamp(), skill_status, if (skill_output.len > 0) skill_output else null, spec.delete_after_run, false, run_result);
                     // Alert operator on hard failure (verified=3) or degraded content (verified=2).
                     if (run_result.verified != 1) {
                         if (state.event_bus) |eb| {

@@ -5016,11 +5016,20 @@ pub fn cliInitSeed(allocator: std.mem.Allocator) !void {
             ) catch continue,
         };
 
-        // Apply timezone offset and recalculate next_run_secs with it.
+        // Restore fields not covered by the add*Job helpers.
         job.tz_offset_s = seed_tz_offset;
         if (seed_tz_offset != 0) {
             job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), seed_tz_offset) catch job.next_run_secs;
         }
+        if (obj.get("one_shot")) |v| if (v == .bool) {
+            job.one_shot = v.bool;
+        };
+        if (obj.get("delete_after_run")) |v| if (v == .bool) {
+            job.delete_after_run = v.bool;
+        };
+        if (jsonStr(obj, "session_target")) |st| job.session_target = SessionTarget.parse(st);
+        if (jsonStr(obj, "verification_mode")) |vm| job.verification_mode = VerificationMode.parse(vm);
+        if (jsonStr(obj, "repair_policy")) |rp| job.repair_policy = RepairPolicy.parse(rp);
 
         _ = dbSaveJob(db, job) catch continue;
         count += 1;
