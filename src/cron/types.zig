@@ -141,11 +141,69 @@ pub const CronJob = struct {
     last_output: ?[]const u8 = null,
     delivery: DeliveryConfig = .{},
     tz_offset_s: i32 = 0,
+    verification_mode: VerificationMode = .none,
+    repair_policy: RepairPolicy = .none,
 };
 
 /// Immutable execution snapshot returned by CronBackend.dequeue().
 /// Claimed and loaded atomically — no second DB lookup needed by the worker.
 /// All strings are arena-allocated; caller frees via arena.deinit().
+pub const VerificationMode = enum {
+    none,
+    exit_only,
+    content_nonempty,
+    content_has_trace,
+
+    pub fn asStr(self: VerificationMode) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .exit_only => "exit_only",
+            .content_nonempty => "content_nonempty",
+            .content_has_trace => "content_has_trace",
+        };
+    }
+
+    pub fn parse(s: []const u8) VerificationMode {
+        if (std.ascii.eqlIgnoreCase(s, "exit_only")) return .exit_only;
+        if (std.ascii.eqlIgnoreCase(s, "content_nonempty")) return .content_nonempty;
+        if (std.ascii.eqlIgnoreCase(s, "content_has_trace")) return .content_has_trace;
+        return .none;
+    }
+};
+
+pub const RepairPolicy = enum {
+    none,
+    retry_once,
+    alert_only,
+
+    pub fn asStr(self: RepairPolicy) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .retry_once => "retry_once",
+            .alert_only => "alert_only",
+        };
+    }
+
+    pub fn parse(s: []const u8) RepairPolicy {
+        if (std.ascii.eqlIgnoreCase(s, "retry_once")) return .retry_once;
+        if (std.ascii.eqlIgnoreCase(s, "alert_only")) return .alert_only;
+        return .none;
+    }
+};
+
+/// Classification result from a single skill execution.
+/// All string fields point to string literals — no allocator needed.
+pub const RunResult = struct {
+    exit_code: u8,
+    timed_out: bool,
+    /// "timeout" | "exec_error" | "content_empty" | "content_invalid" | null
+    failure_class: ?[]const u8 = null,
+    /// "retried_ok" | "retried_failed" | "alert_sent" | null
+    repair_action: ?[]const u8 = null,
+    /// 0=unverified 1=ok 2=degraded 3=failed_verify
+    verified: u8 = 0,
+};
+
 pub const CronJobSpec = struct {
     id: []const u8,
     job_type: JobType,
@@ -159,6 +217,8 @@ pub const CronJobSpec = struct {
     timeout_secs: ?u32,
     delivery: DeliveryConfig, // best_effort correctly loaded from DB
     session_target: SessionTarget,
+    verification_mode: VerificationMode = .none,
+    repair_policy: RepairPolicy = .none,
 };
 
 /// Result of an atomic dequeue+claim+snapshot operation.
@@ -219,4 +279,6 @@ pub const NewJobSpec = struct {
     /// Required for @once: delay expressions where expression is not a valid cron pattern.
     next_run_secs_override: i64 = 0,
     tz_offset_s: i32 = 0,
+    verification_mode: VerificationMode = .none,
+    repair_policy: RepairPolicy = .none,
 };

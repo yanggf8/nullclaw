@@ -29,6 +29,9 @@ pub const DequeueResult = types.DequeueResult;
 pub const CronJobOutput = types.CronJobOutput;
 pub const CronJobSummary = types.CronJobSummary;
 pub const NewJobSpec = types.NewJobSpec;
+pub const VerificationMode = types.VerificationMode;
+pub const RepairPolicy = types.RepairPolicy;
+pub const RunResult = types.RunResult;
 
 pub const CronBackend = struct {
     ptr: *anyopaque,

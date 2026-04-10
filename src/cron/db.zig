@@ -137,6 +137,8 @@ pub const DbCronBackend = struct {
             .next_run_secs = next_run,
             .created_at_s = created_at,
             .tz_offset_s = spec.tz_offset_s,
+            .verification_mode = spec.verification_mode,
+            .repair_policy = spec.repair_policy,
         };
 
         // Convert types.CronJob -> cron.CronJob for dbSaveJob (same shape, different namespace).
@@ -159,6 +161,8 @@ pub const DbCronBackend = struct {
             .next_run_secs = job.next_run_secs,
             .created_at_s = job.created_at_s,
             .tz_offset_s = job.tz_offset_s,
+            .verification_mode = @enumFromInt(@intFromEnum(job.verification_mode)),
+            .repair_policy = @enumFromInt(@intFromEnum(job.repair_policy)),
         };
         try dbSaveJobDirect(db, &legacy);
         return job;
@@ -271,7 +275,7 @@ pub const DbCronBackend = struct {
         // We need delete_after_run to decide the completion path.
         // Load it cheaply from the DB.
         const dar = try dbGetDeleteAfterRun(db, id);
-        try cron.dbCompleteJob(db, id, row_id, now, status, output, dar);
+        try cron.dbCompleteJob(db, id, row_id, now, status, output, dar, null, null);
     }
 
     fn vtableResetInProgress(ptr: *anyopaque) anyerror!void {
@@ -808,6 +812,8 @@ fn dbAtomicDequeue(db: *c.sqlite3, allocator: std.mem.Allocator) !?types.Dequeue
             .timeout_secs = legacy_spec.timeout_secs,
             .delivery = typesDelivery(legacy_spec.delivery),
             .session_target = @enumFromInt(@intFromEnum(legacy_spec.session_target)),
+            .verification_mode = @enumFromInt(@intFromEnum(legacy_spec.verification_mode)),
+            .repair_policy = @enumFromInt(@intFromEnum(legacy_spec.repair_policy)),
         },
     };
 }
@@ -860,8 +866,9 @@ fn dbSaveJobDirect(db: *c.sqlite3, job: *const cron.CronJob) !void {
         "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
         "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs, " ++
         "delivery_best_effort, session_target, skill_name, skill_args, tz_offset_s, " ++
-        "delivery_peer_kind, delivery_peer_id, delivery_thread_id) " ++
-        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)";
+        "delivery_peer_kind, delivery_peer_id, delivery_thread_id, " ++
+        "verification_mode, repair_policy) " ++
+        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31)";
     var stmt: ?*c.sqlite3_stmt = null;
     var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
     if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -906,6 +913,10 @@ fn dbSaveJobDirect(db: *c.sqlite3, job: *const cron.CronJob) !void {
     } else _ = c.sqlite3_bind_null(stmt, 27);
     if (job.delivery.peer_id) |pid| _ = c.sqlite3_bind_text(stmt, 28, pid.ptr, @intCast(pid.len), SQLITE_STATIC) else _ = c.sqlite3_bind_null(stmt, 28);
     if (job.delivery.thread_id) |tid| _ = c.sqlite3_bind_text(stmt, 29, tid.ptr, @intCast(tid.len), SQLITE_STATIC) else _ = c.sqlite3_bind_null(stmt, 29);
+    const vm_str = job.verification_mode.asStr();
+    _ = c.sqlite3_bind_text(stmt, 30, vm_str.ptr, @intCast(vm_str.len), SQLITE_STATIC);
+    const rp_str = job.repair_policy.asStr();
+    _ = c.sqlite3_bind_text(stmt, 31, rp_str.ptr, @intCast(rp_str.len), SQLITE_STATIC);
 
     rc = c.sqlite3_step(stmt);
     if (rc != c.SQLITE_DONE) return error.StepFailed;

@@ -2741,6 +2741,10 @@ fn appendCronBackendJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem
     if (job.skill_args) |sa| try appendJsonStringBuf(buf, allocator, sa) else try buf.appendSlice(allocator, "null");
     try buf.appendSlice(allocator, ",\"tz_offset_s\":");
     try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{job.tz_offset_s}) catch "0");
+    try buf.appendSlice(allocator, ",\"verification_mode\":");
+    try appendJsonStringBuf(buf, allocator, job.verification_mode.asStr());
+    try buf.appendSlice(allocator, ",\"repair_policy\":");
+    try appendJsonStringBuf(buf, allocator, job.repair_policy.asStr());
     try buf.appendSlice(allocator, "}");
 }
 
@@ -2895,6 +2899,14 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
         const v = jsonIntField(body, "tz_offset_s") orelse break :blk 0;
         break :blk @intCast(v);
     };
+    const verification_mode_add = if (cronObjectStringField(obj, "verification_mode")) |raw|
+        cron_backend_mod.VerificationMode.parse(raw)
+    else
+        cron_backend_mod.VerificationMode.none;
+    const repair_policy_add = if (cronObjectStringField(obj, "repair_policy")) |raw|
+        cron_backend_mod.RepairPolicy.parse(raw)
+    else
+        cron_backend_mod.RepairPolicy.none;
 
     // ── DB-direct path ────────────────────────────────────────────────
     if (ctx.state.cron_db_backend) |*be| {
@@ -2980,6 +2992,8 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
             .session_target = @enumFromInt(@intFromEnum(session_target)),
             .next_run_secs_override = next_run_override,
             .tz_offset_s = tz_offset_s_add,
+            .verification_mode = verification_mode_add,
+            .repair_policy = repair_policy_add,
         };
 
         const job = be.backend().add(ctx.req_allocator, spec) catch |err| {
@@ -3698,6 +3712,31 @@ fn handleCronLoadFromSeed(ctx: *WebhookHandlerContext) void {
     ctx.response_body = "{\"status\":\"restored\"}";
 }
 
+/// Classify a completed skill run into a RunResult based on exit code, timeout, and
+/// the job's verification_mode. All failure/repair strings are literals — no allocator.
+fn classifySkillRun(
+    spec: anytype,
+    stdout: []const u8,
+    exit_code: u8,
+    timed_out: bool,
+) cron_mod.RunResult {
+    if (timed_out) return .{ .exit_code = exit_code, .timed_out = true, .failure_class = "timeout", .verified = 3 };
+    if (exit_code != 0) return .{ .exit_code = exit_code, .timed_out = false, .failure_class = "exec_error", .verified = 3 };
+    switch (spec.verification_mode) {
+        .none, .exit_only => return .{ .exit_code = 0, .timed_out = false, .verified = 1 },
+        .content_nonempty => {
+            if (std.mem.trim(u8, stdout, " \t\n\r").len == 0)
+                return .{ .exit_code = 0, .timed_out = false, .failure_class = "content_empty", .verified = 2 };
+            return .{ .exit_code = 0, .timed_out = false, .verified = 1 };
+        },
+        .content_has_trace => {
+            if (std.mem.indexOf(u8, std.mem.trim(u8, stdout, " \t\n\r"), spec.id) == null)
+                return .{ .exit_code = 0, .timed_out = false, .failure_class = "content_invalid", .verified = 2 };
+            return .{ .exit_code = 0, .timed_out = false, .verified = 1 };
+        },
+    }
+}
+
 /// Worker thread: dequeues job IDs from cron_run_queue (DB) and executes them one at a time.
 /// Falls back to the legacy in-memory ArrayList when cron_db_path is not set.
 fn runQueueWorker(state: *GatewayState) void {
@@ -3786,6 +3825,8 @@ fn runQueueWorker(state: *GatewayState) void {
                             .best_effort = legacy_spec.delivery.best_effort,
                         },
                         .session_target = @enumFromInt(@intFromEnum(legacy_spec.session_target)),
+                        .verification_mode = @enumFromInt(@intFromEnum(legacy_spec.verification_mode)),
+                        .repair_policy = @enumFromInt(@intFromEnum(legacy_spec.repair_policy)),
                     },
                 };
             };
@@ -3827,7 +3868,29 @@ fn runQueueWorker(state: *GatewayState) void {
                     } else if (db_path_opt) |dp| {
                         const db2 = cron_mod.openCronDbAtPath(dp) catch return;
                         defer cron_mod.closeCronDb(db2);
-                        cron_mod.dbCompleteJob(db2, job_id, row_id, ts, status_str, output_str, dar) catch {};
+                        cron_mod.dbCompleteJob(db2, job_id, row_id, ts, status_str, output_str, dar, null, null) catch {};
+                    }
+                }
+            }.call;
+
+            const completeWithResult = struct {
+                fn call(
+                    be_opt: *?cron_db_mod.DbCronBackend,
+                    db_path_opt: ?[:0]const u8,
+                    job_id: []const u8,
+                    row_id: i64,
+                    ts: i64,
+                    status_str: []const u8,
+                    output_str: ?[]const u8,
+                    dar: bool,
+                    run_result: cron_mod.RunResult,
+                    trace_id: ?[]const u8,
+                ) void {
+                    _ = be_opt;
+                    if (db_path_opt) |dp| {
+                        const db2 = cron_mod.openCronDbAtPath(dp) catch return;
+                        defer cron_mod.closeCronDb(db2);
+                        cron_mod.dbCompleteJob(db2, job_id, row_id, ts, status_str, output_str, dar, run_result, trace_id) catch {};
                     }
                 }
             }.call;
@@ -4018,22 +4081,77 @@ fn runQueueWorker(state: *GatewayState) void {
                         .Exited => |ec| ec,
                         else => 1,
                     };
-                    const skill_ok = !skill_timed_out and skill_exit == 0;
+                    var run_result = classifySkillRun(spec, skill_stdout.items, skill_exit, skill_timed_out);
+                    // Retry loop: fires at most once when repair_policy == .retry_once and first run not verified ok.
+                    var retry_count: u8 = 0;
+                    while (run_result.verified != 1 and spec.repair_policy == .retry_once and retry_count == 0) {
+                        retry_count += 1;
+                        const saved_failure_class = run_result.failure_class;
+                        log.info("[{s}] skill retry 1 (failure_class={s})", .{ spec.id, saved_failure_class orelse "?" });
+                        var retry_stdout: std.ArrayList(u8) = .empty;
+                        defer retry_stdout.deinit(arena);
+                        var retry_stderr: std.ArrayList(u8) = .empty;
+                        defer retry_stderr.deinit(arena);
+                        var retry_child = std.process.Child.init(
+                            &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), skill_cmd },
+                            arena,
+                        );
+                        retry_child.stdin_behavior = .Ignore;
+                        retry_child.stdout_behavior = .Pipe;
+                        retry_child.stderr_behavior = .Pipe;
+                        retry_child.cwd = state.cron_workspace_dir;
+                        retry_child.spawn() catch |err| {
+                            log.err("[{s}] skill retry spawn failed: {s}", .{ spec.id, @errorName(err) });
+                            break;
+                        };
+                        const retry_start_ns = std.time.nanoTimestamp();
+                        const retry_timed_out = cron_mod.collectChildOutputWithTimeout(
+                            &retry_child,
+                            arena,
+                            &retry_stdout,
+                            &retry_stderr,
+                            timeout,
+                            retry_start_ns,
+                        ) catch false;
+                        const retry_term = retry_child.wait() catch break;
+                        const retry_exit: u8 = switch (retry_term) {
+                            .Exited => |ec| ec,
+                            else => 1,
+                        };
+                        run_result = classifySkillRun(spec, retry_stdout.items, retry_exit, retry_timed_out);
+                        run_result.repair_action = if (run_result.verified == 1) "retried_ok" else "retried_failed";
+                        if (run_result.failure_class == null) run_result.failure_class = saved_failure_class;
+                        // Use retry output for logging/recording if non-empty.
+                        if (retry_stdout.items.len > 0) {
+                            skill_stdout.clearAndFree(arena);
+                            skill_stdout.appendSlice(arena, retry_stdout.items) catch {};
+                        }
+                        if (retry_stderr.items.len > 0) {
+                            skill_stderr.clearAndFree(arena);
+                            skill_stderr.appendSlice(arena, retry_stderr.items) catch {};
+                        }
+                    }
+                    if (spec.repair_policy == .alert_only and run_result.verified != 1)
+                        run_result.repair_action = "alert_sent";
+                    const skill_ok = run_result.verified == 1;
                     const skill_output = if (skill_stdout.items.len > 0) skill_stdout.items else skill_stderr.items;
-                    const skill_status = if (skill_ok) "ok" else "error";
+                    const skill_status = if (run_result.verified != 3 and skill_ok) "ok" else "error";
                     // Skills self-deliver — no cron delivery needed.
-                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, skill_status, if (skill_output.len > 0) skill_output else null, spec.delete_after_run, false);
-                    // Alert operator on non-zero exit or timeout.
-                    if (!skill_ok) {
+                    completeWithResult(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, now, skill_status, if (skill_output.len > 0) skill_output else null, spec.delete_after_run, run_result, spec.id);
+                    // Alert operator on hard failure (verified=3) or degraded content (verified=2).
+                    if (run_result.verified != 1) {
                         if (state.event_bus) |eb| {
                             const stderr_preview = if (skill_stderr.items.len > 0)
                                 skill_stderr.items[0..@min(skill_stderr.items.len, 200)]
                             else
                                 "no stderr";
-                            const em = if (skill_timed_out)
-                                std.fmt.allocPrint(arena, "[cron] skill '{s}' timed out after {d}s", .{ spec.skill_name orelse "?", timeout }) catch null
-                            else
-                                std.fmt.allocPrint(arena, "[cron] skill '{s}' exit={d}: {s}", .{ spec.skill_name orelse "?", skill_exit, stderr_preview }) catch null;
+                            const fc = run_result.failure_class orelse "unknown";
+                            const ra = run_result.repair_action orelse "none";
+                            const em = std.fmt.allocPrint(
+                                arena,
+                                "[cron] skill '{s}' degraded: failure={s} repair={s} trace={s}\n{s}",
+                                .{ spec.skill_name orelse "?", fc, ra, spec.id, stderr_preview },
+                            ) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
                         }
                     }
@@ -4046,9 +4164,9 @@ fn runQueueWorker(state: *GatewayState) void {
                         skill_stdout.items;
                     if (log_output.len > 0) {
                         const nl = std.mem.indexOfScalar(u8, log_output, '\n') orelse log_output.len;
-                        log.info("[{s}] skill completed ({s}): {s}", .{ spec.id, skill_status, log_output[0..@min(nl, 120)] });
+                        log.info("[{s}] skill completed ({s}, verified={d}): {s}", .{ spec.id, skill_status, run_result.verified, log_output[0..@min(nl, 120)] });
                     } else {
-                        log.info("[{s}] skill completed ({s}): (no output)", .{ spec.id, skill_status });
+                        log.info("[{s}] skill completed ({s}, verified={d}): (no output)", .{ spec.id, skill_status, run_result.verified });
                     }
                 },
             }
