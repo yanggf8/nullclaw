@@ -542,6 +542,28 @@ fn dbApplyPatch(db: *c.sqlite3, id: []const u8, patch: types.CronJobPatch) !void
             _ = c.sqlite3_finalize(s);
         }
     }
+    if (patch.verification_mode) |vm| {
+        const vm_str = vm.asStr();
+        const sql = "UPDATE cron_jobs SET verification_mode=?1 WHERE id=?2";
+        var s: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
+            _ = c.sqlite3_bind_text(s, 1, vm_str.ptr, @intCast(vm_str.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
+            _ = c.sqlite3_step(s);
+            _ = c.sqlite3_finalize(s);
+        }
+    }
+    if (patch.repair_policy) |rp| {
+        const rp_str = rp.asStr();
+        const sql = "UPDATE cron_jobs SET repair_policy=?1 WHERE id=?2";
+        var s: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
+            _ = c.sqlite3_bind_text(s, 1, rp_str.ptr, @intCast(rp_str.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
+            _ = c.sqlite3_step(s);
+            _ = c.sqlite3_finalize(s);
+        }
+    }
 }
 
 /// Load a full CronJob by ID (includes all columns + last_output).

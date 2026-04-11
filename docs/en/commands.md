@@ -105,20 +105,36 @@ Notes:
 | `nullclaw cron schedule [--hours N] [--today] [--all] [--json]` | Upcoming fires within a time window |
 | `nullclaw cron status` | Scheduler daemon health summary |
 | `nullclaw cron job-status [--json]` | Per-job last-run status and timestamps |
-| `nullclaw cron add "0 * * * *" "command" [--tz <offset>]` | Add a recurring shell task |
-| `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--session-target isolated\|main] [--channel <name>] [--account <id>] [--to <id>] [--tz <offset>]` | Add a recurring agent task |
-| `nullclaw cron add-skill "0 * * * *" <skill> [--skill-args "..."] [--deliver-to <id>] [--account <id>] [--timeout <secs>] [--tz <offset>]` | Add a recurring skill task |
+| `nullclaw cron add "0 * * * *" "command" [--tz <offset>] [--verify <mode>] [--repair <policy>]` | Add a recurring shell task |
+| `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--session-target isolated\|main] [--channel <name>] [--account <id>] [--to <id>] [--tz <offset>] [--verify <mode>] [--repair <policy>]` | Add a recurring agent task |
+| `nullclaw cron add-skill "0 * * * *" <skill> [--skill-args "..."] [--deliver-to <id>] [--account <id>] [--timeout <secs>] [--tz <offset>] [--verify <mode>] [--repair <policy>] [-- <skill-args...>]` | Add a recurring skill task. Use `--` to forward args to the skill verbatim (needed if the skill itself takes `--verify`/`--repair`) |
 | `nullclaw cron once <delay> "command"` | Add a one-shot delayed shell task |
 | `nullclaw cron once-agent <delay> "prompt" --model <model> [--session-target isolated\|main]` | Add a one-shot delayed agent task |
 | `nullclaw cron run <id>` | Run a task immediately |
 | `nullclaw cron pause <id>` / `resume <id>` | Pause or resume a task |
 | `nullclaw cron remove <id>` | Delete a task |
-| `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>]` | Update an existing task; `--enable` also clears the paused flag, `--disable` sets it |
-| `nullclaw cron runs <id> [--limit N] [--json]` | Show recent run history for a task |
+| `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>] [--verify <mode>] [--repair <policy>]` | Update an existing task; `--enable` also clears the paused flag, `--disable` sets it |
+| `nullclaw cron runs <id> [--limit N] [--json]` | Show recent run history for a task (includes exit code, failure class, repair action, verified state, and trace ID) |
+| `nullclaw cron degraded [--hours N] [--job <id>] [--json]` | List failed or degraded runs across all jobs in a time window (default 24h). Matches runs where `status=error` OR `verified>=2`. |
+| `nullclaw cron run-by-trace <trace_id> [--json]` | Look up a run by its `trace_id`. Exits 1 if no runs match, for use in shell pipelines. |
 | `nullclaw cron backup` | Export all jobs to a timestamped seed file |
 | `nullclaw cron restore [<file>]` | Restore jobs from a seed file |
 | `nullclaw cron export-seed` | Print jobs as a portable seed JSON |
 | `nullclaw cron init-seed` | Load seed file into a fresh DB (new installs only) |
+
+**Verification and repair policies** (`--verify` / `--repair`):
+
+- `--verify <mode>` — how the scheduler judges a completed run. One of:
+  - `none` (default) — no verification
+  - `exit_only` — only non-zero exit is treated as failure
+  - `content_nonempty` — empty stdout is treated as degraded
+  - `content_has_trace` — stdout must contain the job ID (skills can use the `trace_marker.emit_trace()` helper)
+- `--repair <policy>` — what the scheduler does when a run is marked degraded/failed. One of:
+  - `none` (default) — record the outcome and move on
+  - `retry_once` — immediately re-run once; the retry outcome is recorded as `repair_action=retried_ok` or `retried_failed`
+  - `alert_only` — send an operator alert without retrying (`repair_action=alert_sent`)
+
+Unrecognized values are rejected with an error listing the allowed values — a typo on `cron update` will not silently clear an existing policy.
 
 ### `skills`
 

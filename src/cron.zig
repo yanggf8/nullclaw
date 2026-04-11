@@ -93,6 +93,16 @@ pub const VerificationMode = enum {
         if (std.ascii.eqlIgnoreCase(s, "content_has_trace")) return .content_has_trace;
         return .none;
     }
+
+    /// Strict parse: returns an error for unrecognized values. Use for CLI input
+    /// where a typo must not silently downgrade to `.none`.
+    pub fn parseStrict(s: []const u8) !VerificationMode {
+        if (std.ascii.eqlIgnoreCase(s, "none")) return .none;
+        if (std.ascii.eqlIgnoreCase(s, "exit_only")) return .exit_only;
+        if (std.ascii.eqlIgnoreCase(s, "content_nonempty")) return .content_nonempty;
+        if (std.ascii.eqlIgnoreCase(s, "content_has_trace")) return .content_has_trace;
+        return error.InvalidVerificationMode;
+    }
 };
 
 pub const RepairPolicy = enum {
@@ -112,6 +122,15 @@ pub const RepairPolicy = enum {
         if (std.ascii.eqlIgnoreCase(s, "retry_once")) return .retry_once;
         if (std.ascii.eqlIgnoreCase(s, "alert_only")) return .alert_only;
         return .none;
+    }
+
+    /// Strict parse: returns an error for unrecognized values. Use for CLI input
+    /// where a typo must not silently downgrade to `.none`.
+    pub fn parseStrict(s: []const u8) !RepairPolicy {
+        if (std.ascii.eqlIgnoreCase(s, "none")) return .none;
+        if (std.ascii.eqlIgnoreCase(s, "retry_once")) return .retry_once;
+        if (std.ascii.eqlIgnoreCase(s, "alert_only")) return .alert_only;
+        return error.InvalidRepairPolicy;
     }
 };
 
@@ -245,6 +264,8 @@ pub const CronJobPatch = struct {
     next_run_secs: ?i64 = null,
     tz_offset_s: ?i32 = null,
     session_target: ?SessionTarget = null,
+    verification_mode: ?VerificationMode = null,
+    repair_policy: ?RepairPolicy = null,
 };
 
 /// A scheduled cron job.
@@ -938,6 +959,12 @@ pub const CronScheduler = struct {
         }
         if (patch.session_target) |st| {
             job.session_target = st;
+        }
+        if (patch.verification_mode) |vm| {
+            job.verification_mode = vm;
+        }
+        if (patch.repair_policy) |rp| {
+            job.repair_policy = rp;
         }
         return true;
     }
@@ -4041,7 +4068,14 @@ pub fn cliJobStatus(allocator: std.mem.Allocator, json_out: bool) !void {
 }
 
 /// CLI: add a recurring cron job.
-pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: []const u8, tz_offset_s: i32) !void {
+pub fn cliAddJob(
+    allocator: std.mem.Allocator,
+    expression: []const u8,
+    command: []const u8,
+    tz_offset_s: i32,
+    verification_mode: VerificationMode,
+    repair_policy: RepairPolicy,
+) !void {
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
         var body_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -4055,6 +4089,14 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
             const tz_str = std.fmt.bufPrint(&tz_buf, ",\"tz_offset_s\":{d}", .{tz_offset_s}) catch "";
             body_buf.appendSlice(allocator, tz_str) catch {};
         }
+        if (verification_mode != .none) {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "verification_mode", verification_mode.asStr()) catch {};
+        }
+        if (repair_policy != .none) {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "repair_policy", repair_policy.asStr()) catch {};
+        }
         body_buf.appendSlice(allocator, "}") catch {};
         if (gatewayPost(allocator, url, "/cron/add", body_buf.items)) return;
     }
@@ -4066,6 +4108,8 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
         defer temp.deinit();
         const job = temp.addJob(expression, command) catch break :db_blk;
         job.tz_offset_s = tz_offset_s;
+        job.verification_mode = verification_mode;
+        job.repair_policy = repair_policy;
         if (tz_offset_s != 0) {
             job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
         }
@@ -4080,6 +4124,8 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
         log.info("  Next: {d}", .{job.next_run_secs});
         log.info("  Cmd : {s}", .{job.command});
         if (tz_offset_s != 0) log.info("  TZ  : {d}s", .{tz_offset_s});
+        if (verification_mode != .none) log.info("  Verify: {s}", .{verification_mode.asStr()});
+        if (repair_policy != .none) log.info("  Repair: {s}", .{repair_policy.asStr()});
         return;
     }
 
@@ -4089,6 +4135,8 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
 
     const job = try scheduler.addJob(expression, command);
     job.tz_offset_s = tz_offset_s;
+    job.verification_mode = verification_mode;
+    job.repair_policy = repair_policy;
     if (tz_offset_s != 0) {
         job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
     }
@@ -4099,6 +4147,8 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
     log.info("  Next: {d}", .{job.next_run_secs});
     log.info("  Cmd : {s}", .{job.command});
     if (tz_offset_s != 0) log.info("  TZ  : {d}s", .{tz_offset_s});
+    if (verification_mode != .none) log.info("  Verify: {s}", .{verification_mode.asStr()});
+    if (repair_policy != .none) log.info("  Repair: {s}", .{repair_policy.asStr()});
 }
 
 /// CLI: add a recurring agent job.
@@ -4110,6 +4160,8 @@ pub fn cliAddAgentJob(
     session_target: SessionTarget,
     delivery: DeliveryConfig,
     tz_offset_s: i32,
+    verification_mode: VerificationMode,
+    repair_policy: RepairPolicy,
 ) !void {
     const enriched_delivery = enrichDeliveryRouting(delivery);
     if (readGatewayUrl(allocator)) |url| {
@@ -4165,6 +4217,14 @@ pub fn cliAddAgentJob(
             const tz_str = std.fmt.bufPrint(&tz_buf, ",\"tz_offset_s\":{d}", .{tz_offset_s}) catch "";
             body_buf.appendSlice(allocator, tz_str) catch {};
         }
+        if (verification_mode != .none) {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "verification_mode", verification_mode.asStr()) catch {};
+        }
+        if (repair_policy != .none) {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "repair_policy", repair_policy.asStr()) catch {};
+        }
         body_buf.appendSlice(allocator, "}") catch {};
         if (body_buf.items.len > 2) {
             if (gatewayPost(allocator, url, "/cron/add", body_buf.items)) return;
@@ -4177,6 +4237,8 @@ pub fn cliAddAgentJob(
         const job = temp.addAgentJob(expression, prompt, model, delivery) catch break :db_blk;
         job.session_target = session_target;
         job.tz_offset_s = tz_offset_s;
+        job.verification_mode = verification_mode;
+        job.repair_policy = repair_policy;
         if (tz_offset_s != 0) {
             job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
         }
@@ -4190,6 +4252,8 @@ pub fn cliAddAgentJob(
         log.info("  Type : {s}", .{job.job_type.asStr()});
         if (job.model) |m| log.info("  Model: {s}", .{m});
         if (tz_offset_s != 0) log.info("  TZ   : {d}s", .{tz_offset_s});
+        if (verification_mode != .none) log.info("  Verify: {s}", .{verification_mode.asStr()});
+        if (repair_policy != .none) log.info("  Repair: {s}", .{repair_policy.asStr()});
         return;
     }
 
@@ -4200,6 +4264,8 @@ pub fn cliAddAgentJob(
     const job = try scheduler.addAgentJob(expression, prompt, model, enriched_delivery);
     job.session_target = session_target;
     job.tz_offset_s = tz_offset_s;
+    job.verification_mode = verification_mode;
+    job.repair_policy = repair_policy;
     if (tz_offset_s != 0) {
         job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
     }
@@ -4210,16 +4276,30 @@ pub fn cliAddAgentJob(
     log.info("  Type : {s}", .{job.job_type.asStr()});
     if (job.model) |m| log.info("  Model: {s}", .{m});
     if (tz_offset_s != 0) log.info("  TZ   : {d}s", .{tz_offset_s});
+    if (verification_mode != .none) log.info("  Verify: {s}", .{verification_mode.asStr()});
+    if (repair_policy != .none) log.info("  Repair: {s}", .{repair_policy.asStr()});
 }
 
 /// CLI: add a recurring skill job (job_type=skill).
 /// DB-direct — does not route through the gateway HTTP API.
-pub fn cliAddSkillJob(allocator: std.mem.Allocator, expression: []const u8, skill_name: []const u8, skill_args: ?[]const u8, delivery: DeliveryConfig, timeout_secs: ?u32, tz_offset_s: i32) !void {
+pub fn cliAddSkillJob(
+    allocator: std.mem.Allocator,
+    expression: []const u8,
+    skill_name: []const u8,
+    skill_args: ?[]const u8,
+    delivery: DeliveryConfig,
+    timeout_secs: ?u32,
+    tz_offset_s: i32,
+    verification_mode: VerificationMode,
+    repair_policy: RepairPolicy,
+) !void {
     if (build_options.enable_sqlite) db_blk: {
         var temp = CronScheduler.init(allocator, 65535, true);
         defer temp.deinit();
         const job = temp.addSkillJob(expression, skill_name, skill_args, delivery, timeout_secs) catch break :db_blk;
         job.tz_offset_s = tz_offset_s;
+        job.verification_mode = verification_mode;
+        job.repair_policy = repair_policy;
         if (tz_offset_s != 0) {
             job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
         }
@@ -4233,6 +4313,8 @@ pub fn cliAddSkillJob(allocator: std.mem.Allocator, expression: []const u8, skil
         log.info("  Skill: {s}", .{skill_name});
         if (skill_args) |sa| log.info("  Args : {s}", .{sa});
         if (tz_offset_s != 0) log.info("  TZ   : {d}s", .{tz_offset_s});
+        if (verification_mode != .none) log.info("  Verify: {s}", .{verification_mode.asStr()});
+        if (repair_policy != .none) log.info("  Repair: {s}", .{repair_policy.asStr()});
         return;
     }
 
@@ -4242,6 +4324,8 @@ pub fn cliAddSkillJob(allocator: std.mem.Allocator, expression: []const u8, skil
 
     const job = try scheduler.addSkillJob(expression, skill_name, skill_args, delivery, timeout_secs);
     job.tz_offset_s = tz_offset_s;
+    job.verification_mode = verification_mode;
+    job.repair_policy = repair_policy;
     if (tz_offset_s != 0) {
         job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
     }
@@ -4252,6 +4336,8 @@ pub fn cliAddSkillJob(allocator: std.mem.Allocator, expression: []const u8, skil
     log.info("  Skill: {s}", .{skill_name});
     if (skill_args) |sa| log.info("  Args : {s}", .{sa});
     if (tz_offset_s != 0) log.info("  TZ   : {d}s", .{tz_offset_s});
+    if (verification_mode != .none) log.info("  Verify: {s}", .{verification_mode.asStr()});
+    if (repair_policy != .none) log.info("  Repair: {s}", .{repair_policy.asStr()});
 }
 
 /// CLI: add a one-shot delayed task.
@@ -4561,6 +4647,8 @@ pub fn cliUpdateJob(
     enabled: ?bool,
     session_target: ?SessionTarget,
     tz_offset_s: ?i32,
+    verification_mode: ?VerificationMode,
+    repair_policy: ?RepairPolicy,
 ) !void {
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
@@ -4597,6 +4685,14 @@ pub fn cliUpdateJob(
             const tz_str = std.fmt.bufPrint(&tz_buf, ",\"tz_offset_s\":{d}", .{tz}) catch "";
             body_buf.appendSlice(allocator, tz_str) catch {};
         }
+        if (verification_mode) |vm| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "verification_mode", vm.asStr()) catch {};
+        }
+        if (repair_policy) |rp| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "repair_policy", rp.asStr()) catch {};
+        }
         body_buf.appendSlice(allocator, "}") catch {};
         if (gatewayPost(allocator, url, "/cron/update", body_buf.items)) return;
     }
@@ -4623,6 +4719,8 @@ pub fn cliUpdateJob(
         .enabled = enabled,
         .session_target = session_target,
         .tz_offset_s = tz_offset_s,
+        .verification_mode = verification_mode,
+        .repair_policy = repair_policy,
     };
     if (scheduler.updateJob(allocator, id, patch)) {
         // If SQLite is enabled, write only the updated row directly to the DB
@@ -4665,7 +4763,8 @@ pub fn cliListRuns(allocator: std.mem.Allocator, id: []const u8, limit: usize, j
         }
 
         const sql =
-            "SELECT id, started_at, finished_at, status, output " ++
+            "SELECT id, started_at, finished_at, status, output, " ++
+            "exit_code, failure_class, repair_action, verified, trace_id " ++
             "FROM cron_runs WHERE job_id=?1 ORDER BY finished_at DESC LIMIT ?2";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) break :db_blk;
@@ -4683,7 +4782,33 @@ pub fn cliListRuns(allocator: std.mem.Allocator, id: []const u8, limit: usize, j
             const status_str: []const u8 = if (status_ptr != null) status_ptr[0..status_len] else "?";
             var ts_buf: [64]u8 = undefined;
             const formatted = formatUnixTimestamp(finished, &ts_buf);
-            log.info("  [{d}] {s} at {d} ({s})", .{ count, status_str, finished, formatted });
+
+            // Observability suffix — only shown when verified != 0 (hides
+            // pre-migration rows which default to 0).
+            const verified = c.sqlite3_column_int64(stmt, 8);
+            var suffix_buf: [192]u8 = undefined;
+            const suffix: []const u8 = if (verified == 0) "" else blk: {
+                var written: usize = 0;
+                const v_part = std.fmt.bufPrint(suffix_buf[written..], " v={d}", .{verified}) catch "";
+                written += v_part.len;
+                if (c.sqlite3_column_type(stmt, 6) != c.SQLITE_NULL) {
+                    const fc_ptr = c.sqlite3_column_text(stmt, 6);
+                    const fc_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 6));
+                    const fc_str: []const u8 = fc_ptr[0..fc_len];
+                    const fc_part = std.fmt.bufPrint(suffix_buf[written..], " fc={s}", .{fc_str}) catch "";
+                    written += fc_part.len;
+                }
+                if (c.sqlite3_column_type(stmt, 7) != c.SQLITE_NULL) {
+                    const ra_ptr = c.sqlite3_column_text(stmt, 7);
+                    const ra_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 7));
+                    const ra_str: []const u8 = ra_ptr[0..ra_len];
+                    const ra_part = std.fmt.bufPrint(suffix_buf[written..], " ra={s}", .{ra_str}) catch "";
+                    written += ra_part.len;
+                }
+                break :blk suffix_buf[0..written];
+            };
+
+            log.info("  [{d}] {s} at {d} ({s}){s}", .{ count, status_str, finished, formatted, suffix });
         }
         if (count == 0) {
             // Fall through to legacy view below.
@@ -4732,6 +4857,311 @@ pub fn cliListRuns(allocator: std.mem.Allocator, id: []const u8, limit: usize, j
         log.info("  Next run:    {d} ({s})", .{ job.next_run_secs, formatted });
     } else {
         log.warn("Cron job '{s}' not found", .{id});
+    }
+}
+
+/// Query cron_runs for failed or degraded rows within a time window, optionally
+/// filtered by job_id. A row is included when EITHER `verified >= 2` (skill
+/// verification tagged it as degraded/failed) OR `status = 'error'` (shell or
+/// agent run completed unsuccessfully — these runs do not populate the
+/// verification columns and would otherwise be invisible to this command).
+/// Writes either JSON or human output.
+pub fn cliListDegradedRuns(
+    allocator: std.mem.Allocator,
+    hours: u32,
+    job_filter: ?[]const u8,
+    json_out: bool,
+) !void {
+    const db_path_z = getCronDbPathZ(allocator) catch return error.CronDbUnavailable;
+    defer allocator.free(db_path_z);
+
+    const db = openCronDbAtPath(db_path_z) catch return error.CronDbUnavailable;
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    const now = std.time.timestamp();
+    const cutoff: i64 = now - @as(i64, @intCast(hours)) * 3600;
+
+    const sql_no_filter =
+        "SELECT job_id, finished_at, verified, failure_class, repair_action, " ++
+        "exit_code, trace_id, status " ++
+        "FROM cron_runs " ++
+        "WHERE (verified >= 2 OR status = 'error') AND finished_at > ?1 " ++
+        "ORDER BY finished_at DESC LIMIT 200";
+    const sql_with_filter =
+        "SELECT job_id, finished_at, verified, failure_class, repair_action, " ++
+        "exit_code, trace_id, status " ++
+        "FROM cron_runs " ++
+        "WHERE (verified >= 2 OR status = 'error') AND finished_at > ?1 AND job_id = ?2 " ++
+        "ORDER BY finished_at DESC LIMIT 200";
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (job_filter) |jf| {
+        if (c.sqlite3_prepare_v2(db, sql_with_filter, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        _ = c.sqlite3_bind_int64(stmt, 1, cutoff);
+        _ = c.sqlite3_bind_text(stmt, 2, jf.ptr, @intCast(jf.len), SQLITE_STATIC);
+    } else {
+        if (c.sqlite3_prepare_v2(db, sql_no_filter, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        _ = c.sqlite3_bind_int64(stmt, 1, cutoff);
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+
+    if (json_out) {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(allocator);
+        var int_buf: [32]u8 = undefined;
+        try buf.append(allocator, '[');
+        var first = true;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (!first) try buf.append(allocator, ',');
+            first = false;
+            try buf.appendSlice(allocator, "{\"job_id\":");
+            const jid_ptr = c.sqlite3_column_text(stmt, 0);
+            const jid_len: usize = if (jid_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 0)) else 0;
+            try appendJsonStr(&buf, allocator, if (jid_ptr != null) jid_ptr[0..jid_len] else "");
+            try buf.appendSlice(allocator, ",\"finished_at\":");
+            try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{c.sqlite3_column_int64(stmt, 1)}) catch "0");
+            try buf.appendSlice(allocator, ",\"verified\":");
+            try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{c.sqlite3_column_int64(stmt, 2)}) catch "0");
+            try buf.appendSlice(allocator, ",\"failure_class\":");
+            if (c.sqlite3_column_type(stmt, 3) == c.SQLITE_NULL) {
+                try buf.appendSlice(allocator, "null");
+            } else {
+                const fc_ptr = c.sqlite3_column_text(stmt, 3);
+                const fc_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 3));
+                try appendJsonStr(&buf, allocator, fc_ptr[0..fc_len]);
+            }
+            try buf.appendSlice(allocator, ",\"repair_action\":");
+            if (c.sqlite3_column_type(stmt, 4) == c.SQLITE_NULL) {
+                try buf.appendSlice(allocator, "null");
+            } else {
+                const ra_ptr = c.sqlite3_column_text(stmt, 4);
+                const ra_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 4));
+                try appendJsonStr(&buf, allocator, ra_ptr[0..ra_len]);
+            }
+            try buf.appendSlice(allocator, ",\"exit_code\":");
+            try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{c.sqlite3_column_int64(stmt, 5)}) catch "0");
+            try buf.appendSlice(allocator, ",\"trace_id\":");
+            if (c.sqlite3_column_type(stmt, 6) == c.SQLITE_NULL) {
+                try buf.appendSlice(allocator, "null");
+            } else {
+                const tr_ptr = c.sqlite3_column_text(stmt, 6);
+                const tr_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 6));
+                try appendJsonStr(&buf, allocator, tr_ptr[0..tr_len]);
+            }
+            try buf.appendSlice(allocator, ",\"status\":");
+            if (c.sqlite3_column_type(stmt, 7) == c.SQLITE_NULL) {
+                try buf.appendSlice(allocator, "null");
+            } else {
+                const st_ptr = c.sqlite3_column_text(stmt, 7);
+                const st_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 7));
+                try appendJsonStr(&buf, allocator, st_ptr[0..st_len]);
+            }
+            try buf.append(allocator, '}');
+        }
+        try buf.append(allocator, ']');
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll(buf.items) catch {};
+        stdout.writeAll("\n") catch {};
+        return;
+    }
+
+    // Human-readable output.
+    var count: usize = 0;
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        count += 1;
+        if (count == 1) log.info("Failed/degraded runs (last {d}h):", .{hours});
+
+        const jid_ptr = c.sqlite3_column_text(stmt, 0);
+        const jid_len: usize = if (jid_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 0)) else 0;
+        const jid_raw: []const u8 = if (jid_ptr != null) jid_ptr[0..jid_len] else "?";
+
+        const finished = c.sqlite3_column_int64(stmt, 1);
+        var ts_buf: [64]u8 = undefined;
+        const formatted = formatUnixTimestamp(finished, &ts_buf);
+
+        const verified = c.sqlite3_column_int64(stmt, 2);
+
+        var fc_buf: [64]u8 = undefined;
+        const fc_col: []const u8 = blk: {
+            if (c.sqlite3_column_type(stmt, 3) == c.SQLITE_NULL) break :blk "—";
+            const p = c.sqlite3_column_text(stmt, 3);
+            const l: usize = @intCast(c.sqlite3_column_bytes(stmt, 3));
+            const src = p[0..l];
+            if (src.len > fc_buf.len) break :blk src[0..fc_buf.len];
+            @memcpy(fc_buf[0..src.len], src);
+            break :blk fc_buf[0..src.len];
+        };
+
+        var ra_buf: [64]u8 = undefined;
+        const ra_col: []const u8 = blk: {
+            if (c.sqlite3_column_type(stmt, 4) == c.SQLITE_NULL) break :blk "—";
+            const p = c.sqlite3_column_text(stmt, 4);
+            const l: usize = @intCast(c.sqlite3_column_bytes(stmt, 4));
+            const src = p[0..l];
+            if (src.len > ra_buf.len) break :blk src[0..ra_buf.len];
+            @memcpy(ra_buf[0..src.len], src);
+            break :blk ra_buf[0..src.len];
+        };
+
+        var tr_buf: [64]u8 = undefined;
+        const tr_col: []const u8 = blk: {
+            if (c.sqlite3_column_type(stmt, 6) == c.SQLITE_NULL) break :blk "—";
+            const p = c.sqlite3_column_text(stmt, 6);
+            const l: usize = @intCast(c.sqlite3_column_bytes(stmt, 6));
+            const src = p[0..l];
+            if (src.len > tr_buf.len) break :blk src[0..tr_buf.len];
+            @memcpy(tr_buf[0..src.len], src);
+            break :blk tr_buf[0..src.len];
+        };
+
+        var st_buf: [16]u8 = undefined;
+        const st_col: []const u8 = blk: {
+            if (c.sqlite3_column_type(stmt, 7) == c.SQLITE_NULL) break :blk "—";
+            const p = c.sqlite3_column_text(stmt, 7);
+            const l: usize = @intCast(c.sqlite3_column_bytes(stmt, 7));
+            const src = p[0..l];
+            if (src.len > st_buf.len) break :blk src[0..st_buf.len];
+            @memcpy(st_buf[0..src.len], src);
+            break :blk st_buf[0..src.len];
+        };
+
+        log.info("  {s}  {s: <20}  status={s: <7}  v={d}  fc={s: <20}  ra={s: <18}  trace={s}", .{
+            formatted,
+            jid_raw,
+            st_col,
+            verified,
+            fc_col,
+            ra_col,
+            tr_col,
+        });
+    }
+    if (count == 0) {
+        log.info("No failed or degraded runs in the last {d}h.", .{hours});
+    }
+}
+
+/// Look up a run (or runs, up to 10) by trace_id.
+/// Returns error.NoRunMatched if no rows match (caller should exit 1).
+pub fn cliFindRunByTrace(allocator: std.mem.Allocator, trace_id: []const u8, json_out: bool) !void {
+    const db_path_z = getCronDbPathZ(allocator) catch return error.CronDbUnavailable;
+    defer allocator.free(db_path_z);
+
+    const db = openCronDbAtPath(db_path_z) catch return error.CronDbUnavailable;
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    const sql =
+        "SELECT id, job_id, started_at, finished_at, status, exit_code, " ++
+        "verified, failure_class, repair_action, output " ++
+        "FROM cron_runs WHERE trace_id = ?1 " ++
+        "ORDER BY finished_at DESC LIMIT 10";
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, trace_id.ptr, @intCast(trace_id.len), SQLITE_STATIC);
+
+    if (json_out) {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(allocator);
+        var int_buf: [32]u8 = undefined;
+        try buf.append(allocator, '[');
+        var count: usize = 0;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (count > 0) try buf.append(allocator, ',');
+            count += 1;
+            try buf.appendSlice(allocator, "{\"id\":");
+            try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{c.sqlite3_column_int64(stmt, 0)}) catch "0");
+            try buf.appendSlice(allocator, ",\"job_id\":");
+            const jid_ptr = c.sqlite3_column_text(stmt, 1);
+            const jid_len: usize = if (jid_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 1)) else 0;
+            try appendJsonStr(&buf, allocator, if (jid_ptr != null) jid_ptr[0..jid_len] else "");
+            try buf.appendSlice(allocator, ",\"started_at\":");
+            try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{c.sqlite3_column_int64(stmt, 2)}) catch "0");
+            try buf.appendSlice(allocator, ",\"finished_at\":");
+            try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{c.sqlite3_column_int64(stmt, 3)}) catch "0");
+            try buf.appendSlice(allocator, ",\"status\":");
+            const st_ptr = c.sqlite3_column_text(stmt, 4);
+            const st_len: usize = if (st_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 4)) else 0;
+            try appendJsonStr(&buf, allocator, if (st_ptr != null) st_ptr[0..st_len] else "");
+            try buf.appendSlice(allocator, ",\"exit_code\":");
+            try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{c.sqlite3_column_int64(stmt, 5)}) catch "0");
+            try buf.appendSlice(allocator, ",\"verified\":");
+            try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{c.sqlite3_column_int64(stmt, 6)}) catch "0");
+            try buf.appendSlice(allocator, ",\"failure_class\":");
+            if (c.sqlite3_column_type(stmt, 7) == c.SQLITE_NULL) {
+                try buf.appendSlice(allocator, "null");
+            } else {
+                const fc_ptr = c.sqlite3_column_text(stmt, 7);
+                const fc_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 7));
+                try appendJsonStr(&buf, allocator, fc_ptr[0..fc_len]);
+            }
+            try buf.appendSlice(allocator, ",\"repair_action\":");
+            if (c.sqlite3_column_type(stmt, 8) == c.SQLITE_NULL) {
+                try buf.appendSlice(allocator, "null");
+            } else {
+                const ra_ptr = c.sqlite3_column_text(stmt, 8);
+                const ra_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 8));
+                try appendJsonStr(&buf, allocator, ra_ptr[0..ra_len]);
+            }
+            try buf.appendSlice(allocator, ",\"output\":");
+            if (c.sqlite3_column_type(stmt, 9) == c.SQLITE_NULL) {
+                try buf.appendSlice(allocator, "null");
+            } else {
+                const out_ptr = c.sqlite3_column_text(stmt, 9);
+                const out_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 9));
+                try appendJsonStr(&buf, allocator, out_ptr[0..out_len]);
+            }
+            try buf.append(allocator, '}');
+        }
+        try buf.append(allocator, ']');
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll(buf.items) catch {};
+        stdout.writeAll("\n") catch {};
+        if (count == 0) return error.NoRunMatched;
+        return;
+    }
+
+    var count: usize = 0;
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        count += 1;
+        if (count == 1) log.info("Runs matching trace_id='{s}':", .{trace_id});
+
+        const run_id = c.sqlite3_column_int64(stmt, 0);
+        const jid_ptr = c.sqlite3_column_text(stmt, 1);
+        const jid_len: usize = if (jid_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 1)) else 0;
+        const jid_str: []const u8 = if (jid_ptr != null) jid_ptr[0..jid_len] else "?";
+
+        const finished = c.sqlite3_column_int64(stmt, 3);
+        var ts_buf: [64]u8 = undefined;
+        const formatted = formatUnixTimestamp(finished, &ts_buf);
+
+        const st_ptr = c.sqlite3_column_text(stmt, 4);
+        const st_len: usize = if (st_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 4)) else 0;
+        const st_str: []const u8 = if (st_ptr != null) st_ptr[0..st_len] else "?";
+
+        const exit_code = c.sqlite3_column_int64(stmt, 5);
+        const verified = c.sqlite3_column_int64(stmt, 6);
+
+        log.info("  [{d}] job={s} at {s} status={s} exit={d} v={d}", .{
+            run_id, jid_str, formatted, st_str, exit_code, verified,
+        });
+
+        if (c.sqlite3_column_type(stmt, 7) != c.SQLITE_NULL) {
+            const fc_ptr = c.sqlite3_column_text(stmt, 7);
+            const fc_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 7));
+            log.info("       failure_class={s}", .{fc_ptr[0..fc_len]});
+        }
+        if (c.sqlite3_column_type(stmt, 8) != c.SQLITE_NULL) {
+            const ra_ptr = c.sqlite3_column_text(stmt, 8);
+            const ra_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 8));
+            log.info("       repair_action={s}", .{ra_ptr[0..ra_len]});
+        }
+    }
+    if (count == 0) {
+        log.warn("No run matches trace_id='{s}'", .{trace_id});
+        return error.NoRunMatched;
     }
 }
 
@@ -5791,7 +6221,8 @@ pub fn dbListJobsJson(db: *c.sqlite3, buf: *std.ArrayListUnmanaged(u8), allocato
 pub fn dbListRunsJson(db: *c.sqlite3, job_id: []const u8, limit: usize, buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator) !void {
     const effective_limit: usize = if (limit == 0) 50 else limit;
     const sql =
-        "SELECT id, job_id, started_at, finished_at, status, output " ++
+        "SELECT id, job_id, started_at, finished_at, status, output, " ++
+        "exit_code, failure_class, repair_action, verified, trace_id " ++
         "FROM cron_runs WHERE job_id=?1 ORDER BY finished_at DESC LIMIT ?2";
     var stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
@@ -5840,6 +6271,44 @@ pub fn dbListRunsJson(db: *c.sqlite3, job_id: []const u8, limit: usize, buf: *st
         } else {
             const out_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 5));
             try appendJsonStr(buf, allocator, out_ptr[0..out_len]);
+        }
+
+        // exit_code (col 6) — INTEGER (defaults to 0 for pre-migration rows)
+        try buf.appendSlice(allocator, ",\"exit_code\":");
+        try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{c.sqlite3_column_int64(stmt, 6)}) catch "0");
+
+        // failure_class (col 7) — TEXT nullable
+        try buf.appendSlice(allocator, ",\"failure_class\":");
+        if (c.sqlite3_column_type(stmt, 7) == c.SQLITE_NULL) {
+            try buf.appendSlice(allocator, "null");
+        } else {
+            const fc_ptr = c.sqlite3_column_text(stmt, 7);
+            const fc_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 7));
+            try appendJsonStr(buf, allocator, fc_ptr[0..fc_len]);
+        }
+
+        // repair_action (col 8) — TEXT nullable
+        try buf.appendSlice(allocator, ",\"repair_action\":");
+        if (c.sqlite3_column_type(stmt, 8) == c.SQLITE_NULL) {
+            try buf.appendSlice(allocator, "null");
+        } else {
+            const ra_ptr = c.sqlite3_column_text(stmt, 8);
+            const ra_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 8));
+            try appendJsonStr(buf, allocator, ra_ptr[0..ra_len]);
+        }
+
+        // verified (col 9) — INTEGER (defaults to 0)
+        try buf.appendSlice(allocator, ",\"verified\":");
+        try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{c.sqlite3_column_int64(stmt, 9)}) catch "0");
+
+        // trace_id (col 10) — TEXT nullable
+        try buf.appendSlice(allocator, ",\"trace_id\":");
+        if (c.sqlite3_column_type(stmt, 10) == c.SQLITE_NULL) {
+            try buf.appendSlice(allocator, "null");
+        } else {
+            const tr_ptr = c.sqlite3_column_text(stmt, 10);
+            const tr_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 10));
+            try appendJsonStr(buf, allocator, tr_ptr[0..tr_len]);
         }
 
         try buf.append(allocator, '}');
@@ -7891,6 +8360,89 @@ test "dbListRunsJson returns JSON array of runs" {
     try std.testing.expect(json[0] == '[');
     try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"ok\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"output\":\"out\"") != null);
+}
+
+test "dbListRunsJson emits observability columns" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const sched = &iso.scheduler;
+
+    const j = try sched.addJob("* * * * *", "echo obs");
+    const jid = try std.testing.allocator.dupe(u8, j.id);
+    defer std.testing.allocator.free(jid);
+    try dbUpsertAndVerify(sched, sched.getJob(jid).?);
+
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer _ = c.sqlite3_close(db);
+    try ensureCronTable(db);
+
+    // Insert three rows with varied observability columns.
+    const ins =
+        "INSERT INTO cron_runs(job_id, started_at, finished_at, status, exit_code, " ++
+        "failure_class, repair_action, verified, trace_id) " ++
+        "VALUES(?1, ?2, ?2, 'ok', ?3, ?4, ?5, ?6, ?7)";
+
+    const cases = [_]struct {
+        ts: i64,
+        exit_code: i32,
+        failure_class: ?[]const u8,
+        repair_action: ?[]const u8,
+        verified: i32,
+        trace_id: ?[]const u8,
+    }{
+        .{ .ts = 1000, .exit_code = 0, .failure_class = null, .repair_action = null, .verified = 1, .trace_id = "trace-ok" },
+        .{ .ts = 1001, .exit_code = 2, .failure_class = "content_invalid", .repair_action = "retried_failed", .verified = 2, .trace_id = "trace-bad" },
+        .{ .ts = 1002, .exit_code = 124, .failure_class = "timeout", .repair_action = null, .verified = 3, .trace_id = null },
+    };
+
+    for (cases) |cs| {
+        var stmt: ?*c.sqlite3_stmt = null;
+        try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_prepare_v2(db, ins, -1, &stmt, null));
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, jid.ptr, @intCast(jid.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(stmt, 2, cs.ts);
+        _ = c.sqlite3_bind_int(stmt, 3, cs.exit_code);
+        if (cs.failure_class) |fc| {
+            _ = c.sqlite3_bind_text(stmt, 4, fc.ptr, @intCast(fc.len), SQLITE_STATIC);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 4);
+        }
+        if (cs.repair_action) |ra| {
+            _ = c.sqlite3_bind_text(stmt, 5, ra.ptr, @intCast(ra.len), SQLITE_STATIC);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 5);
+        }
+        _ = c.sqlite3_bind_int(stmt, 6, cs.verified);
+        if (cs.trace_id) |tid| {
+            _ = c.sqlite3_bind_text(stmt, 7, tid.ptr, @intCast(tid.len), SQLITE_STATIC);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 7);
+        }
+        try std.testing.expectEqual(@as(c_int, c.SQLITE_DONE), c.sqlite3_step(stmt));
+    }
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try dbListRunsJson(db, jid, 10, &buf, std.testing.allocator);
+
+    const json = buf.items;
+    // Keys must appear.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"exit_code\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"failure_class\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"repair_action\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verified\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"trace_id\":") != null);
+    // Specific values.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"failure_class\":\"content_invalid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"failure_class\":\"timeout\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"repair_action\":\"retried_failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"trace_id\":\"trace-ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verified\":3") != null);
+    // Nullable columns serialize as JSON null.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"trace_id\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"repair_action\":null") != null);
 }
 
 test "cron_runs pruning removes rows older than 30 days" {

@@ -39,7 +39,7 @@ const Command = enum {
 };
 
 const SERVICE_SUBCOMMANDS = "install|start|stop|restart|status|uninstall";
-const CRON_SUBCOMMANDS = "list|status|job-status|schedule|add|add-agent|add-skill|once|once-agent|remove|pause|resume|run|update|runs|backup|restore|export-seed|init-seed";
+const CRON_SUBCOMMANDS = "list|status|job-status|schedule|add|add-agent|add-skill|once|once-agent|remove|pause|resume|run|update|runs|degraded|run-by-trace|backup|restore|export-seed|init-seed";
 const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
@@ -844,6 +844,8 @@ const CronAddAgentOptions = struct {
     session_target: yc.cron.SessionTarget = .isolated,
     delivery: yc.cron.DeliveryConfig = .{},
     tz_offset_s: i32 = 0,
+    verification_mode: yc.cron.VerificationMode = .none,
+    repair_policy: yc.cron.RepairPolicy = .none,
 };
 
 const CronAddSkillOptions = struct {
@@ -852,6 +854,14 @@ const CronAddSkillOptions = struct {
     account_id: ?[]const u8 = null,
     timeout_secs: ?u32 = null,
     tz_offset_s: i32 = 0,
+    verification_mode: yc.cron.VerificationMode = .none,
+    repair_policy: yc.cron.RepairPolicy = .none,
+};
+
+const CronAddShellOptions = struct {
+    tz_offset_s: i32 = 0,
+    verification_mode: yc.cron.VerificationMode = .none,
+    repair_policy: yc.cron.RepairPolicy = .none,
 };
 
 fn parseCronAddSkillOptions(allocator: std.mem.Allocator, sub_args: []const []const u8) CronAddSkillOptions {
@@ -859,9 +869,26 @@ fn parseCronAddSkillOptions(allocator: std.mem.Allocator, sub_args: []const []co
     // Collect all remaining args after expression and skill_name.
     // --deliver-to is extracted for the delivery config AND kept in skill_args
     // so the Python script receives it. --timeout is extracted only.
+    //
+    // Scheduler-owned flags (--verify, --repair, --timeout, --tz) are consumed
+    // only before a `--` terminator. Anything after `--` is forwarded verbatim
+    // to the skill script, so skills with their own `--verify`/`--repair`
+    // options can still pass them through. Example:
+    //   cron add-skill "*/5 * * * *" news --verify exit_only -- --verify trace
+    // Here the scheduler sees --verify exit_only; the skill receives --verify trace.
     var args_buf: std.ArrayListUnmanaged(u8) = .empty;
     var i: usize = 3;
+    var after_separator = false;
     while (i < sub_args.len) : (i += 1) {
+        if (after_separator) {
+            if (args_buf.items.len > 0) args_buf.appendSlice(allocator, " ") catch {};
+            args_buf.appendSlice(allocator, sub_args[i]) catch {};
+            continue;
+        }
+        if (std.mem.eql(u8, sub_args[i], "--")) {
+            after_separator = true;
+            continue;
+        }
         if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--deliver-to")) {
             options.deliver_to = sub_args[i + 1];
             // Keep --deliver-to in skill_args for the script
@@ -881,6 +908,12 @@ fn parseCronAddSkillOptions(allocator: std.mem.Allocator, sub_args: []const []co
             i += 1;
         } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--tz")) {
             options.tz_offset_s = parseTzOffset(sub_args[i + 1]);
+            i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--verify")) {
+            options.verification_mode = parseCronVerifyArg(sub_args[i + 1]);
+            i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--repair")) {
+            options.repair_policy = parseCronRepairArg(sub_args[i + 1]);
             i += 1;
         } else if (std.mem.eql(u8, sub_args[i], "--skill-args") and i + 1 < sub_args.len) {
             // --skill-args <value>: the user passed the value as a quoted string after --skill-args,
@@ -903,6 +936,30 @@ fn parseCronAddSkillOptions(allocator: std.mem.Allocator, sub_args: []const []co
 
 fn parseCronSessionTargetArg(raw: []const u8) !yc.cron.SessionTarget {
     return yc.cron.SessionTarget.parseStrict(raw);
+}
+
+/// Strict-parse --verify argument; on invalid input, print a clear error
+/// listing allowed values and exit 1. Never returns on error.
+fn parseCronVerifyArg(raw: []const u8) yc.cron.VerificationMode {
+    return yc.cron.VerificationMode.parseStrict(raw) catch {
+        std.debug.print(
+            "Invalid --verify value '{s}': expected one of none|exit_only|content_nonempty|content_has_trace\n",
+            .{raw},
+        );
+        std.process.exit(1);
+    };
+}
+
+/// Strict-parse --repair argument; on invalid input, print a clear error
+/// listing allowed values and exit 1. Never returns on error.
+fn parseCronRepairArg(raw: []const u8) yc.cron.RepairPolicy {
+    return yc.cron.RepairPolicy.parseStrict(raw) catch {
+        std.debug.print(
+            "Invalid --repair value '{s}': expected one of none|retry_once|alert_only\n",
+            .{raw},
+        );
+        std.process.exit(1);
+    };
 }
 
 fn parseCronAgentOptions(sub_args: []const []const u8, start_index: usize) !CronAddAgentOptions {
@@ -930,6 +987,12 @@ fn parseCronAgentOptions(sub_args: []const []const u8, start_index: usize) !Cron
         } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--tz")) {
             options.tz_offset_s = parseTzOffset(sub_args[i + 1]);
             i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--verify")) {
+            options.verification_mode = parseCronVerifyArg(sub_args[i + 1]);
+            i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--repair")) {
+            options.repair_policy = parseCronRepairArg(sub_args[i + 1]);
+            i += 1;
         }
     }
     return options;
@@ -947,6 +1010,24 @@ fn parseCronAddAgentOptions(sub_args: []const []const u8) !CronAddAgentOptions {
     return parseCronAgentOptions(sub_args, 3);
 }
 
+fn parseCronAddShellOptions(sub_args: []const []const u8) CronAddShellOptions {
+    var options = CronAddShellOptions{};
+    var i: usize = 3;
+    while (i < sub_args.len) : (i += 1) {
+        if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--tz")) {
+            options.tz_offset_s = parseTzOffset(sub_args[i + 1]);
+            i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--verify")) {
+            options.verification_mode = parseCronVerifyArg(sub_args[i + 1]);
+            i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--repair")) {
+            options.repair_policy = parseCronRepairArg(sub_args[i + 1]);
+            i += 1;
+        }
+    }
+    return options;
+}
+
 fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     const cron_usage = std.fmt.comptimePrint(
         \\Usage: nullclaw cron <{s}> [--help|-h]
@@ -962,13 +1043,20 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         \\                                --all       include paused/disabled jobs
         \\                                --today     restrict to remaining jobs in the current display day
         \\  add <expression> <command> [--tz <offset>]
+        \\             [--verify <mode>] [--repair <policy>]
         \\                                Add a recurring shell cron job
         \\  add-agent <expression> <prompt> [--model <model>] [--session-target <isolated|main>]
         \\             [--announce] [--channel <name>] [--account <id>] [--to <id>] [--tz <offset>]
+        \\             [--verify <mode>] [--repair <policy>]
         \\                                Add a recurring agent cron job
         \\  add-skill <expression> <skill> [args...] [--deliver-to <id>] [--account <id>]
-        \\             [--timeout <secs>] [--tz <offset>]
-        \\                                Add a recurring skill cron job
+        \\             [--timeout <secs>] [--tz <offset>] [--verify <mode>] [--repair <policy>]
+        \\             [-- <skill-args...>]
+        \\                                Add a recurring skill cron job.
+        \\                                --verify one of: none|exit_only|content_nonempty|content_has_trace
+        \\                                --repair one of: none|retry_once|alert_only
+        \\                                Use `--` to forward later args verbatim to the skill
+        \\                                (needed if the skill itself takes --verify/--repair).
         \\  once <delay> <command>        Add a one-shot delayed task
         \\  once-agent <delay> <prompt> [--model <model>] [--session-target <isolated|main>]
         \\                                Add a one-shot delayed agent task
@@ -979,9 +1067,15 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         \\  update <id> [--expression <expr>] [--command <cmd>] [--prompt <text>]
         \\             [--model <model>] [--session-target <isolated|main>]
         \\             [--enable] [--disable] [--tz <offset>]
+        \\             [--verify <mode>] [--repair <policy>]
         \\                                Update a cron job. --expression also recomputes next run time.
         \\  runs <id> [--limit N] [--json]
         \\                                List run history for a specific job (from cron_runs table)
+        \\  degraded [--hours N] [--job <id>] [--json]
+        \\                                List failed or degraded runs (status=error OR verified>=2) across all jobs.
+        \\                                --hours defaults to 24.
+        \\  run-by-trace <trace_id> [--json]
+        \\                                Find a run by trace_id (exact match).
         \\  backup                        Backup cron.db to ~/.nullclaw/backup/
         \\  restore [file]                Restore cron.db from latest backup or specified file
         \\  export-seed                   Export enabled jobs to ~/.nullclaw/cron-seed.json
@@ -1044,23 +1138,21 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliSchedule(allocator, hours, show_all, show_today, sched_json);
     } else if (std.mem.eql(u8, subcmd, "add")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron add <expression> <command> [--tz <offset>]\n", .{});
+            std.debug.print("Usage: nullclaw cron add <expression> <command> [--tz <offset>] [--verify <mode>] [--repair <policy>]\n", .{});
             std.process.exit(1);
         }
-        var add_tz: i32 = 0;
-        {
-            var ai: usize = 3;
-            while (ai < sub_args.len) : (ai += 1) {
-                if (ai + 1 < sub_args.len and std.mem.eql(u8, sub_args[ai], "--tz")) {
-                    add_tz = parseTzOffset(sub_args[ai + 1]);
-                    ai += 1;
-                }
-            }
-        }
-        try yc.cron.cliAddJob(allocator, sub_args[1], sub_args[2], add_tz);
+        const options = parseCronAddShellOptions(sub_args);
+        try yc.cron.cliAddJob(
+            allocator,
+            sub_args[1],
+            sub_args[2],
+            options.tz_offset_s,
+            options.verification_mode,
+            options.repair_policy,
+        );
     } else if (std.mem.eql(u8, subcmd, "add-agent")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>] [--tz <offset>]\n", .{});
+            std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>] [--tz <offset>] [--verify <mode>] [--repair <policy>]\n", .{});
             std.process.exit(1);
         }
         const options = parseCronAddAgentOptions(sub_args) catch |err| switch (err) {
@@ -1070,10 +1162,20 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             },
             else => return err,
         };
-        try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], options.model, options.session_target, options.delivery, options.tz_offset_s);
+        try yc.cron.cliAddAgentJob(
+            allocator,
+            sub_args[1],
+            sub_args[2],
+            options.model,
+            options.session_target,
+            options.delivery,
+            options.tz_offset_s,
+            options.verification_mode,
+            options.repair_policy,
+        );
     } else if (std.mem.eql(u8, subcmd, "add-skill")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron add-skill <expression> <skill> [args...] [--deliver-to <id>] [--account <id>] [--timeout <secs>] [--tz <offset>]\n", .{});
+            std.debug.print("Usage: nullclaw cron add-skill <expression> <skill> [args...] [--deliver-to <id>] [--account <id>] [--timeout <secs>] [--tz <offset>] [--verify <mode>] [--repair <policy>] [-- <skill-args...>]\n", .{});
             std.process.exit(1);
         }
         const options = parseCronAddSkillOptions(allocator, sub_args);
@@ -1084,7 +1186,17 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             .to = dt,
             .best_effort = true,
         } else .{};
-        try yc.cron.cliAddSkillJob(allocator, sub_args[1], sub_args[2], options.skill_args, delivery, options.timeout_secs orelse 120, options.tz_offset_s);
+        try yc.cron.cliAddSkillJob(
+            allocator,
+            sub_args[1],
+            sub_args[2],
+            options.skill_args,
+            delivery,
+            options.timeout_secs orelse 120,
+            options.tz_offset_s,
+            options.verification_mode,
+            options.repair_policy,
+        );
     } else if (std.mem.eql(u8, subcmd, "once")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron once <delay> <command>\n", .{});
@@ -1130,7 +1242,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliRunJob(allocator, sub_args[1]);
     } else if (std.mem.eql(u8, subcmd, "update")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <prompt>] [--model <model>] [--session-target <isolated|main>] [--enable] [--disable] [--tz <offset>]\n", .{});
+            std.debug.print("Usage: nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <prompt>] [--model <model>] [--session-target <isolated|main>] [--enable] [--disable] [--tz <offset>] [--verify <mode>] [--repair <policy>]\n", .{});
             std.process.exit(1);
         }
         const id = sub_args[1];
@@ -1141,6 +1253,8 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         var enabled: ?bool = null;
         var tz_offset_s: ?i32 = null;
         var session_target: ?yc.cron.SessionTarget = null;
+        var verification_mode: ?yc.cron.VerificationMode = null;
+        var repair_policy: ?yc.cron.RepairPolicy = null;
         var i: usize = 2;
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--expression") and i + 1 < sub_args.len) {
@@ -1171,9 +1285,27 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             } else if (std.mem.eql(u8, sub_args[i], "--tz") and i + 1 < sub_args.len) {
                 i += 1;
                 tz_offset_s = parseTzOffset(sub_args[i]);
+            } else if (std.mem.eql(u8, sub_args[i], "--verify") and i + 1 < sub_args.len) {
+                i += 1;
+                verification_mode = parseCronVerifyArg(sub_args[i]);
+            } else if (std.mem.eql(u8, sub_args[i], "--repair") and i + 1 < sub_args.len) {
+                i += 1;
+                repair_policy = parseCronRepairArg(sub_args[i]);
             }
         }
-        yc.cron.cliUpdateJob(allocator, id, expression, command, prompt, model, enabled, session_target, tz_offset_s) catch |err| switch (err) {
+        yc.cron.cliUpdateJob(
+            allocator,
+            id,
+            expression,
+            command,
+            prompt,
+            model,
+            enabled,
+            session_target,
+            tz_offset_s,
+            verification_mode,
+            repair_policy,
+        ) catch |err| switch (err) {
             error.SessionTargetRequiresAgentJob => {
                 std.debug.print("session_target can only be updated for agent jobs\n", .{});
                 std.process.exit(1);
@@ -1199,6 +1331,44 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             }
         }
         try yc.cron.cliListRuns(allocator, sub_args[1], runs_limit, runs_json);
+    } else if (std.mem.eql(u8, subcmd, "degraded")) {
+        var hours: u32 = 24;
+        var job_filter: ?[]const u8 = null;
+        var degraded_json = false;
+        {
+            var ri: usize = 1;
+            while (ri < sub_args.len) : (ri += 1) {
+                if (std.mem.eql(u8, sub_args[ri], "--json")) {
+                    degraded_json = true;
+                } else if (std.mem.eql(u8, sub_args[ri], "--hours") and ri + 1 < sub_args.len) {
+                    ri += 1;
+                    hours = std.fmt.parseInt(u32, sub_args[ri], 10) catch 24;
+                } else if (std.mem.eql(u8, sub_args[ri], "--job") and ri + 1 < sub_args.len) {
+                    ri += 1;
+                    job_filter = sub_args[ri];
+                }
+            }
+        }
+        try yc.cron.cliListDegradedRuns(allocator, hours, job_filter, degraded_json);
+    } else if (std.mem.eql(u8, subcmd, "run-by-trace")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw cron run-by-trace <trace_id> [--json]\n", .{});
+            std.process.exit(1);
+        }
+        var trace_json = false;
+        {
+            var ri: usize = 2;
+            while (ri < sub_args.len) : (ri += 1) {
+                if (std.mem.eql(u8, sub_args[ri], "--json")) trace_json = true;
+            }
+        }
+        yc.cron.cliFindRunByTrace(allocator, sub_args[1], trace_json) catch |err| {
+            if (err == error.NoRunMatched) {
+                std.debug.print("No runs found with trace_id={s}\n", .{sub_args[1]});
+                std.process.exit(1);
+            }
+            return err;
+        };
     } else if (std.mem.eql(u8, subcmd, "backup")) {
         try yc.cron.cliBackup(allocator);
     } else if (std.mem.eql(u8, subcmd, "restore")) {
@@ -4433,6 +4603,65 @@ test "parseCronAddSkillOptions preserves account and deliver-to in both config a
     try std.testing.expect(std.mem.indexOf(u8, sa, "--location") != null);
     // --timeout should NOT appear in skill_args
     try std.testing.expect(std.mem.indexOf(u8, sa, "--timeout") == null);
+}
+
+test "VerificationMode.parseStrict accepts valid values and rejects typos" {
+    try std.testing.expectEqual(yc.cron.VerificationMode.none, try yc.cron.VerificationMode.parseStrict("none"));
+    try std.testing.expectEqual(yc.cron.VerificationMode.exit_only, try yc.cron.VerificationMode.parseStrict("exit_only"));
+    try std.testing.expectEqual(yc.cron.VerificationMode.content_nonempty, try yc.cron.VerificationMode.parseStrict("content_nonempty"));
+    try std.testing.expectEqual(yc.cron.VerificationMode.content_has_trace, try yc.cron.VerificationMode.parseStrict("content_has_trace"));
+    // Case-insensitive.
+    try std.testing.expectEqual(yc.cron.VerificationMode.exit_only, try yc.cron.VerificationMode.parseStrict("EXIT_ONLY"));
+    // Typos must not silently map to .none.
+    try std.testing.expectError(error.InvalidVerificationMode, yc.cron.VerificationMode.parseStrict("content_nonemtpy"));
+    try std.testing.expectError(error.InvalidVerificationMode, yc.cron.VerificationMode.parseStrict(""));
+    try std.testing.expectError(error.InvalidVerificationMode, yc.cron.VerificationMode.parseStrict("off"));
+}
+
+test "RepairPolicy.parseStrict accepts valid values and rejects typos" {
+    try std.testing.expectEqual(yc.cron.RepairPolicy.none, try yc.cron.RepairPolicy.parseStrict("none"));
+    try std.testing.expectEqual(yc.cron.RepairPolicy.retry_once, try yc.cron.RepairPolicy.parseStrict("retry_once"));
+    try std.testing.expectEqual(yc.cron.RepairPolicy.alert_only, try yc.cron.RepairPolicy.parseStrict("alert_only"));
+    try std.testing.expectError(error.InvalidRepairPolicy, yc.cron.RepairPolicy.parseStrict("retry-once"));
+    try std.testing.expectError(error.InvalidRepairPolicy, yc.cron.RepairPolicy.parseStrict(""));
+}
+
+test "parseCronAddSkillOptions forwards script args after -- separator" {
+    // Regression for Codex review [P3]: before the fix, `--verify` and `--repair`
+    // were unconditionally consumed by the scheduler-side parser, breaking skills
+    // that take those names as their own options. The `--` separator lets users
+    // route scheduler flags on the left and skill flags on the right.
+    const args = [_][]const u8{
+        "add-skill",
+        "*/5 * * * *",
+        "news",
+        "--verify",
+        "exit_only",
+        "--deliver-to",
+        "123",
+        "--",
+        "--verify",
+        "deep",
+        "--repair",
+        "reload",
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const options = parseCronAddSkillOptions(arena.allocator(), &args);
+
+    // Scheduler-side parsing picked up the pre-separator --verify.
+    try std.testing.expectEqual(yc.cron.VerificationMode.exit_only, options.verification_mode);
+    // Post-separator --verify/--repair must reach the skill verbatim.
+    const sa = options.skill_args.?;
+    try std.testing.expect(std.mem.indexOf(u8, sa, "--verify deep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sa, "--repair reload") != null);
+    // --deliver-to is extracted and also forwarded (unchanged behavior).
+    try std.testing.expectEqualStrings("123", options.deliver_to.?);
+    try std.testing.expect(std.mem.indexOf(u8, sa, "--deliver-to 123") != null);
+    // The bare `--` separator token itself must not leak into skill_args.
+    // It would show up as a space-delimited word: " -- ".
+    try std.testing.expect(std.mem.indexOf(u8, sa, " -- ") == null);
 }
 
 test "parseCronAddSkillOptions strips --skill-args flag prefix" {

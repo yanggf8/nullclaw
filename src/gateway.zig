@@ -3431,6 +3431,10 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
         }
     else
         null;
+    const verification_mode_upd: ?cron_mod.VerificationMode =
+        if (cronObjectStringField(obj, "verification_mode")) |raw| cron_mod.VerificationMode.parse(raw) else null;
+    const repair_policy_upd: ?cron_mod.RepairPolicy =
+        if (cronObjectStringField(obj, "repair_policy")) |raw| cron_mod.RepairPolicy.parse(raw) else null;
 
     // ── DB-direct path ────────────────────────────────────────────────
     if (ctx.state.cron_db_backend) |*be| {
@@ -3451,6 +3455,8 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
             .next_run_secs = next_run_secs_opt,
             .tz_offset_s = tz_offset_s_opt,
             .session_target = if (session_target) |st| @as(cron_backend_mod.SessionTarget, @enumFromInt(@intFromEnum(st))) else null,
+            .verification_mode = if (verification_mode_upd) |vm| @as(cron_backend_mod.VerificationMode, @enumFromInt(@intFromEnum(vm))) else null,
+            .repair_policy = if (repair_policy_upd) |rp| @as(cron_backend_mod.RepairPolicy, @enumFromInt(@intFromEnum(rp))) else null,
         };
         const found = be.backend().update(id, patch) catch false;
         if (!found) {
@@ -3499,6 +3505,8 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
         .next_run_secs = next_run_secs_opt,
         .tz_offset_s = tz_offset_s_opt,
         .session_target = session_target,
+        .verification_mode = verification_mode_upd,
+        .repair_policy = repair_policy_upd,
     };
 
     if (!sched.updateJob(sched.allocator, id, patch)) {

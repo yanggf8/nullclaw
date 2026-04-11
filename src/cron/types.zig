@@ -115,6 +115,8 @@ pub const CronJobPatch = struct {
     next_run_secs: ?i64 = null,
     tz_offset_s: ?i32 = null,
     session_target: ?SessionTarget = null,
+    verification_mode: ?VerificationMode = null,
+    repair_policy: ?RepairPolicy = null,
 };
 
 /// A scheduled cron job — the full persistent record.
@@ -169,6 +171,16 @@ pub const VerificationMode = enum {
         if (std.ascii.eqlIgnoreCase(s, "content_has_trace")) return .content_has_trace;
         return .none;
     }
+
+    /// Strict parse: returns an error for unrecognized values. Use for CLI input
+    /// where a typo must not silently downgrade to `.none`.
+    pub fn parseStrict(s: []const u8) !VerificationMode {
+        if (std.ascii.eqlIgnoreCase(s, "none")) return .none;
+        if (std.ascii.eqlIgnoreCase(s, "exit_only")) return .exit_only;
+        if (std.ascii.eqlIgnoreCase(s, "content_nonempty")) return .content_nonempty;
+        if (std.ascii.eqlIgnoreCase(s, "content_has_trace")) return .content_has_trace;
+        return error.InvalidVerificationMode;
+    }
 };
 
 pub const RepairPolicy = enum {
@@ -188,6 +200,15 @@ pub const RepairPolicy = enum {
         if (std.ascii.eqlIgnoreCase(s, "retry_once")) return .retry_once;
         if (std.ascii.eqlIgnoreCase(s, "alert_only")) return .alert_only;
         return .none;
+    }
+
+    /// Strict parse: returns an error for unrecognized values. Use for CLI input
+    /// where a typo must not silently downgrade to `.none`.
+    pub fn parseStrict(s: []const u8) !RepairPolicy {
+        if (std.ascii.eqlIgnoreCase(s, "none")) return .none;
+        if (std.ascii.eqlIgnoreCase(s, "retry_once")) return .retry_once;
+        if (std.ascii.eqlIgnoreCase(s, "alert_only")) return .alert_only;
+        return error.InvalidRepairPolicy;
     }
 };
 

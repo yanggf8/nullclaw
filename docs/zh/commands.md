@@ -91,20 +91,36 @@
 | `nullclaw cron schedule [--hours N] [--today] [--all] [--json]` | 查看指定時間窗口內的即將觸發任務 |
 | `nullclaw cron status` | 排程守護進程健康摘要 |
 | `nullclaw cron job-status [--json]` | 各任務最近執行狀態與時間戳記 |
-| `nullclaw cron add "0 * * * *" "command" [--tz <offset>]` | 新增週期性 shell 任務 |
-| `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--session-target isolated\|main] [--channel <name>] [--account <id>] [--to <id>] [--tz <offset>]` | 新增週期性 agent 任務 |
-| `nullclaw cron add-skill "0 * * * *" <skill> [--skill-args "..."] [--deliver-to <id>] [--account <id>] [--timeout <secs>] [--tz <offset>]` | 新增週期性技能任務 |
+| `nullclaw cron add "0 * * * *" "command" [--tz <offset>] [--verify <mode>] [--repair <policy>]` | 新增週期性 shell 任務 |
+| `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--session-target isolated\|main] [--channel <name>] [--account <id>] [--to <id>] [--tz <offset>] [--verify <mode>] [--repair <policy>]` | 新增週期性 agent 任務 |
+| `nullclaw cron add-skill "0 * * * *" <skill> [--skill-args "..."] [--deliver-to <id>] [--account <id>] [--timeout <secs>] [--tz <offset>] [--verify <mode>] [--repair <policy>] [-- <skill-args...>]` | 新增週期性技能任務。使用 `--` 可將後續參數原樣轉交技能本身（當技能自己也有 `--verify`/`--repair` 時必需） |
 | `nullclaw cron once <delay> "command"` | 新增一次性延遲任務 |
 | `nullclaw cron once-agent <delay> "prompt" --model <model> [--session-target isolated\|main]` | 新增一次性 agent 延遲任務 |
 | `nullclaw cron run <id>` | 立即執行指定任務 |
 | `nullclaw cron pause <id>` / `resume <id>` | 暫停 / 恢復任務 |
 | `nullclaw cron remove <id>` | 刪除任務 |
-| `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>]` | 更新已有任務；`--enable` 同時清除 paused 標誌，`--disable` 同時設定 |
-| `nullclaw cron runs <id> [--limit N] [--json]` | 查看任務最近執行記錄 |
+| `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>] [--verify <mode>] [--repair <policy>]` | 更新已有任務；`--enable` 同時清除 paused 標誌，`--disable` 同時設定 |
+| `nullclaw cron runs <id> [--limit N] [--json]` | 查看任務最近執行記錄（包含 exit code、failure class、repair action、verified 狀態與 trace ID） |
+| `nullclaw cron degraded [--hours N] [--job <id>] [--json]` | 列出時間窗內（預設 24 小時）所有失敗或降級的執行；比對條件為 `status=error` 或 `verified>=2` |
+| `nullclaw cron run-by-trace <trace_id> [--json]` | 依 `trace_id` 查詢執行記錄;無對應結果時以 exit 1 結束,方便 shell pipeline 使用 |
 | `nullclaw cron backup` | 將所有任務匯出為帶時間戳記的 seed 檔案 |
 | `nullclaw cron restore [<file>]` | 從 seed 檔案還原任務 |
 | `nullclaw cron export-seed` | 以可攜式 JSON 格式列印任務 |
 | `nullclaw cron init-seed` | 將 seed 檔案載入全新 DB（僅用於新安裝） |
+
+**驗證與修復策略**（`--verify` / `--repair`）:
+
+- `--verify <mode>` — 排程器如何判定執行結果。可選值:
+  - `none`（預設）— 不做驗證
+  - `exit_only` — 只把非零 exit 視為失敗
+  - `content_nonempty` — 空的 stdout 視為降級
+  - `content_has_trace` — stdout 必須包含 job ID（技能可使用 `trace_marker.emit_trace()` 輔助函式）
+- `--repair <policy>` — 執行被判定為降級/失敗時排程器如何處理。可選值:
+  - `none`（預設）— 僅記錄結果
+  - `retry_once` — 立即重試一次;重試結果會被記成 `repair_action=retried_ok` 或 `retried_failed`
+  - `alert_only` — 發送操作者告警但不重試（`repair_action=alert_sent`）
+
+無法辨識的值會直接被拒絕並列出合法選項 — `cron update` 時的拼字錯誤不會靜默清除既有策略。
 
 ### Skills
 
