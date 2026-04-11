@@ -324,7 +324,7 @@ fn writeAtomic(allocator: std.mem.Allocator, path: []const u8, content: []const 
 
 fn validateCandidateJson(allocator: std.mem.Allocator, config_path: []const u8, content: []const u8) !void {
     const config_dir = std.fs.path.dirname(config_path) orelse return error.InvalidPath;
-    const workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
+    const workspace_dir = try config_paths.defaultWorkspaceDirFromConfigDir(allocator, config_dir);
 
     var cfg = config_mod.Config{
         .workspace_dir = workspace_dir,

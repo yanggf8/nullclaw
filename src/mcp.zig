@@ -97,6 +97,7 @@ pub const McpServer = struct {
 
         // Build environment: inherit parent + config overrides
         var env = std.process.EnvMap.init(self.allocator);
+        defer env.deinit();
         // Add PATH, HOME, etc. from parent
         const inherit_vars = [_][]const u8{
             "PATH",              "HOME",        "TERM",    "LANG",         "LC_ALL",
@@ -627,6 +628,21 @@ test "McpServer init fields" {
     try std.testing.expectEqual(@as(u32, 1), server.next_id);
     try std.testing.expect(server.child == null);
     try std.testing.expectEqualStrings("/usr/bin/echo", server.config.command);
+}
+
+test "McpServer connectStdio deinit frees env map after spawn" {
+    var server = McpServer.init(std.testing.allocator, .{
+        .name = "cat",
+        .transport = "stdio",
+        .command = "sh",
+        .args = &.{ "-c", "cat" },
+        .env = &.{.{ .key = "NULLCLAW_TEST_ENV", .value = "1" }},
+    });
+    defer server.deinit();
+
+    // Regression: connectStdio used to leak its EnvMap when stdio servers had env overrides.
+    try server.connectStdio();
+    try std.testing.expect(server.child != null);
 }
 
 test "McpServer sendRequest requires http client for http transport" {

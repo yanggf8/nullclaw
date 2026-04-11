@@ -94,6 +94,10 @@ docker run --rm -it \
 docker compose --profile agent run --rm agent onboard --interactive
 ```
 
+在官方容器流程里，workspace 提示直接回车即可保留挂载卷里的默认路径：
+
+- 工作区：`/nullclaw-data/workspace`
+
 交互式 agent 会话：
 
 ```bash

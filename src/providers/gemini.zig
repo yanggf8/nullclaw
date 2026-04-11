@@ -649,35 +649,38 @@ pub const GeminiProvider = struct {
         // Extract text and thinking from candidates.
         // Parts with "thought": true are reasoning traces; all others are visible content.
         if (root_obj.get("candidates")) |candidates| {
-            if (candidates.array.items.len > 0) {
+            if (candidates == .array and candidates.array.items.len > 0) {
                 const candidate = candidates.array.items[0].object;
                 if (candidate.get("content")) |content| {
-                    if (content.object.get("parts")) |parts| {
-                        var text_buf: std.ArrayListUnmanaged(u8) = .empty;
-                        defer text_buf.deinit(allocator);
-                        var thought_buf: std.ArrayListUnmanaged(u8) = .empty;
-                        defer thought_buf.deinit(allocator);
+                    if (content == .object) {
+                        if (content.object.get("parts")) |parts| {
+                            if (parts != .array) return error.NoResponseContent;
+                            var text_buf: std.ArrayListUnmanaged(u8) = .empty;
+                            defer text_buf.deinit(allocator);
+                            var thought_buf: std.ArrayListUnmanaged(u8) = .empty;
+                            defer thought_buf.deinit(allocator);
 
-                        for (parts.array.items) |part_val| {
-                            const part = part_val.object;
-                            const is_thought = if (part.get("thought")) |t| (t == .bool and t.bool) else false;
-                            if (part.get("text")) |text| {
-                                if (text == .string and text.string.len > 0) {
-                                    const buf = if (is_thought) &thought_buf else &text_buf;
-                                    if (buf.items.len > 0) try buf.append(allocator, '\n');
-                                    try buf.appendSlice(allocator, text.string);
+                            for (parts.array.items) |part_val| {
+                                const part = part_val.object;
+                                const is_thought = if (part.get("thought")) |t| (t == .bool and t.bool) else false;
+                                if (part.get("text")) |text| {
+                                    if (text == .string and text.string.len > 0) {
+                                        const buf = if (is_thought) &thought_buf else &text_buf;
+                                        if (buf.items.len > 0) try buf.append(allocator, '\n');
+                                        try buf.appendSlice(allocator, text.string);
+                                    }
                                 }
                             }
+
+                            if (text_buf.items.len == 0 and thought_buf.items.len == 0)
+                                return error.NoResponseContent;
+
+                            return .{
+                                .content = if (text_buf.items.len > 0) try text_buf.toOwnedSlice(allocator) else null,
+                                .reasoning_content = if (thought_buf.items.len > 0) try thought_buf.toOwnedSlice(allocator) else null,
+                                .usage = usage,
+                            };
                         }
-
-                        if (text_buf.items.len == 0 and thought_buf.items.len == 0)
-                            return error.NoResponseContent;
-
-                        return .{
-                            .content = if (text_buf.items.len > 0) try text_buf.toOwnedSlice(allocator) else null,
-                            .reasoning_content = if (thought_buf.items.len > 0) try thought_buf.toOwnedSlice(allocator) else null,
-                            .usage = usage,
-                        };
                     }
                 }
             }
@@ -1365,6 +1368,14 @@ test "parseResponse empty candidates fails" {
     try std.testing.expectError(error.NoResponseContent, GeminiProvider.parseResponse(std.testing.allocator, body));
 }
 
+test "parseResponse null candidates fails" {
+    // Regression: provider response parsing must tolerate `"candidates": null`.
+    const body =
+        \\{"candidates":null}
+    ;
+    try std.testing.expectError(error.NoResponseContent, GeminiProvider.parseResponse(std.testing.allocator, body));
+}
+
 test "parseResponse no text field fails" {
     const body =
         \\{"candidates":[{"content":{"parts":[{}]}}]}
@@ -1411,6 +1422,13 @@ test "parseChatResponse thought only leaves content null" {
     }
     try std.testing.expect(response.content == null);
     try std.testing.expectEqualStrings("only thinking", response.reasoning_content.?);
+}
+
+test "parseChatResponse null parts fails cleanly" {
+    const body =
+        \\{"candidates":[{"content":{"parts":null}}]}
+    ;
+    try std.testing.expectError(error.NoResponseContent, GeminiProvider.parseChatResponse(std.testing.allocator, body));
 }
 
 test "provider rejects whitespace key" {

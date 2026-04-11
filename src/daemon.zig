@@ -15,6 +15,7 @@ const cron = @import("cron.zig");
 const bus_mod = @import("bus.zig");
 const channels_mod = @import("channels/root.zig");
 const dispatch = @import("channels/dispatch.zig");
+const channel_outbox = @import("channels/outbox.zig");
 const channel_loop = @import("channel_loop.zig");
 const channel_manager = @import("channel_manager.zig");
 const agent_routing = @import("agent_routing.zig");
@@ -24,6 +25,7 @@ const heartbeat_mod = @import("heartbeat.zig");
 const inbound_debounce = @import("inbound_debounce.zig");
 const interaction_choices = @import("interactions/choices.zig");
 const memory_mod = @import("memory/root.zig");
+const outbound = @import("outbound.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
@@ -105,6 +107,13 @@ pub fn stateFilePath(allocator: std.mem.Allocator, config: *const Config) ![]u8 
         return std.fs.path.join(allocator, &.{ dir, "daemon_state.json" });
     }
     return allocator.dupe(u8, "daemon_state.json");
+}
+
+pub fn outboundDeliveryPath(allocator: std.mem.Allocator, config: *const Config) ![]u8 {
+    if (std.fs.path.dirname(config.config_path)) |dir| {
+        return std.fs.path.join(allocator, &.{ dir, "state", "outbound_delivery.json" });
+    }
+    return allocator.dupe(u8, "outbound_delivery.json");
 }
 
 /// Write daemon state to disk as JSON.
@@ -737,6 +746,9 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
         if (pm.value.object.get("message_id")) |v| {
             if (v == .string and v.string.len > 0) parsed.fields.message_id = v.string;
         }
+        if (pm.value.object.get("replace_message")) |v| {
+            if (v == .bool) parsed.fields.replace_message = v.bool;
+        }
         if (pm.value.object.get("guild_id")) |v| {
             if (v == .string) parsed.fields.guild_id = v.string;
         }
@@ -1123,6 +1135,62 @@ fn makeAssistantReplyOutbound(
     return msg;
 }
 
+const AssistantReplyPayload = struct {
+    text: []u8,
+    choices: []outbound.Choice,
+
+    fn deinit(self: *AssistantReplyPayload, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        for (self.choices) |choice| choice.deinit(allocator);
+        allocator.free(self.choices);
+    }
+
+    fn payload(self: *const AssistantReplyPayload) outbound.Payload {
+        return .{
+            .text = self.text,
+            .choices = self.choices,
+        };
+    }
+};
+
+fn makeAssistantReplyPayload(allocator: std.mem.Allocator, reply: []const u8) !AssistantReplyPayload {
+    if (std.mem.indexOf(u8, reply, interaction_choices.START_TAG) == null) {
+        return .{
+            .text = try allocator.dupe(u8, reply),
+            .choices = try allocator.alloc(outbound.Choice, 0),
+        };
+    }
+
+    var parsed = try interaction_choices.parseAssistantChoices(allocator, reply);
+    defer parsed.deinit(allocator);
+
+    const choices = if (parsed.choices) |choices| blk: {
+        const duped = try allocator.alloc(outbound.Choice, choices.options.len);
+        var i: usize = 0;
+        errdefer {
+            for (duped[0..i]) |choice| choice.deinit(allocator);
+            allocator.free(duped);
+        }
+        while (i < choices.options.len) : (i += 1) {
+            duped[i] = .{
+                .id = try allocator.dupe(u8, choices.options[i].id),
+                .label = try allocator.dupe(u8, choices.options[i].label),
+                .submit_text = try allocator.dupe(u8, choices.options[i].submit_text),
+            };
+        }
+        break :blk duped;
+    } else try allocator.alloc(outbound.Choice, 0);
+    errdefer {
+        for (choices) |choice| choice.deinit(allocator);
+        allocator.free(choices);
+    }
+
+    return .{
+        .text = try allocator.dupe(u8, parsed.visible_text),
+        .choices = choices,
+    };
+}
+
 fn makeStreamingSinkForChannel(
     streaming_supported: bool,
     raw_sink: streaming.Sink,
@@ -1301,6 +1369,38 @@ fn inboundDispatcherThread(
                 continue;
             };
             defer allocator.free(reply);
+
+            if ((parsed_meta.fields.replace_message orelse false) and parsed_meta.fields.message_id != null) {
+                if (outbound_channel) |channel| {
+                    var payload = makeAssistantReplyPayload(allocator, reply) catch |err| {
+                        log.warn("failed to build edit payload: {}", .{err});
+                        const out = makeAssistantReplyOutbound(
+                            allocator,
+                            msg.channel,
+                            outbound_account_id,
+                            msg.chat_id,
+                            reply,
+                            outbound_draft_id,
+                        ) catch continue;
+                        event_bus.publishOutbound(out) catch |publish_err| {
+                            out.deinit(allocator);
+                            log.err("inbound dispatch publishOutbound failed: {}", .{publish_err});
+                        };
+                        continue;
+                    };
+                    defer payload.deinit(allocator);
+
+                    if (channel.editMessage(.{
+                        .target = msg.chat_id,
+                        .message_id = parsed_meta.fields.message_id.?,
+                        .payload = payload.payload(),
+                    })) |_| {
+                        continue;
+                    } else |err| {
+                        log.warn("editMessage failed; falling back to normal outbound: {}", .{err});
+                    }
+                }
+            }
 
             const out = makeAssistantReplyOutbound(
                 allocator,
@@ -1531,12 +1631,23 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     }
 
     var dispatch_stats = dispatch.DispatchStats{};
+    const delivery_path = try outboundDeliveryPath(allocator, config);
+    defer allocator.free(delivery_path);
+    if (std.fs.path.dirname(delivery_path)) |delivery_dir| {
+        std.fs.makeDirAbsolute(delivery_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+    var delivery_outbox = try channel_outbox.DeliveryOutbox.init(allocator, delivery_path);
+    defer delivery_outbox.deinit();
 
     state.addComponent("outbound_dispatcher");
+    state.addComponent("outbound_delivery");
 
     var dispatcher_thread: ?std.Thread = null;
-    if (std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, dispatch.runOutboundDispatcher, .{
-        allocator, &event_bus, &channel_registry, &dispatch_stats,
+    if (std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, dispatch.runOutboundDispatcherWithOutbox, .{
+        allocator, &event_bus, &channel_registry, &dispatch_stats, &delivery_outbox,
     })) |thread| {
         dispatcher_thread = thread;
         state.markRunning("outbound_dispatcher");
@@ -1544,6 +1655,18 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     } else |err| {
         state.markError("outbound_dispatcher", @errorName(err));
         stdout.print("Warning: outbound dispatcher thread failed: {}\n", .{err}) catch {};
+    }
+
+    var delivery_thread: ?std.Thread = null;
+    if (std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, dispatch.runDurableOutboundWorker, .{
+        allocator, &delivery_outbox, &channel_registry,
+    })) |thread| {
+        delivery_thread = thread;
+        state.markRunning("outbound_delivery");
+        health.markComponentOk("outbound_delivery");
+    } else |err| {
+        state.markError("outbound_delivery", @errorName(err));
+        stdout.print("Warning: outbound delivery thread failed: {}\n", .{err}) catch {};
     }
 
     // Main thread: wait for shutdown signal (poll-based)
@@ -1555,6 +1678,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     // Close bus to signal dispatcher to exit
     event_bus.close();
+    delivery_outbox.close();
 
     // Write final state
     state.markError("gateway", "shutting down");
@@ -1563,6 +1687,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     // Wait for threads
     if (inbound_thread) |t| t.join();
     if (dispatcher_thread) |t| t.join();
+    if (delivery_thread) |t| t.join();
     if (chan_thread) |t| t.join();
     if (sched_thread) |t| t.join();
     if (hb_thread) |t| t.join();
@@ -2524,6 +2649,17 @@ test "parseInboundMetadata extracts message_id and thread_id" {
     try std.testing.expectEqualStrings("C1", parsed.fields.channel_id.?);
     try std.testing.expectEqualStrings("1700.1", parsed.fields.message_id.?);
     try std.testing.expectEqualStrings("1700.0", parsed.fields.thread_id.?);
+}
+
+test "parseInboundMetadata extracts replace_message flag" {
+    var parsed = parseInboundMetadata(
+        std.testing.allocator,
+        "{\"message_id\":\"42\",\"replace_message\":true}",
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("42", parsed.fields.message_id.?);
+    try std.testing.expectEqual(true, parsed.fields.replace_message.?);
 }
 
 test "parseInboundMetadata extracts discord sender identity fields" {

@@ -98,6 +98,10 @@ Interactive onboarding:
 docker compose --profile agent run --rm agent onboard --interactive
 ```
 
+Inside the official container flow, pressing Enter at the workspace prompt keeps the volume-backed default:
+
+- workspace: `/nullclaw-data/workspace`
+
 Interactive agent session:
 
 ```bash

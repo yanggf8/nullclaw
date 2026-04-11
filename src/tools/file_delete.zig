@@ -5,8 +5,10 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const isPathSafe = @import("path_security.zig").isPathSafe;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
+const file_common = @import("file_common.zig");
 const bootstrap_mod = @import("../bootstrap/root.zig");
 const onboard = @import("../onboard.zig");
+const resolveNearestExistingAncestor = file_common.resolveNearestExistingAncestor;
 
 /// Delete BOOTSTRAP.md from the workspace or bootstrap memory backend.
 pub const FileDeleteTool = struct {
@@ -84,17 +86,6 @@ pub const FileDeleteTool = struct {
         return ToolResult.ok("Deleted BOOTSTRAP.md");
     }
 };
-
-fn resolveNearestExistingAncestor(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    return std.fs.cwd().realpathAlloc(allocator, path) catch |err| switch (err) {
-        error.FileNotFound => {
-            const parent = std.fs.path.dirname(path) orelse return err;
-            if (std.mem.eql(u8, parent, path)) return err;
-            return resolveNearestExistingAncestor(allocator, parent);
-        },
-        else => return err,
-    };
-}
 
 test "file_delete tool name" {
     var ft = FileDeleteTool{ .workspace_dir = "/tmp" };

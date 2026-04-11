@@ -24,6 +24,15 @@ pub const ResultEntry = struct {
     description: []const u8,
 };
 
+pub const ParsedJsonObject = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    object: std.json.ObjectMap,
+
+    pub fn deinit(self: *ParsedJsonObject) void {
+        self.parsed.deinit();
+    }
+};
+
 pub fn logRequestError(provider: []const u8, query: []const u8, err: anytype) void {
     if (builtin.is_test) return;
     log.err("web_search ({s}) request failed for '{s}': {}", .{ provider, query, err });
@@ -68,6 +77,35 @@ pub fn timeoutToString(allocator: std.mem.Allocator, timeout_secs: u64) ![]u8 {
     const default_timeout_secs: u64 = 30;
     const effective_timeout = if (timeout_secs == 0) default_timeout_secs else timeout_secs;
     return std.fmt.allocPrint(allocator, "{d}", .{effective_timeout});
+}
+
+pub fn parseJsonObject(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+) (ProviderSearchError || error{OutOfMemory})!ParsedJsonObject {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidResponse;
+    const object = switch (parsed.value) {
+        .object => |o| o,
+        else => {
+            parsed.deinit();
+            return error.InvalidResponse;
+        },
+    };
+    return .{
+        .parsed = parsed,
+        .object = object,
+    };
+}
+
+pub fn requireArrayField(
+    object: std.json.ObjectMap,
+    key: []const u8,
+) (ProviderSearchError || error{OutOfMemory})![]const std.json.Value {
+    const value = object.get(key) orelse return error.InvalidResponse;
+    return switch (value) {
+        .array => |items| items.items,
+        else => error.InvalidResponse,
+    };
 }
 
 pub fn buildSearxngSearchUrl(
@@ -201,4 +239,30 @@ pub fn duckduckgoTitleFromText(text: []const u8) []const u8 {
         if (idx > 0) return text[0..idx];
     }
     return text;
+}
+
+test "parseJsonObject returns object root" {
+    var parsed = try parseJsonObject(std.testing.allocator, "{\"results\":[]}");
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.object.get("results") != null);
+}
+
+test "parseJsonObject rejects non-object root" {
+    try std.testing.expectError(error.InvalidResponse, parseJsonObject(std.testing.allocator, "[]"));
+}
+
+test "requireArrayField returns array items" {
+    var parsed = try parseJsonObject(std.testing.allocator, "{\"results\":[{\"title\":\"A\"}]}");
+    defer parsed.deinit();
+
+    const items = try requireArrayField(parsed.object, "results");
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+}
+
+test "requireArrayField rejects missing field" {
+    var parsed = try parseJsonObject(std.testing.allocator, "{\"data\":[]}");
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.InvalidResponse, requireArrayField(parsed.object, "results"));
 }

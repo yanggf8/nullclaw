@@ -163,6 +163,20 @@ nullclaw onboard --interactive
 
 如果同一 provider 有多把 key，可以配置 `reliability.api_keys` 让 NullClaw 在限流时轮转。
 
+### 6) 本地 Ollama 模型提示没有 `scheduler_tool` 权限
+
+这通常意味着：
+
+- NullClaw 里的规范工具名其实是 `schedule`。
+- 某些通过 Ollama 提供的本地模型会输出 `scheduler_tool` 或 `schedule_tool`。
+- 新版 NullClaw 会在分发前把这些 Ollama 别名规范化回 `schedule`。
+
+建议检查：
+
+- 确认当前运行的版本已经包含 Ollama 工具别名规范化修复。
+- 如果仍然看到 scheduler 相关名字触发 `Unknown tool`，用 `nullclaw agent --verbose` 复现一次。
+- 如果还在使用旧二进制，先升级再排查 scheduler 配置；大多数情况下问题是工具名漂移，不是 scheduler 没开。
+
 ## 变更后回归检查清单
 
 每次改配置后，建议按顺序执行：

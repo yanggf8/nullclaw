@@ -91,6 +91,50 @@ pub fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const
     return allocator.dupe(u8, trimmed);
 }
 
+fn appendReasoningDetailText(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    detail: std.json.Value,
+) !void {
+    if (detail != .object) return;
+    const obj = detail.object;
+
+    if (obj.get("type")) |type_val| {
+        if (type_val == .string and std.mem.eql(u8, type_val.string, "reasoning.encrypted")) return;
+    }
+
+    const text = blk: {
+        if (obj.get("text")) |value| {
+            if (value == .string and value.string.len > 0) break :blk value.string;
+        }
+        if (obj.get("summary")) |value| {
+            if (value == .string and value.string.len > 0) break :blk value.string;
+        }
+        break :blk null;
+    } orelse return;
+
+    if (out.items.len > 0) try out.append(allocator, '\n');
+    try out.appendSlice(allocator, text);
+}
+
+/// Extract plain-text reasoning from OpenRouter/OpenAI-style `reasoning_details`.
+/// Encrypted detail variants are intentionally ignored.
+pub fn extractReasoningTextFromDetails(allocator: std.mem.Allocator, details: std.json.Value) !?[]const u8 {
+    if (details != .array) return null;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+
+    for (details.array.items) |detail| {
+        try appendReasoningDetailText(&out, allocator, detail);
+    }
+
+    const trimmed = std.mem.trim(u8, out.items, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const owned = try allocator.dupe(u8, trimmed);
+    return owned;
+}
+
 /// Extract api_key from a config-like struct (supports both Config.defaultProviderKey() and plain .api_key field).
 fn resolveApiKeyFromCfg(cfg: anytype) ?[]const u8 {
     const T = @TypeOf(cfg);
@@ -212,6 +256,36 @@ pub fn buildRequestBodyWithSystem(allocator: std.mem.Allocator, model: []const u
     try json_util.appendJsonString(&buf, allocator, prompt);
     try std.fmt.format(w, "}}],\"temperature\":{d:.1},\"max_tokens\":{d}}}", .{ temperature, max_tokens });
     return try buf.toOwnedSlice(allocator);
+}
+
+/// Append OpenAI-compatible request extras:
+/// - `user` sourced from the upstream session_id
+/// - arbitrary top-level JSON fields from `extra_body_params`
+///
+/// `extra_body_params` is expected to be a compact JSON object string such as
+/// `{"seed":123,"metadata":{"tier":"pro"}}`. Parsing happens at config-load
+/// time; request builders only splice the already-validated object body.
+pub fn appendOpenAiBodyExtraParams(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    session_id: ?[]const u8,
+    extra_body_params: ?[]const u8,
+) !void {
+    if (session_id) |sid| {
+        try buf.appendSlice(allocator, ",\"user\":");
+        try json_util.appendJsonString(buf, allocator, sid);
+    }
+
+    if (extra_body_params) |extra| {
+        const trimmed = std.mem.trim(u8, extra, " \t\r\n");
+        if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') return;
+
+        const inner = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+        if (inner.len == 0) return;
+
+        try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, inner);
+    }
 }
 
 /// Check if a model name indicates an OpenAI reasoning model
@@ -564,7 +638,7 @@ pub fn extractContent(allocator: std.mem.Allocator, body: []const u8) ![]const u
 
     // OpenAI/OpenRouter format: choices[0].message.content
     if (root_obj.get("choices")) |choices| {
-        if (choices.array.items.len > 0) {
+        if (choices == .array and choices.array.items.len > 0) {
             if (choices.array.items[0].object.get("message")) |msg| {
                 if (msg.object.get("content")) |content| {
                     if (content == .string) return try allocator.dupe(u8, content.string);
@@ -575,7 +649,7 @@ pub fn extractContent(allocator: std.mem.Allocator, body: []const u8) ![]const u
 
     // Anthropic format: content[0].text
     if (root_obj.get("content")) |content| {
-        if (content.array.items.len > 0) {
+        if (content == .array and content.array.items.len > 0) {
             if (content.array.items[0].object.get("text")) |text| {
                 if (text == .string) return try allocator.dupe(u8, text.string);
             }
@@ -703,6 +777,25 @@ test "extractContent parses Anthropic format" {
     const result = try extractContent(allocator, body);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("Hello from Claude", result);
+}
+
+test "extractContent skips null choices and parses Anthropic format" {
+    // Regression: some OpenAI-compatible providers return `"choices": null`.
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"choices":null,"content":[{"type":"text","text":"Hello from Claude"}]}
+    ;
+    const result = try extractContent(allocator, body);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Hello from Claude", result);
+}
+
+test "extractContent null content fails cleanly" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"content":null}
+    ;
+    try std.testing.expectError(error.UnexpectedResponse, extractContent(allocator, body));
 }
 
 test "buildRequestBody escapes double quotes in prompt" {

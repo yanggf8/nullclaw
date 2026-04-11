@@ -1,5 +1,6 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
+const config_paths = @import("config_paths.zig");
 const config_types = @import("config_types.zig");
 const agent_routing = @import("agent_routing.zig");
 
@@ -321,7 +322,7 @@ pub fn applyBindingUpdate(
 
 fn loadConfigFromPath(allocator: std.mem.Allocator, config_path: []const u8) !Config {
     const config_dir = std.fs.path.dirname(config_path) orelse return error.InvalidConfigPath;
-    const workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
+    const workspace_dir = try config_paths.defaultWorkspaceDirFromConfigDir(allocator, config_dir);
 
     var cfg = Config{
         .workspace_dir = workspace_dir,

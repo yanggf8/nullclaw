@@ -4,6 +4,7 @@
 //! for `nullclaw agent`) and the streaming stdout callback.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const log = std.log.scoped(.agent);
 const Config = @import("../config.zig").Config;
 const config_types = @import("../config_types.zig");
@@ -35,6 +36,7 @@ const Agent = @import("root.zig").Agent;
 const CliStreamCtx = struct {
     sink: streaming.Sink,
     emitted_text: bool = false,
+    filter: streaming.TagFilter = undefined,
 };
 
 const CliProviderContext = struct {
@@ -58,8 +60,14 @@ fn shouldPrintTurnResponse(supports_streaming: bool, emitted_text: bool) bool {
     return !supports_streaming or !emitted_text;
 }
 
-fn cliStreamSinkCallback(_: *anyopaque, event: streaming.Event) void {
+fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
     if (event.stage != .chunk or event.text.len == 0) return;
+    const stream_ctx: *CliStreamCtx = @ptrCast(@alignCast(ctx_ptr));
+    stream_ctx.emitted_text = true;
+
+    // In tests, stdout is used by Zig's test runner protocol (`--listen`).
+    if (builtin.is_test) return;
+
     var buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&buf);
     const wr = &bw.interface;
@@ -67,12 +75,14 @@ fn cliStreamSinkCallback(_: *anyopaque, event: streaming.Event) void {
     wr.flush() catch {};
 }
 
+fn makeCliStreamSink(raw_sink: streaming.Sink, filter: *streaming.TagFilter) streaming.Sink {
+    filter.* = streaming.TagFilter.init(raw_sink);
+    return filter.sink();
+}
+
 /// Streaming callback that forwards provider chunks into unified stream sink events.
 fn cliStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
     const stream_ctx: *CliStreamCtx = @ptrCast(@alignCast(ctx_ptr));
-    if (!chunk.is_final and chunk.delta.len > 0) {
-        stream_ctx.emitted_text = true;
-    }
     streaming.forwardProviderChunk(stream_ctx.sink, chunk);
 }
 
@@ -240,6 +250,7 @@ fn resolveProfileProvider(
         cfg.getProviderApiMode(profile.provider),
         cfg.getProviderMaxStreamingPromptBytes(profile.provider),
         cfg.getProviderChatTemplateEnableThinkingParam(profile.provider),
+        cfg.getProviderExtraBodyParams(profile.provider),
     );
     return .{
         .provider = holder.provider(),
@@ -486,13 +497,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         defer agent.deinit();
 
         // Enable streaming if provider supports it
-        var stream_sink_ctx: u8 = 0;
         var stream_ctx = CliStreamCtx{
-            .sink = .{
-                .callback = cliStreamSinkCallback,
-                .ctx = @ptrCast(&stream_sink_ctx),
-            },
+            .sink = undefined,
         };
+        const raw_stream_sink = streaming.Sink{
+            .callback = cliStreamSinkCallback,
+            .ctx = @ptrCast(&stream_ctx),
+        };
+        stream_ctx.sink = makeCliStreamSink(raw_stream_sink, &stream_ctx.filter);
         if (supports_streaming) {
             agent.stream_callback = cliStreamCallback;
             agent.stream_ctx = @ptrCast(&stream_ctx);
@@ -594,13 +606,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer agent.deinit();
 
     // Enable streaming if provider supports it
-    var stream_sink_ctx: u8 = 0;
     var stream_ctx = CliStreamCtx{
-        .sink = .{
-            .callback = cliStreamSinkCallback,
-            .ctx = @ptrCast(&stream_sink_ctx),
-        },
+        .sink = undefined,
     };
+    const raw_stream_sink = streaming.Sink{
+        .callback = cliStreamSinkCallback,
+        .ctx = @ptrCast(&stream_ctx),
+    };
+    stream_ctx.sink = makeCliStreamSink(raw_stream_sink, &stream_ctx.filter);
     if (supports_streaming) {
         agent.stream_callback = cliStreamCallback;
         agent.stream_ctx = @ptrCast(&stream_ctx);
@@ -815,19 +828,70 @@ test "buildCliDebouncedInput preserves queued bypass command" {
 }
 
 test "cliStreamCallback text delta chunk" {
-    var sink_ctx: u8 = 0;
     var ctx = CliStreamCtx{
-        .sink = .{
-            .callback = noopSinkEvent,
-            .ctx = @ptrCast(&sink_ctx),
-        },
+        .sink = undefined,
     };
+    const raw_sink = streaming.Sink{
+        .callback = cliStreamSinkCallback,
+        .ctx = @ptrCast(&ctx),
+    };
+    ctx.sink = makeCliStreamSink(raw_sink, &ctx.filter);
     const chunk = providers.StreamChunk.textDelta("hello");
     cliStreamCallback(@ptrCast(&ctx), chunk);
     try std.testing.expectEqualStrings("hello", chunk.delta);
     try std.testing.expect(!chunk.is_final);
     try std.testing.expectEqual(@as(u32, 2), chunk.token_count);
     try std.testing.expect(ctx.emitted_text);
+}
+
+test "makeCliStreamSink strips streamed tool_call markup" {
+    const Collector = struct {
+        buf: [128]u8 = undefined,
+        len: usize = 0,
+
+        fn callback(ctx_ptr: *anyopaque, event: streaming.Event) void {
+            if (event.stage != .chunk or event.text.len == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            @memcpy(self.buf[self.len..][0..event.text.len], event.text);
+            self.len += event.text.len;
+        }
+    };
+
+    var collector = Collector{};
+    var filter: streaming.TagFilter = undefined;
+    const raw_sink = streaming.Sink{
+        .callback = Collector.callback,
+        .ctx = @ptrCast(&collector),
+    };
+    const filtered_sink = makeCliStreamSink(raw_sink, &filter);
+
+    var ctx = CliStreamCtx{ .sink = filtered_sink };
+    cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.textDelta(
+        "Let me check the projects for you.<tool_call>{\"name\":\"mcp_vikunja_vikunja_list_projects\",\"arguments\":{}}</tool_call>",
+    ));
+    cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.finalChunk());
+
+    try std.testing.expectEqualStrings("Let me check the projects for you.", collector.buf[0..collector.len]);
+}
+
+test "cliStreamCallback keeps emitted_text false for filtered tool_call-only chunk" {
+    var ctx = CliStreamCtx{
+        .sink = undefined,
+    };
+    const raw_sink = streaming.Sink{
+        .callback = cliStreamSinkCallback,
+        .ctx = @ptrCast(&ctx),
+    };
+    ctx.sink = makeCliStreamSink(raw_sink, &ctx.filter);
+
+    // Regression: tool-only streamed control markup must not suppress the final fallback response.
+    cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.textDelta(
+        "<tool_call>{\"name\":\"mcp_vikunja_vikunja_list_projects\",\"arguments\":{}}</tool_call>",
+    ));
+    cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.finalChunk());
+
+    try std.testing.expect(!ctx.emitted_text);
+    try std.testing.expect(shouldPrintTurnResponse(true, ctx.emitted_text));
 }
 
 test "parseAgentArgs parses provider and model overrides" {

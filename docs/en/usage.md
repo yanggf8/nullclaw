@@ -177,6 +177,20 @@ If the plan is valid but fragile, tune reliability conservatively:
 
 If you have multiple keys for the same provider, add `reliability.api_keys` so NullClaw can rotate them.
 
+### 6) Local Ollama model says it has no access to `scheduler_tool`
+
+What this usually means:
+
+- The canonical NullClaw tool name is `schedule`.
+- Some local Ollama-served models emit `scheduler_tool` or `schedule_tool` instead.
+- Current NullClaw builds normalize those Ollama aliases back to `schedule` before dispatch.
+
+Checks:
+
+- Confirm you are running a build that includes the Ollama tool-alias normalization fix.
+- Re-run with `nullclaw agent --verbose` if you still see `Unknown tool` for a scheduler-related name.
+- If you are pinned to an older binary, upgrade before changing your scheduler config. The problem is usually tool-name drift, not a disabled scheduler.
+
 ## Post-Change Checklist
 
 After config edits:

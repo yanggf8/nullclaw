@@ -91,6 +91,7 @@ The example below is enough to run local CLI mode (replace API key):
 - Controls runtime diagnostics and observability output.
 - For OpenTelemetry, use the nested `diagnostics.otel` object.
 - OTEL spans are flushed at natural runtime boundaries such as turn completion and agent shutdown, with batch flushing still used as a fallback for longer-running flows.
+- OTEL endpoints should use HTTPS. Plain HTTP is appropriate only for localhost/private collectors.
 
 Example:
 
@@ -103,7 +104,7 @@ Example:
     "log_message_payloads": true,
     "log_llm_io": true,
     "otel": {
-      "endpoint": "http://otel:4318",
+      "endpoint": "https://otel:4318",
       "service_name": "nullclaw",
       "headers": {
         "Authorization": "Bearer example-token"
@@ -572,6 +573,7 @@ Minimal end-to-end example:
         "main": {
           "bot_token": "123456:ABCDEF",
           "allow_from": ["YOUR_TELEGRAM_USER_ID"],
+          "draft_previews": false,
           "binding_commands_enabled": true,
           "topic_commands_enabled": true,
           "topic_map_command_enabled": true,
@@ -599,6 +601,12 @@ Operator flow:
 - `nullclaw` writes a new exact `bindings[]` entry to `~/.nullclaw/config.json` for that topic and Telegram account.
 - The next message in that topic uses the new routed agent profile.
 - `nullclaw` must have write access to `~/.nullclaw/config.json` for `/bind` to persist changes.
+
+About `draft_previews`:
+
+- `draft_previews=false` is the default and recommended setting.
+- When disabled, Telegram still shows activity/typing while the reply is being generated, but it does not use ephemeral `sendMessageDraft` previews.
+- Set `draft_previews=true` only if you explicitly want live partial previews and accept that Telegram may hide and replace those drafts before the final message lands.
 
 About `account_id`:
 

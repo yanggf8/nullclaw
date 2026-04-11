@@ -86,6 +86,10 @@ pub const ProviderEntry = struct {
     /// When set, 0 forces the non-streaming path for every request and any
     /// positive value applies that byte threshold. Example: 524288 for 512 KiB.
     max_streaming_prompt_bytes: ?usize = null,
+    /// Optional compact JSON string of additional key-value pairs to merge into
+    /// request bodies for OpenAI-compatible providers. The encoded value must
+    /// be a JSON object.
+    extra_body_params: ?[]const u8 = null,
 };
 
 // ── Audio media config (tools.media.audio) ─────────────────────
@@ -134,6 +138,21 @@ pub const DiagnosticsConfig = struct {
     token_usage_ledger_max_bytes: u64 = 0,
     /// Maximum number of JSONL rows before reset. 0 disables row-limit reset.
     token_usage_ledger_max_lines: u64 = 0,
+
+    /// OTLP endpoint must be an absolute HTTPS URL, or a local/private HTTP URL
+    /// when exporting to a collector on the same machine or private network.
+    pub fn isValidOtelEndpoint(raw: []const u8) bool {
+        var trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') {
+            trimmed = trimmed[0 .. trimmed.len - 1];
+        }
+        if (trimmed.len == 0) return false;
+        if (!McpServerConfig.isValidHttpUrl(trimmed)) return false;
+
+        const uri = std.Uri.parse(trimmed) catch return false;
+        if (uri.query != null or uri.fragment != null) return false;
+        return true;
+    }
 };
 
 pub const AutonomyConfig = struct {
@@ -397,8 +416,12 @@ pub const TelegramConfig = struct {
     interactive: TelegramInteractiveConfig = .{},
     /// When true, only respond to messages that @mention the bot (in groups).
     require_mention: bool = false,
-    /// Stream partial responses to users via sendMessageDraft before the final message.
+    /// Enable streaming response generation for Telegram. When combined with
+    /// `draft_previews=true`, partial responses are shown via sendMessageDraft.
     streaming: bool = true,
+    /// Show ephemeral sendMessageDraft previews while the reply is still being generated.
+    /// Disabled by default because Telegram drafts can disappear and reappear in a confusing way.
+    draft_previews: bool = false,
     /// Show task lifecycle on the triggering user message via Telegram reactions.
     status_reactions: bool = false,
     /// Per-state reaction emoji overrides. Empty string clears the reaction for that state.
@@ -1760,6 +1783,7 @@ test "WebConfig defaults" {
 test "security defaults stay least-privilege" {
     const diagnostics = DiagnosticsConfig{};
     try std.testing.expect(diagnostics.api_error_max_chars == null);
+    try std.testing.expect(diagnostics.otel_endpoint == null);
 
     const autonomy = AutonomyConfig{};
     try std.testing.expectEqual(AutonomyLevel.supervised, autonomy.level);
@@ -1803,6 +1827,22 @@ test "McpServerConfig http url validation" {
     try std.testing.expect(McpServerConfig.isValidHttpUrl("http://100.127.255.254:6000/mcp"));
     try std.testing.expect(!McpServerConfig.isValidHttpUrl("http://100.128.0.1:8080/rpc"));
     try std.testing.expect(!McpServerConfig.isValidHttpUrl("http://100.63.0.1:8080/rpc"));
+}
+
+test "DiagnosticsConfig otel endpoint validation" {
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com/collector"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com/"));
+
+    // Regression: OTEL exporters must not allow remote plaintext collectors.
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://localhost:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://127.0.0.1:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://10.0.0.5:4318"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("http://otel.example.com:4318"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com?x=1"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com#frag"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("ftp://otel.example.com"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("https://"));
 }
 
 test "McpServerConfig timeout defaults" {

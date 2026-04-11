@@ -31,6 +31,34 @@ pub fn pathFromConfigDir(
     return std.fs.path.join(allocator, &.{ config_dir, leaf_name });
 }
 
+pub fn defaultWorkspaceDirFromInputs(
+    allocator: std.mem.Allocator,
+    nullclaw_workspace: ?[]const u8,
+    config_dir: []const u8,
+) ![]u8 {
+    if (nullclaw_workspace) |workspace_dir| return allocator.dupe(u8, workspace_dir);
+    return pathFromConfigDir(allocator, config_dir, "workspace");
+}
+
+pub fn defaultWorkspaceDirFromConfigDir(
+    allocator: std.mem.Allocator,
+    config_dir: []const u8,
+) ![]u8 {
+    return defaultWorkspaceDirFromInputs(allocator, null, config_dir);
+}
+
+pub fn defaultWorkspaceDir(allocator: std.mem.Allocator) ![]u8 {
+    const nullclaw_workspace = std.process.getEnvVarOwned(allocator, "NULLCLAW_WORKSPACE") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    if (nullclaw_workspace) |workspace_dir| return workspace_dir;
+
+    const config_dir = try defaultConfigDir(allocator);
+    defer allocator.free(config_dir);
+    return defaultWorkspaceDirFromConfigDir(allocator, config_dir);
+}
+
 test "defaultConfigDirFromInputs prefers NULLCLAW_HOME override" {
     const config_dir = try defaultConfigDirFromInputs(std.testing.allocator, "/tmp/nullclaw-home", "/home/ignored");
     defer std.testing.allocator.free(config_dir);
@@ -60,4 +88,21 @@ test "pathFromConfigDir appends a leaf name" {
     defer std.testing.allocator.free(expected);
 
     try std.testing.expectEqualStrings(expected, path);
+}
+
+test "defaultWorkspaceDirFromInputs prefers NULLCLAW_WORKSPACE override" {
+    const workspace_dir = try defaultWorkspaceDirFromInputs(std.testing.allocator, "/tmp/custom-workspace", "/tmp/nullclaw-home");
+    defer std.testing.allocator.free(workspace_dir);
+
+    try std.testing.expectEqualStrings("/tmp/custom-workspace", workspace_dir);
+}
+
+test "defaultWorkspaceDirFromConfigDir appends workspace" {
+    const workspace_dir = try defaultWorkspaceDirFromConfigDir(std.testing.allocator, "/tmp/nullclaw-home");
+    defer std.testing.allocator.free(workspace_dir);
+
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ "/tmp/nullclaw-home", "workspace" });
+    defer std.testing.allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, workspace_dir);
 }

@@ -82,6 +82,12 @@ Defined in `src/root.zig`. Phases mirror deployment dependencies:
 - `src/agent/` - Agent loop internals: `dispatcher.zig` (tool call parsing), `compaction.zig` (history trimming), `prompt.zig` (system prompt builder), `memory_loader.zig` (context injection), `commands.zig` (agent-mode commands). Config defaults are `max_tool_iterations = 1000` and `max_history_messages = 100` (see `src/config_types.zig`).
 - `src/cron/` - DB-backed cron subsystem: `types.zig` (shared types: `CronJobSpec`, `DequeueResult`, `SessionTarget`), `db.zig` (SQLite vtable implementation), `root.zig` (CronBackend vtable interface), `factory.zig` (backend selection). The legacy in-memory `CronScheduler` lives in `src/cron.zig` (top-level, ~4500 lines). New work should target the DB backend in `src/cron/`.
 
+### Provider Boundary Notes
+
+- Keep canonical tool names in the runtime and prompt layer. Provider-specific quirks should be normalized at the provider boundary when possible.
+- `src/providers/ollama.zig` already normalizes common local-model tool-name drift such as `tool.shell` -> `shell`, `tools.file_read` -> `file_read`, and `scheduler_tool` / `schedule_tool` -> `schedule`.
+- If a local model invents another wrapper-style tool name, prefer extending the Ollama normalization helper and adding a regression test instead of teaching alternate names to the tool registry or prompt text.
+
 ### Dependency Direction
 
 Concrete implementations depend inward on vtable interfaces, config, and util. Never import across subsystems (e.g., provider code must not import channel internals).
