@@ -3971,7 +3971,8 @@ pub fn cliJobStatus(allocator: std.mem.Allocator, json_out: bool) !void {
         ensureCronTable(db) catch break :db_blk;
 
         const sql =
-            "SELECT id, expression, command, job_type, last_run_secs, last_status, paused " ++
+            "SELECT id, expression, command, job_type, last_run_secs, last_status, paused, " ++
+            "verification_mode, repair_policy " ++
             "FROM cron_jobs ORDER BY COALESCE(last_run_secs, 0) DESC";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) break :db_blk;
@@ -4018,6 +4019,16 @@ pub fn cliJobStatus(allocator: std.mem.Allocator, json_out: bool) !void {
                 }
                 try buf.appendSlice(allocator, ",\"paused\":");
                 try buf.appendSlice(allocator, if (c.sqlite3_column_int(stmt, 6) != 0) "true" else "false");
+                // verification_mode (col 7) — TEXT NOT NULL DEFAULT 'none'
+                try buf.appendSlice(allocator, ",\"verification_mode\":");
+                const vm_ptr = c.sqlite3_column_text(stmt, 7);
+                const vm_len: usize = if (vm_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 7)) else 0;
+                try appendJsonStr(&buf, allocator, if (vm_ptr != null) vm_ptr[0..vm_len] else "none");
+                // repair_policy (col 8) — TEXT NOT NULL DEFAULT 'none'
+                try buf.appendSlice(allocator, ",\"repair_policy\":");
+                const rp_ptr = c.sqlite3_column_text(stmt, 8);
+                const rp_len: usize = if (rp_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 8)) else 0;
+                try appendJsonStr(&buf, allocator, if (rp_ptr != null) rp_ptr[0..rp_len] else "none");
                 try buf.append(allocator, '}');
             }
             try buf.append(allocator, ']');
@@ -4039,12 +4050,28 @@ pub fn cliJobStatus(allocator: std.mem.Allocator, json_out: bool) !void {
             const ls_str: []const u8 = if (ls_ptr != null and ls_len > 0) ls_ptr[0..ls_len] else "never";
             const lrs: ?i64 = if (c.sqlite3_column_type(stmt, 4) != c.SQLITE_NULL) c.sqlite3_column_int64(stmt, 4) else null;
             const paused = c.sqlite3_column_int(stmt, 6) != 0;
+            // Observability columns (col 7, 8) — only show when not both 'none'.
+            const vm_ptr_h = c.sqlite3_column_text(stmt, 7);
+            const vm_len_h: usize = if (vm_ptr_h != null) @intCast(c.sqlite3_column_bytes(stmt, 7)) else 0;
+            const vm_str: []const u8 = if (vm_ptr_h != null) vm_ptr_h[0..vm_len_h] else "none";
+            const rp_ptr_h = c.sqlite3_column_text(stmt, 8);
+            const rp_len_h: usize = if (rp_ptr_h != null) @intCast(c.sqlite3_column_bytes(stmt, 8)) else 0;
+            const rp_str: []const u8 = if (rp_ptr_h != null) rp_ptr_h[0..rp_len_h] else "none";
+            const has_obs = !std.mem.eql(u8, vm_str, "none") or !std.mem.eql(u8, rp_str, "none");
             if (lrs) |ts| {
                 var ts_buf: [64]u8 = undefined;
                 const ts_str = formatUnixTimestamp(ts, &ts_buf);
-                log.info("  {s}  status={s}  last_run={d} ({s}){s}", .{ id_str, ls_str, ts, ts_str, if (paused) " [paused]" else "" });
+                if (has_obs) {
+                    log.info("  {s}  status={s}  last_run={d} ({s})  verify={s} repair={s}{s}", .{ id_str, ls_str, ts, ts_str, vm_str, rp_str, if (paused) " [paused]" else "" });
+                } else {
+                    log.info("  {s}  status={s}  last_run={d} ({s}){s}", .{ id_str, ls_str, ts, ts_str, if (paused) " [paused]" else "" });
+                }
             } else {
-                log.info("  {s}  status=never{s}", .{ id_str, if (paused) " [paused]" else "" });
+                if (has_obs) {
+                    log.info("  {s}  status=never  verify={s} repair={s}{s}", .{ id_str, vm_str, rp_str, if (paused) " [paused]" else "" });
+                } else {
+                    log.info("  {s}  status=never{s}", .{ id_str, if (paused) " [paused]" else "" });
+                }
             }
         }
         if (count == 0) log.info("  No jobs found.", .{});
@@ -4063,7 +4090,14 @@ pub fn cliJobStatus(allocator: std.mem.Allocator, json_out: bool) !void {
     log.info("Last known execution status per job:", .{});
     for (jobs) |job| {
         const ls = job.last_status orelse "never";
-        log.info("  {s}  status={s}", .{ job.id, ls });
+        const vm_s = job.verification_mode.asStr();
+        const rp_s = job.repair_policy.asStr();
+        const has_obs_fb = !std.mem.eql(u8, vm_s, "none") or !std.mem.eql(u8, rp_s, "none");
+        if (has_obs_fb) {
+            log.info("  {s}  status={s}  verify={s} repair={s}", .{ job.id, ls, vm_s, rp_s });
+        } else {
+            log.info("  {s}  status={s}", .{ job.id, ls });
+        }
     }
 }
 
@@ -4968,6 +5002,7 @@ pub fn cliListDegradedRuns(
 
     // Human-readable output.
     var count: usize = 0;
+    var has_any_trace = false;
     while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
         count += 1;
         if (count == 1) log.info("Failed/degraded runs (last {d}h):", .{hours});
@@ -5007,6 +5042,7 @@ pub fn cliListDegradedRuns(
         var tr_buf: [64]u8 = undefined;
         const tr_col: []const u8 = blk: {
             if (c.sqlite3_column_type(stmt, 6) == c.SQLITE_NULL) break :blk "—";
+            has_any_trace = true;
             const p = c.sqlite3_column_text(stmt, 6);
             const l: usize = @intCast(c.sqlite3_column_bytes(stmt, 6));
             const src = p[0..l];
@@ -5037,7 +5073,9 @@ pub fn cliListDegradedRuns(
         });
     }
     if (count == 0) {
-        log.info("No failed or degraded runs in the last {d}h.", .{hours});
+        log.info("No failed or degraded runs in the last {d}h. (none)", .{hours});
+    } else if (has_any_trace) {
+        log.info("Investigate a specific run: nullclaw cron run-by-trace <trace_id>", .{});
     }
 }
 
@@ -6019,12 +6057,14 @@ pub fn dbListJobsJson(db: *c.sqlite3, buf: *std.ArrayListUnmanaged(u8), allocato
     // 20  delivery_best_effort
     // 21  skill_name
     // 22  skill_args
+    // 23  verification_mode
+    // 24  repair_policy
     const sql =
         "SELECT id, expression, command, next_run_secs, last_run_secs, last_status, " ++
         "last_output, paused, one_shot, job_type, enabled, delete_after_run, " ++
         "prompt, model, delivery_mode, delivery_channel, delivery_account_id, " ++
         "delivery_to, created_at_s, timeout_secs, delivery_best_effort, " ++
-        "skill_name, skill_args " ++
+        "skill_name, skill_args, verification_mode, repair_policy " ++
         "FROM cron_jobs ORDER BY rowid ASC LIMIT ?1";
 
     var stmt: ?*c.sqlite3_stmt = null;
@@ -6209,6 +6249,18 @@ pub fn dbListJobsJson(db: *c.sqlite3, buf: *std.ArrayListUnmanaged(u8), allocato
             const sa_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 22));
             try appendJsonStr(buf, allocator, sa_ptr[0..sa_len]);
         }
+
+        // verification_mode (col 23) — TEXT NOT NULL DEFAULT 'none'
+        try buf.appendSlice(allocator, ",\"verification_mode\":");
+        const vm_ptr = c.sqlite3_column_text(stmt, 23);
+        const vm_len: usize = if (vm_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 23)) else 0;
+        try appendJsonStr(buf, allocator, if (vm_ptr != null) vm_ptr[0..vm_len] else "none");
+
+        // repair_policy (col 24) — TEXT NOT NULL DEFAULT 'none'
+        try buf.appendSlice(allocator, ",\"repair_policy\":");
+        const rp_ptr = c.sqlite3_column_text(stmt, 24);
+        const rp_len: usize = if (rp_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 24)) else 0;
+        try appendJsonStr(buf, allocator, if (rp_ptr != null) rp_ptr[0..rp_len] else "none");
 
         try buf.append(allocator, '}');
     }
@@ -8627,4 +8679,54 @@ test "cronJsonPath appends cron.json to resolved config dir" {
 
 test "resolveConfigDir reports missing home when no config directory inputs exist" {
     try std.testing.expectError(error.HomeDirNotFound, config_paths.defaultConfigDirFromInputs(std.testing.allocator, null, null));
+}
+
+test "dbCompleteJob shell run with status=error writes verified=0 and is matched by degraded filter" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const sched = &iso.scheduler;
+
+    const j = try sched.addJob("* * * * *", "echo fail-test");
+    const jid = try std.testing.allocator.dupe(u8, j.id);
+    defer std.testing.allocator.free(jid);
+    if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
+    try dbUpsertAndVerify(sched, sched.getJob(jid).?);
+
+    const now = std.time.timestamp();
+    _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
+
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer _ = c.sqlite3_close(db);
+    try ensureCronTable(db);
+
+    const dequeued = (try dbDequeueNextJob(db, std.testing.allocator)).?;
+    defer std.testing.allocator.free(dequeued.job_id);
+
+    // Shell completion: run_result=null, status="error" — simulates a non-zero exit.
+    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "error", null, false, null, null);
+
+    // Verify: the run row has verified=0 (because run_result was null) and status='error'.
+    var stmt: ?*c.sqlite3_stmt = null;
+    const check_sql = "SELECT verified, status FROM cron_runs WHERE job_id=?1";
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db, check_sql, -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, dequeued.job_id.ptr, @intCast(dequeued.job_id.len), SQLITE_STATIC);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    // verified must be 0 (shell path hardcodes this).
+    try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 0));
+    // status must be "error".
+    const st_ptr = c.sqlite3_column_text(stmt, 1);
+    const st_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+    try std.testing.expectEqualStrings("error", st_ptr[0..st_len]);
+
+    // The degraded filter (verified >= 2 OR status = 'error') must match this row.
+    var deg_stmt: ?*c.sqlite3_stmt = null;
+    const deg_sql = "SELECT COUNT(*) FROM cron_runs WHERE job_id=?1 AND (verified >= 2 OR status = 'error')";
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db, deg_sql, -1, &deg_stmt, null));
+    defer _ = c.sqlite3_finalize(deg_stmt);
+    _ = c.sqlite3_bind_text(deg_stmt, 1, dequeued.job_id.ptr, @intCast(dequeued.job_id.len), SQLITE_STATIC);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(deg_stmt));
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(deg_stmt, 0));
 }
