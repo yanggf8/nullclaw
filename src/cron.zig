@@ -2283,6 +2283,10 @@ pub fn ensureCronRunsTable(db: *c.sqlite3) !void {
     _ = c.sqlite3_exec(db, "ALTER TABLE cron_runs ADD COLUMN repair_action TEXT", null, null, null);
     _ = c.sqlite3_exec(db, "ALTER TABLE cron_runs ADD COLUMN verified INTEGER NOT NULL DEFAULT 0", null, null, null);
     _ = c.sqlite3_exec(db, "ALTER TABLE cron_runs ADD COLUMN trace_id TEXT", null, null, null);
+    // Migration: distinguish runs spawned by the scheduler (manual=0, default)
+    // from runs invoked manually via `nullclaw cron run`. Aggregate queries that
+    // want "scheduled only" should add WHERE manual=0.
+    _ = c.sqlite3_exec(db, "ALTER TABLE cron_runs ADD COLUMN manual INTEGER NOT NULL DEFAULT 0", null, null, null);
 }
 
 /// Ensure the cron_run_queue table exists in the given DB.
@@ -3152,7 +3156,10 @@ pub fn loadJobs(scheduler: *CronScheduler) !void {
             log.info("loaded {d} cron job(s) from DB", .{scheduler.jobs.items.len});
             return;
         } else |err| {
-            log.err("cron DB load failed ({s}); DB may be corrupt. Falling back to cron.json. Run: sqlite3 ~/.nullclaw/cron.db '.tables' to diagnose.", .{@errorName(err)});
+            if (@import("builtin").is_test)
+                log.info("cron DB load skipped in test: {s}", .{@errorName(err)})
+            else
+                log.err("cron DB load failed ({s}); DB may be corrupt. Falling back to cron.json. Run: sqlite3 ~/.nullclaw/cron.db '.tables' to diagnose.", .{@errorName(err)});
         }
     }
     log.info("loading cron jobs from cron.json...", .{});
@@ -4564,8 +4571,90 @@ fn resolveRunnableCwd(cwd_opt: ?[]const u8) ?[]const u8 {
     return cwd;
 }
 
-pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
-    // DB-direct execution — no gateway dependency.
+/// Validate a job_id against the allowed character set.
+/// Permits `[a-zA-Z0-9._-]` of length 1..128. Used by `cron show` and `cron run`
+/// to refuse path-injection-shaped inputs before touching the DB.
+pub fn isValidJobId(id: []const u8) bool {
+    if (id.len == 0 or id.len > 128) return false;
+    for (id) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or
+            (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or
+            ch == '.' or ch == '_' or ch == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// Exit codes for `nullclaw cron run`. Documented in the plan and the CLI usage.
+pub const CronRunExit = struct {
+    pub const ok: u8 = 0;
+    pub const internal_error: u8 = 1;
+    pub const not_found: u8 = 2;
+    pub const verification_failed: u8 = 3;
+    pub const already_running: u8 = 4;
+    pub const invalid_id: u8 = 5;
+};
+
+/// Pretty-print a CronJobSpec for `cron run --dry-run`.
+fn dryRunPrint(spec: CronJobSpec) void {
+    const stdout = std.fs.File.stdout();
+    var buf: [4096]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+    w.print("[dry-run] job '{s}'\n", .{spec.id}) catch {};
+    w.print("  type:        {s}\n", .{@tagName(spec.job_type)}) catch {};
+    if (spec.skill_name) |sn| {
+        w.print("  skill:       {s}\n", .{sn}) catch {};
+        if (spec.skill_args) |sa| w.print("  skill_args:  {s}\n", .{sa}) catch {};
+    } else {
+        if (spec.command.len > 0) w.print("  command:     {s}\n", .{spec.command}) catch {};
+        if (spec.prompt) |p| w.print("  prompt:      {s}\n", .{p}) catch {};
+        if (spec.model) |m| w.print("  model:       {s}\n", .{m}) catch {};
+    }
+    w.print("  verification: {s}\n", .{@tagName(spec.verification_mode)}) catch {};
+    w.print("  repair:       {s}\n", .{@tagName(spec.repair_policy)}) catch {};
+    if (spec.timeout_secs) |t| w.print("  timeout:      {d}s\n", .{t}) catch {};
+    w.print("  delivery:     mode={s}", .{@tagName(spec.delivery.mode)}) catch {};
+    if (spec.delivery.channel) |ch| w.print(" channel={s}", .{ch}) catch {};
+    if (spec.delivery.account_id) |a| w.print(" account={s}", .{a}) catch {};
+    if (spec.delivery.to) |to| w.print(" to={s}", .{to}) catch {};
+    w.print("\n", .{}) catch {};
+    w.print("[dry-run] no execution performed.\n", .{}) catch {};
+    stdout.writeAll(fbs.getWritten()) catch {};
+}
+
+/// Refuse to run if any queue row is currently pending/in-progress for this job.
+fn jobHasInflightQueue(db: *c.sqlite3, job_id: []const u8) !bool {
+    const sql =
+        "SELECT id, status, started_at FROM cron_run_queue " ++
+        "WHERE job_id=?1 AND status IN ('pending','in_progress') LIMIT 1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+/// Insert a manual run queue row, immediately marked in_progress so the
+/// scheduler worker won't dequeue it. Returns the new row's id.
+fn insertManualQueueRow(db: *c.sqlite3, job_id: []const u8, now: i64) !i64 {
+    const sql =
+        "INSERT INTO cron_run_queue (job_id, enqueued_at, status, started_at) " ++
+        "VALUES (?1, ?2, 'in_progress', ?2)";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_int64(stmt, 2, now);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.InsertFailed;
+    return c.sqlite3_last_insert_rowid(db);
+}
+
+/// Legacy fallback for builds compiled with `-Denable-sqlite=false` (no DB).
+/// Reads jobs via `loadJobs` (cron.json path) and executes them without the
+/// new verify/repair / manual-run tracking — those features require the DB.
+fn cliRunJobLegacy(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !void {
     var cfg_opt: ?Config = Config.load(allocator) catch null;
     defer if (cfg_opt) |*cfg| cfg.deinit();
 
@@ -4577,96 +4666,391 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
     }
     try loadJobs(&scheduler);
     const run_cwd = resolveRunnableCwd(scheduler.shell_cwd);
-    if (scheduler.shell_cwd != null and run_cwd == null) {
-        log.warn("Cron shell cwd is unavailable; falling back to process cwd for manual run.", .{});
+
+    const job = scheduler.getMutableJob(id) orelse {
+        log.warn("Cron job '{s}' not found", .{id});
+        std.process.exit(CronRunExit.not_found);
+    };
+
+    if (dry_run) {
+        log.info("[dry-run] job '{s}' type={s} command={s}", .{ id, @tagName(job.job_type), job.command });
+        return;
     }
 
-    if (scheduler.getMutableJob(id)) |job| {
-        log.info("Running job '{s}': {s}", .{ id, job.command });
-        const run_at = std.time.timestamp();
-        switch (job.job_type) {
-            .shell => {
-                const resolved_cli_cmd = resolveSkillCommand(allocator, job.command) catch null;
-                defer if (resolved_cli_cmd) |rc| allocator.free(rc);
-                const effective_cli_cmd = resolved_cli_cmd orelse job.command;
-                const result = std.process.Child.run(.{
-                    .allocator = allocator,
-                    .argv = &.{ platform.getShell(), platform.getShellFlag(), effective_cli_cmd },
-                    .cwd = run_cwd,
-                }) catch |err| {
-                    job.last_run_secs = run_at;
-                    job.last_status = "error";
-                    dbUpsertAndVerify(&scheduler, job) catch {};
-                    log.err("Job '{s}' failed: {s}", .{ id, @errorName(err) });
-                    return;
-                };
-                defer allocator.free(result.stdout);
-                defer allocator.free(result.stderr);
-                if (result.stdout.len > 0) log.info("{s}", .{result.stdout});
-                const exit_code: u8 = switch (result.term) {
-                    .Exited => |code| code,
-                    else => 1,
-                };
+    log.info("Running job '{s}': {s}", .{ id, job.command });
+    const run_at = std.time.timestamp();
+    switch (job.job_type) {
+        .shell => {
+            const resolved_cli_cmd = resolveSkillCommand(allocator, job.command) catch null;
+            defer if (resolved_cli_cmd) |rc| allocator.free(rc);
+            const effective_cli_cmd = resolved_cli_cmd orelse job.command;
+            const result = std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{ platform.getShell(), platform.getShellFlag(), effective_cli_cmd },
+                .cwd = run_cwd,
+            }) catch |err| {
                 job.last_run_secs = run_at;
-                job.last_status = if (exit_code == 0) "ok" else "error";
-                try dbUpsertAndVerify(&scheduler, job);
-                log.info("Job '{s}' completed (exit {d}).", .{ id, exit_code });
-            },
-            .agent => {
-                const raw_prompt = job.prompt orelse job.command;
-                const resolved_prompt = resolveSkillPrompt(allocator, raw_prompt) catch null;
-                defer if (resolved_prompt) |rp| allocator.free(rp);
-                const prompt = resolved_prompt orelse raw_prompt;
-                const effective_timeout: u64 = if (job.timeout_secs) |t| t else scheduler.agent_timeout_secs;
-                const result = runAgentJob(allocator, run_cwd, prompt, job.model, effective_timeout) catch |err| {
-                    job.last_run_secs = run_at;
-                    job.last_status = "error";
-                    dbUpsertAndVerify(&scheduler, job) catch {};
-                    log.err("Agent job '{s}' failed: {s}", .{ id, @errorName(err) });
-                    return;
-                };
-                defer allocator.free(result.output);
-                if (result.output.len > 0) log.info("{s}", .{result.output});
-                job.last_run_secs = run_at;
-                job.last_status = if (result.success) "ok" else "error";
-                try dbUpsertAndVerify(&scheduler, job);
-                log.info("Agent job '{s}' completed ({s}).", .{ id, if (result.success) "ok" else "error" });
-            },
-            .skill => {
-                const skill_cmd = resolveSkillExec(allocator, job.skill_name, job.skill_args) catch |err| {
-                    job.last_run_secs = run_at;
-                    job.last_status = "error";
-                    dbUpsertAndVerify(&scheduler, job) catch {};
-                    log.err("Skill resolution for job '{s}' failed: {s}", .{ id, @errorName(err) });
-                    return;
-                };
-                defer allocator.free(skill_cmd);
-                const result = std.process.Child.run(.{
-                    .allocator = allocator,
-                    .argv = &.{ platform.getShell(), platform.getShellFlag(), skill_cmd },
-                    .cwd = run_cwd,
-                }) catch |err| {
-                    job.last_run_secs = run_at;
-                    job.last_status = "error";
-                    dbUpsertAndVerify(&scheduler, job) catch {};
-                    log.err("Skill job '{s}' failed: {s}", .{ id, @errorName(err) });
-                    return;
-                };
-                defer allocator.free(result.stdout);
-                defer allocator.free(result.stderr);
-                if (result.stdout.len > 0) log.info("{s}", .{result.stdout});
-                const exit_code: u8 = switch (result.term) {
-                    .Exited => |code| code,
-                    else => 1,
-                };
-                job.last_run_secs = run_at;
-                job.last_status = if (exit_code == 0) "ok" else "error";
-                try dbUpsertAndVerify(&scheduler, job);
-                log.info("Skill job '{s}' completed (exit {d}).", .{ id, exit_code });
-            },
+                job.last_status = "error";
+                log.err("Job '{s}' failed: {s}", .{ id, @errorName(err) });
+                std.process.exit(CronRunExit.internal_error);
+            };
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+            if (result.stdout.len > 0) log.info("{s}", .{result.stdout});
+            const exit_code: u8 = switch (result.term) {
+                .Exited => |code| code,
+                else => 1,
+            };
+            std.process.exit(exit_code);
+        },
+        .agent => {
+            const raw_prompt = job.prompt orelse job.command;
+            const resolved_prompt = resolveSkillPrompt(allocator, raw_prompt) catch null;
+            defer if (resolved_prompt) |rp| allocator.free(rp);
+            const prompt = resolved_prompt orelse raw_prompt;
+            const effective_timeout: u64 = if (job.timeout_secs) |t| t else scheduler.agent_timeout_secs;
+            const result = runAgentJob(allocator, run_cwd, prompt, job.model, effective_timeout) catch |err| {
+                log.err("Agent job '{s}' failed: {s}", .{ id, @errorName(err) });
+                std.process.exit(CronRunExit.internal_error);
+            };
+            defer allocator.free(result.output);
+            if (result.output.len > 0) log.info("{s}", .{result.output});
+            std.process.exit(if (result.success) CronRunExit.ok else CronRunExit.internal_error);
+        },
+        .skill => {
+            const skill_cmd = resolveSkillExec(allocator, job.skill_name, job.skill_args) catch |err| {
+                log.err("Skill resolution for job '{s}' failed: {s}", .{ id, @errorName(err) });
+                std.process.exit(CronRunExit.internal_error);
+            };
+            defer allocator.free(skill_cmd);
+            const result = std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{ platform.getShell(), platform.getShellFlag(), skill_cmd },
+                .cwd = run_cwd,
+            }) catch |err| {
+                log.err("Skill job '{s}' failed: {s}", .{ id, @errorName(err) });
+                std.process.exit(CronRunExit.internal_error);
+            };
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+            if (result.stdout.len > 0) log.info("{s}", .{result.stdout});
+            const exit_code: u8 = switch (result.term) {
+                .Exited => |code| code,
+                else => 1,
+            };
+            std.process.exit(exit_code);
+        },
+    }
+}
+
+/// CLI: execute a persisted cron job exactly once, applying full verification
+/// and repair semantics. Records a `cron_runs` row with `manual=1`.
+///
+/// Exit codes: see `CronRunExit`.
+pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !void {
+    if (!isValidJobId(id)) {
+        const stderr = std.fs.File.stderr();
+        stderr.writeAll("error: invalid job_id (allowed: [a-zA-Z0-9._-], 1-128 chars)\n") catch {};
+        std.process.exit(CronRunExit.invalid_id);
+    }
+
+    // Builds with sqlite disabled still have the legacy in-memory / cron.json
+    // path. Fall through to the legacy runner in that case — it doesn't get the
+    // new verify/repair semantics, but it keeps `cron run` working on those builds.
+    if (!build_options.enable_sqlite) {
+        try cliRunJobLegacy(allocator, id, dry_run);
+        return;
+    }
+
+    const db_path_z = getCronDbPathZ(allocator) catch {
+        const stderr = std.fs.File.stderr();
+        stderr.writeAll("error: cron DB unavailable\n") catch {};
+        std.process.exit(CronRunExit.internal_error);
+    };
+    defer allocator.free(db_path_z);
+
+    const db = openCronDbAtPath(db_path_z) catch {
+        const stderr = std.fs.File.stderr();
+        stderr.writeAll("error: could not open cron DB\n") catch {};
+        std.process.exit(CronRunExit.internal_error);
+    };
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+    try ensureRunQueueTable(db);
+    try ensureCronRunsTable(db);
+
+    var spec_arena = std.heap.ArenaAllocator.init(allocator);
+    defer spec_arena.deinit();
+    const spec_alloc = spec_arena.allocator();
+
+    const spec = (dbLoadJobSpec(db, spec_alloc, id) catch {
+        const stderr = std.fs.File.stderr();
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "error: failed to load job '{s}'\n", .{id}) catch "error: failed to load job\n";
+        stderr.writeAll(msg) catch {};
+        std.process.exit(CronRunExit.internal_error);
+    }) orelse {
+        const stderr = std.fs.File.stderr();
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "error: job not found: '{s}'\n", .{id}) catch "error: job not found\n";
+        stderr.writeAll(msg) catch {};
+        std.process.exit(CronRunExit.not_found);
+    };
+
+    if (dry_run) {
+        dryRunPrint(spec);
+        return;
+    }
+
+    // Concurrency guard: refuse if a scheduler run is in flight for the same job.
+    if (jobHasInflightQueue(db, id) catch false) {
+        const stderr = std.fs.File.stderr();
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "error: job '{s}' already has a run in flight\n", .{id}) catch "error: job already running\n";
+        stderr.writeAll(msg) catch {};
+        std.process.exit(CronRunExit.already_running);
+    }
+
+    // Load workspace cwd from config (best-effort).
+    var cfg_opt: ?Config = Config.load(allocator) catch null;
+    defer if (cfg_opt) |*cfg| cfg.deinit();
+    const run_cwd: ?[]const u8 = blk: {
+        if (cfg_opt) |cfg| {
+            const resolved = resolveRunnableCwd(cfg.workspace_dir);
+            if (resolved == null) log.warn("Workspace cwd unavailable; using process cwd.", .{});
+            break :blk resolved;
         }
-    } else {
-        log.warn("Cron job '{s}' not found", .{id});
+        break :blk null;
+    };
+    const agent_timeout: u64 = if (cfg_opt) |cfg| cfg.scheduler.agent_timeout_secs else 600;
+
+    const start_ts = std.time.timestamp();
+    const queue_row_id = insertManualQueueRow(db, id, start_ts) catch {
+        const stderr = std.fs.File.stderr();
+        stderr.writeAll("error: could not insert manual queue row\n") catch {};
+        std.process.exit(CronRunExit.internal_error);
+    };
+
+    // Per-run trace ID: {job_id}:{queue_row_id}.
+    const run_trace_id = std.fmt.allocPrint(spec_alloc, "{s}:{d}", .{ spec.id, queue_row_id }) catch spec.id;
+
+    // Effective timeout for skills/shells: spec override, else 120s default.
+    const skill_timeout: u64 = if (spec.timeout_secs) |t| t else 120;
+
+    const stdout_h = std.fs.File.stdout();
+    const stderr_h = std.fs.File.stderr();
+    var msg_buf: [512]u8 = undefined;
+    {
+        const m = std.fmt.bufPrint(&msg_buf, "[manual run] job='{s}' trace={s}\n", .{ spec.id, run_trace_id }) catch "";
+        stdout_h.writeAll(m) catch {};
+    }
+
+    switch (spec.job_type) {
+        .skill => {
+            const raw_skill_cmd = resolveSkillExec(spec_alloc, spec.skill_name, spec.skill_args) catch |err| {
+                const m = std.fmt.bufPrint(&msg_buf, "error: skill resolution failed: {s}\n", .{@errorName(err)}) catch "error: skill resolution failed\n";
+                stderr_h.writeAll(m) catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, null, run_trace_id, true) catch {};
+                std.process.exit(CronRunExit.internal_error);
+            };
+            // Inject NULLCLAW_JOB_ID and NULLCLAW_SKILL_TIMEOUT so delivery.py can honor the budget.
+            const skill_cmd = std.fmt.allocPrint(
+                spec_alloc,
+                "NULLCLAW_JOB_ID={s} NULLCLAW_SKILL_TIMEOUT={d} {s}",
+                .{ run_trace_id, skill_timeout, raw_skill_cmd },
+            ) catch raw_skill_cmd;
+
+            var skill_child = std.process.Child.init(
+                &.{ platform.getShell(), platform.getShellFlag(), skill_cmd },
+                spec_alloc,
+            );
+            skill_child.stdin_behavior = .Ignore;
+            skill_child.stdout_behavior = .Pipe;
+            skill_child.stderr_behavior = .Pipe;
+            skill_child.cwd = run_cwd;
+            skill_child.spawn() catch |err| {
+                const m = std.fmt.bufPrint(&msg_buf, "error: skill spawn failed: {s}\n", .{@errorName(err)}) catch "error: skill spawn failed\n";
+                stderr_h.writeAll(m) catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, null, run_trace_id, true) catch {};
+                std.process.exit(CronRunExit.internal_error);
+            };
+
+            var skill_stdout: std.ArrayList(u8) = .empty;
+            defer skill_stdout.deinit(spec_alloc);
+            var skill_stderr: std.ArrayList(u8) = .empty;
+            defer skill_stderr.deinit(spec_alloc);
+            const skill_start_ns = std.time.nanoTimestamp();
+            const skill_timed_out = collectChildOutputWithTimeout(
+                &skill_child,
+                spec_alloc,
+                &skill_stdout,
+                &skill_stderr,
+                skill_timeout,
+                skill_start_ns,
+            ) catch false;
+            const skill_term = skill_child.wait() catch std.process.Child.Term{ .Exited = 1 };
+            const skill_exit: u8 = switch (skill_term) {
+                .Exited => |ec| ec,
+                else => 1,
+            };
+
+            var run_result = classifySkillRun(spec, skill_stdout.items, skill_exit, skill_timed_out, run_trace_id);
+            // Repair: retry_once
+            if (run_result.verified != 1 and spec.repair_policy == .retry_once) {
+                const saved_failure_class = run_result.failure_class;
+                stdout_h.writeAll("[manual run] retrying once...\n") catch {};
+                var retry_stdout: std.ArrayList(u8) = .empty;
+                defer retry_stdout.deinit(spec_alloc);
+                var retry_stderr: std.ArrayList(u8) = .empty;
+                defer retry_stderr.deinit(spec_alloc);
+                var retry_child = std.process.Child.init(
+                    &.{ platform.getShell(), platform.getShellFlag(), skill_cmd },
+                    spec_alloc,
+                );
+                retry_child.stdin_behavior = .Ignore;
+                retry_child.stdout_behavior = .Pipe;
+                retry_child.stderr_behavior = .Pipe;
+                retry_child.cwd = run_cwd;
+                if (retry_child.spawn()) |_| {
+                    const retry_start_ns = std.time.nanoTimestamp();
+                    const retry_timed_out = collectChildOutputWithTimeout(
+                        &retry_child,
+                        spec_alloc,
+                        &retry_stdout,
+                        &retry_stderr,
+                        skill_timeout,
+                        retry_start_ns,
+                    ) catch false;
+                    const retry_term = retry_child.wait() catch std.process.Child.Term{ .Exited = 1 };
+                    const retry_exit: u8 = switch (retry_term) {
+                        .Exited => |ec| ec,
+                        else => 1,
+                    };
+                    run_result = classifySkillRun(spec, retry_stdout.items, retry_exit, retry_timed_out, run_trace_id);
+                    run_result.repair_action = if (run_result.verified == 1) "retried_ok" else "retried_failed";
+                    if (run_result.failure_class == null) run_result.failure_class = saved_failure_class;
+                    if (retry_stdout.items.len > 0) {
+                        skill_stdout.clearAndFree(spec_alloc);
+                        skill_stdout.appendSlice(spec_alloc, retry_stdout.items) catch {};
+                    }
+                    if (retry_stderr.items.len > 0) {
+                        skill_stderr.clearAndFree(spec_alloc);
+                        skill_stderr.appendSlice(spec_alloc, retry_stderr.items) catch {};
+                    }
+                } else |err| {
+                    const m = std.fmt.bufPrint(&msg_buf, "error: retry spawn failed: {s}\n", .{@errorName(err)}) catch "error: retry spawn failed\n";
+                    stderr_h.writeAll(m) catch {};
+                }
+            }
+            if (spec.repair_policy == .alert_only and run_result.verified != 1)
+                run_result.repair_action = "alert_sent";
+
+            // Stream child output to operator stdout/stderr.
+            if (skill_stdout.items.len > 0) stdout_h.writeAll(skill_stdout.items) catch {};
+            if (skill_stderr.items.len > 0) stderr_h.writeAll(skill_stderr.items) catch {};
+            if (skill_stdout.items.len > 0 and skill_stdout.items[skill_stdout.items.len - 1] != '\n')
+                stdout_h.writeAll("\n") catch {};
+
+            const skill_ok = run_result.verified == 1;
+            const status_str: []const u8 = if (skill_ok) "ok" else "error";
+            const skill_output: ?[]const u8 = if (skill_stdout.items.len > 0)
+                skill_stdout.items
+            else if (skill_stderr.items.len > 0)
+                skill_stderr.items
+            else
+                null;
+            dbCompleteJob(
+                db,
+                spec.id,
+                queue_row_id,
+                std.time.timestamp(),
+                status_str,
+                skill_output,
+                false, // never delete on manual run
+                run_result,
+                run_trace_id,
+                true, // manual=1
+            ) catch {};
+
+            if (run_result.verified != 1) {
+                const fc = run_result.failure_class orelse "unknown";
+                const ra = run_result.repair_action orelse "none";
+                const m = std.fmt.bufPrint(
+                    &msg_buf,
+                    "[cron] manual skill '{s}' degraded: failure={s} repair={s} trace={s}\n",
+                    .{ spec.skill_name orelse "?", fc, ra, run_trace_id },
+                ) catch "[cron] manual skill degraded\n";
+                stderr_h.writeAll(m) catch {};
+            }
+
+            if (run_result.verified >= 2) std.process.exit(CronRunExit.verification_failed);
+            std.process.exit(skill_exit);
+        },
+        .shell => {
+            // Legacy `skill:<name>` prefix: resolve to the skill exec command before spawning,
+            // matching the scheduler worker's behavior.
+            const resolved_cmd = resolveSkillCommand(spec_alloc, spec.command) catch null;
+            const effective_cmd: []const u8 = resolved_cmd orelse spec.command;
+            const result = std.process.Child.run(.{
+                .allocator = spec_alloc,
+                .argv = &.{ platform.getShell(), platform.getShellFlag(), effective_cmd },
+                .cwd = run_cwd,
+            }) catch |err| {
+                const m = std.fmt.bufPrint(&msg_buf, "error: shell spawn failed: {s}\n", .{@errorName(err)}) catch "error: shell spawn failed\n";
+                stderr_h.writeAll(m) catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, null, run_trace_id, true) catch {};
+                std.process.exit(CronRunExit.internal_error);
+            };
+            if (result.stdout.len > 0) stdout_h.writeAll(result.stdout) catch {};
+            if (result.stderr.len > 0) stderr_h.writeAll(result.stderr) catch {};
+            const exit_code: u8 = switch (result.term) {
+                .Exited => |ec| ec,
+                else => 1,
+            };
+            const status_str: []const u8 = if (exit_code == 0) "ok" else "error";
+            dbCompleteJob(
+                db,
+                spec.id,
+                queue_row_id,
+                std.time.timestamp(),
+                status_str,
+                if (result.stdout.len > 0) result.stdout else null,
+                false,
+                null,
+                run_trace_id,
+                true,
+            ) catch {};
+            std.process.exit(exit_code);
+        },
+        .agent => {
+            const raw_prompt = spec.prompt orelse spec.command;
+            // Legacy `skill:<name>` prompt shorthand: resolve to the skill prompt text.
+            const resolved_prompt = resolveSkillPrompt(spec_alloc, raw_prompt) catch null;
+            const prompt = resolved_prompt orelse raw_prompt;
+            // Honor per-job timeout_secs override, falling back to the config default.
+            const effective_agent_timeout: u64 = if (spec.timeout_secs) |t| t else agent_timeout;
+            const result = runAgentJob(spec_alloc, run_cwd, prompt, spec.model, effective_agent_timeout) catch |err| {
+                const m = std.fmt.bufPrint(&msg_buf, "error: agent run failed: {s}\n", .{@errorName(err)}) catch "error: agent run failed\n";
+                stderr_h.writeAll(m) catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, null, run_trace_id, true) catch {};
+                std.process.exit(CronRunExit.internal_error);
+            };
+            if (result.output.len > 0) stdout_h.writeAll(result.output) catch {};
+            const status_str: []const u8 = if (result.success) "ok" else "error";
+            dbCompleteJob(
+                db,
+                spec.id,
+                queue_row_id,
+                std.time.timestamp(),
+                status_str,
+                if (result.output.len > 0) result.output else null,
+                false,
+                null,
+                run_trace_id,
+                true,
+            ) catch {};
+            std.process.exit(if (result.success) CronRunExit.ok else CronRunExit.internal_error);
+        },
     }
 }
 
@@ -4773,6 +5157,221 @@ pub fn cliUpdateJob(
     } else {
         log.warn("Cron job '{s}' not found", .{id});
     }
+}
+
+/// CLI: show detailed info for a single cron job — spec, next fire, last N runs.
+///
+/// Exits 2 if the job is not found, 5 if the id is malformed.
+pub fn cliShowJob(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    runs_limit: usize,
+    json_out: bool,
+) !void {
+    if (!isValidJobId(id)) {
+        const stderr = std.fs.File.stderr();
+        stderr.writeAll("error: invalid job_id (allowed: [a-zA-Z0-9._-], 1-128 chars)\n") catch {};
+        std.process.exit(CronRunExit.invalid_id);
+    }
+
+    const db_path_z = getCronDbPathZ(allocator) catch return error.CronDbUnavailable;
+    defer allocator.free(db_path_z);
+
+    const db = openCronDbAtPath(db_path_z) catch return error.CronDbUnavailable;
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+    try ensureRunQueueTable(db);
+    try ensureCronRunsTable(db);
+
+    // Query the cron_jobs row.
+    const spec_sql =
+        "SELECT expression, job_type, command, prompt, model, next_run_secs, " ++
+        "last_run_secs, last_status, paused, enabled, one_shot, " ++
+        "delivery_mode, delivery_channel, delivery_account_id, delivery_to, " ++
+        "timeout_secs, session_target, skill_name, skill_args, " ++
+        "verification_mode, repair_policy, created_at_s " ++
+        "FROM cron_jobs WHERE id=?1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, spec_sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
+
+    const step_rc = c.sqlite3_step(stmt);
+    if (step_rc == c.SQLITE_DONE) {
+        const stderr = std.fs.File.stderr();
+        var buf: [256]u8 = undefined;
+        const m = std.fmt.bufPrint(&buf, "error: job not found: '{s}'\n", .{id}) catch "error: job not found\n";
+        stderr.writeAll(m) catch {};
+        std.process.exit(CronRunExit.not_found);
+    }
+    if (step_rc != c.SQLITE_ROW) return error.StepFailed;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const expr = (try dbColumnTextOpt(stmt, 0, a)) orelse "";
+    const job_type = (try dbColumnTextOpt(stmt, 1, a)) orelse "shell";
+    const command_opt = try dbColumnTextOpt(stmt, 2, a);
+    const prompt_opt = try dbColumnTextOpt(stmt, 3, a);
+    const model_opt = try dbColumnTextOpt(stmt, 4, a);
+    const next_run = c.sqlite3_column_int64(stmt, 5);
+    const last_run_secs_raw = c.sqlite3_column_int64(stmt, 6);
+    const has_last_run = c.sqlite3_column_type(stmt, 6) != c.SQLITE_NULL;
+    const last_status = try dbColumnTextOpt(stmt, 7, a);
+    const paused = c.sqlite3_column_int(stmt, 8) != 0;
+    const enabled = c.sqlite3_column_int(stmt, 9) != 0;
+    const one_shot = c.sqlite3_column_int(stmt, 10) != 0;
+    const delivery_mode = (try dbColumnTextOpt(stmt, 11, a)) orelse "none";
+    const delivery_channel = try dbColumnTextOpt(stmt, 12, a);
+    const delivery_account = try dbColumnTextOpt(stmt, 13, a);
+    const delivery_to = try dbColumnTextOpt(stmt, 14, a);
+    const timeout_secs_raw = c.sqlite3_column_int(stmt, 15);
+    const has_timeout = c.sqlite3_column_type(stmt, 15) != c.SQLITE_NULL and timeout_secs_raw > 0;
+    const session_target = (try dbColumnTextOpt(stmt, 16, a)) orelse "isolated";
+    const skill_name = try dbColumnTextOpt(stmt, 17, a);
+    const skill_args = try dbColumnTextOpt(stmt, 18, a);
+    const verification_mode = (try dbColumnTextOpt(stmt, 19, a)) orelse "none";
+    const repair_policy = (try dbColumnTextOpt(stmt, 20, a)) orelse "none";
+    const created_at = c.sqlite3_column_int64(stmt, 21);
+
+    const limit = if (runs_limit == 0) @as(usize, 10) else runs_limit;
+
+    if (json_out) {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(allocator);
+        var int_buf: [32]u8 = undefined;
+        try buf.appendSlice(allocator, "{\"id\":");
+        try appendJsonStr(&buf, allocator, id);
+        try buf.appendSlice(allocator, ",\"expression\":");
+        try appendJsonStr(&buf, allocator, expr);
+        try buf.appendSlice(allocator, ",\"job_type\":");
+        try appendJsonStr(&buf, allocator, job_type);
+        try buf.appendSlice(allocator, ",\"enabled\":");
+        try buf.appendSlice(allocator, if (enabled) "true" else "false");
+        try buf.appendSlice(allocator, ",\"paused\":");
+        try buf.appendSlice(allocator, if (paused) "true" else "false");
+        try buf.appendSlice(allocator, ",\"one_shot\":");
+        try buf.appendSlice(allocator, if (one_shot) "true" else "false");
+        try buf.appendSlice(allocator, ",\"next_run_secs\":");
+        try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{next_run}) catch "0");
+        try buf.appendSlice(allocator, ",\"created_at\":");
+        try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{created_at}) catch "0");
+        try buf.appendSlice(allocator, ",\"last_run_secs\":");
+        if (has_last_run) {
+            try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{last_run_secs_raw}) catch "0");
+        } else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"last_status\":");
+        if (last_status) |s| try appendJsonStr(&buf, allocator, s) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"command\":");
+        if (command_opt) |s| try appendJsonStr(&buf, allocator, s) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"prompt\":");
+        if (prompt_opt) |s| try appendJsonStr(&buf, allocator, s) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"model\":");
+        if (model_opt) |s| try appendJsonStr(&buf, allocator, s) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"skill_name\":");
+        if (skill_name) |s| try appendJsonStr(&buf, allocator, s) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"skill_args\":");
+        if (skill_args) |s| try appendJsonStr(&buf, allocator, s) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"verification_mode\":");
+        try appendJsonStr(&buf, allocator, verification_mode);
+        try buf.appendSlice(allocator, ",\"repair_policy\":");
+        try appendJsonStr(&buf, allocator, repair_policy);
+        try buf.appendSlice(allocator, ",\"session_target\":");
+        try appendJsonStr(&buf, allocator, session_target);
+        try buf.appendSlice(allocator, ",\"timeout_secs\":");
+        if (has_timeout) {
+            try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{timeout_secs_raw}) catch "0");
+        } else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"delivery\":{\"mode\":");
+        try appendJsonStr(&buf, allocator, delivery_mode);
+        try buf.appendSlice(allocator, ",\"channel\":");
+        if (delivery_channel) |s| try appendJsonStr(&buf, allocator, s) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"account\":");
+        if (delivery_account) |s| try appendJsonStr(&buf, allocator, s) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"to\":");
+        if (delivery_to) |s| try appendJsonStr(&buf, allocator, s) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, "},\"runs\":");
+        try dbListRunsJson(db, id, limit, &buf, allocator);
+        try buf.append(allocator, '}');
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll(buf.items) catch {};
+        stdout.writeAll("\n") catch {};
+        return;
+    }
+
+    // Human output.
+    log.info("Job:          {s}", .{id});
+    log.info("Kind:         {s}", .{job_type});
+    if (skill_name) |sn| {
+        log.info("Skill:        {s}", .{sn});
+        if (skill_args) |sa| log.info("Args:         {s}", .{sa});
+    } else {
+        if (command_opt) |cm| if (cm.len > 0) log.info("Command:      {s}", .{cm});
+        if (prompt_opt) |pm| log.info("Prompt:       {s}", .{pm});
+        if (model_opt) |mm| log.info("Model:        {s}", .{mm});
+    }
+    var nr_buf: [64]u8 = undefined;
+    const next_run_fmt = formatUnixTimestamp(next_run, &nr_buf);
+    log.info("Schedule:     {s}    (next: {s})", .{ expr, next_run_fmt });
+    log.info("Enabled:      {}   Paused: {}   One-shot: {}", .{ enabled, paused, one_shot });
+    log.info("Session:      {s}", .{session_target});
+    if (has_timeout) log.info("Timeout:      {d}s", .{timeout_secs_raw});
+    log.info("Verification: {s}    Repair: {s}", .{ verification_mode, repair_policy });
+    if (std.mem.eql(u8, delivery_mode, "none")) {
+        log.info("Delivery:     none", .{});
+    } else {
+        const ch = delivery_channel orelse "?";
+        const ac = delivery_account orelse "?";
+        const to = delivery_to orelse "?";
+        log.info("Delivery:     {s} channel={s} account={s} to={s}", .{ delivery_mode, ch, ac, to });
+    }
+    if (has_last_run) {
+        var lr_buf: [64]u8 = undefined;
+        const lr_fmt = formatUnixTimestamp(last_run_secs_raw, &lr_buf);
+        const ls = last_status orelse "?";
+        log.info("Last run:     {s}   status={s}", .{ lr_fmt, ls });
+    } else {
+        log.info("Last run:     (never)", .{});
+    }
+    {
+        var ca_buf: [64]u8 = undefined;
+        const ca_fmt = formatUnixTimestamp(created_at, &ca_buf);
+        log.info("Created:      {s}", .{ca_fmt});
+    }
+
+    // Recent runs.
+    const runs_sql =
+        "SELECT started_at, finished_at, status, exit_code, verified, failure_class, " ++
+        "repair_action, trace_id, manual " ++
+        "FROM cron_runs WHERE job_id=?1 ORDER BY finished_at DESC LIMIT ?2";
+    var rstmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, runs_sql, -1, &rstmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(rstmt);
+    _ = c.sqlite3_bind_text(rstmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_int64(rstmt, 2, @intCast(limit));
+    var row_count: usize = 0;
+    while (c.sqlite3_step(rstmt) == c.SQLITE_ROW) {
+        if (row_count == 0) log.info("Recent runs (last {d}):", .{limit});
+        row_count += 1;
+        const finished = c.sqlite3_column_int64(rstmt, 1);
+        var ts_buf: [64]u8 = undefined;
+        const ts_fmt = formatUnixTimestamp(finished, &ts_buf);
+        const st_ptr = c.sqlite3_column_text(rstmt, 2);
+        const st_len: usize = if (st_ptr != null) @intCast(c.sqlite3_column_bytes(rstmt, 2)) else 0;
+        const st_str: []const u8 = if (st_ptr != null) st_ptr[0..st_len] else "?";
+        const exit_code = c.sqlite3_column_int64(rstmt, 3);
+        const verified = c.sqlite3_column_int64(rstmt, 4);
+        const manual_flag = c.sqlite3_column_int64(rstmt, 8);
+        const tr_ptr = c.sqlite3_column_text(rstmt, 7);
+        const tr_len: usize = if (tr_ptr != null) @intCast(c.sqlite3_column_bytes(rstmt, 7)) else 0;
+        const tr_str: []const u8 = if (tr_ptr != null) tr_ptr[0..tr_len] else "—";
+        const src: []const u8 = if (manual_flag != 0) "manual" else "cron";
+        log.info("  {s}  {s: <6}  exit={d}  v={d}  src={s}  trace={s}", .{
+            ts_fmt, st_str, exit_code, verified, src, tr_str,
+        });
+    }
+    if (row_count == 0) log.info("Recent runs:  (none)", .{});
 }
 
 /// CLI: list run history for a cron job.
@@ -5496,8 +6095,18 @@ pub fn cliInitSeed(allocator: std.mem.Allocator) !void {
             job.delete_after_run = v.bool;
         };
         if (jsonStr(obj, "session_target")) |st| job.session_target = SessionTarget.parse(st);
-        if (jsonStr(obj, "verification_mode")) |vm| job.verification_mode = VerificationMode.parse(vm);
-        if (jsonStr(obj, "repair_policy")) |rp| job.repair_policy = RepairPolicy.parse(rp);
+        if (jsonStr(obj, "verification_mode")) |vm| {
+            job.verification_mode = VerificationMode.parseStrict(vm) catch {
+                log.err("seed: invalid verification_mode '{s}' for job '{s}', skipping", .{ vm, job.id });
+                continue;
+            };
+        }
+        if (jsonStr(obj, "repair_policy")) |rp| {
+            job.repair_policy = RepairPolicy.parseStrict(rp) catch {
+                log.err("seed: invalid repair_policy '{s}' for job '{s}', skipping", .{ rp, job.id });
+                continue;
+            };
+        }
 
         _ = dbSaveJob(db, job) catch continue;
         count += 1;
@@ -5882,7 +6491,40 @@ pub fn dbLoadJobSpec(db: *c.sqlite3, arena: std.mem.Allocator, job_id: []const u
     };
 }
 
+/// Classify a completed skill run into a RunResult based on exit code, timeout, and
+/// the job's verification_mode. All failure/repair strings are literals — no allocator.
+///
+/// `spec` is `anytype` so both `CronJobSpec` and the lighter spec view used by the
+/// scheduler can pass through. The only field accessed is `verification_mode`.
+pub fn classifySkillRun(
+    spec: anytype,
+    stdout: []const u8,
+    exit_code: u8,
+    timed_out: bool,
+    trace_id: []const u8,
+) RunResult {
+    if (timed_out) return .{ .exit_code = exit_code, .timed_out = true, .failure_class = "timeout", .verified = 3 };
+    if (exit_code != 0) return .{ .exit_code = exit_code, .timed_out = false, .failure_class = "exec_error", .verified = 3 };
+    switch (spec.verification_mode) {
+        .none, .exit_only => return .{ .exit_code = 0, .timed_out = false, .verified = 1 },
+        .content_nonempty => {
+            if (std.mem.trim(u8, stdout, " \t\n\r").len == 0)
+                return .{ .exit_code = 0, .timed_out = false, .failure_class = "content_empty", .verified = 2 };
+            return .{ .exit_code = 0, .timed_out = false, .verified = 1 };
+        },
+        .content_has_trace => {
+            if (std.mem.indexOf(u8, std.mem.trim(u8, stdout, " \t\n\r"), trace_id) == null)
+                return .{ .exit_code = 0, .timed_out = false, .failure_class = "content_invalid", .verified = 2 };
+            return .{ .exit_code = 0, .timed_out = false, .verified = 1 };
+        },
+    }
+}
+
 /// Write job completion back to cron_jobs and remove the run queue row.
+///
+/// `manual` distinguishes scheduler-spawned runs (false) from runs invoked
+/// via `nullclaw cron run` (true). The flag is persisted on the cron_runs
+/// row so dashboards can filter "scheduled only" with `WHERE manual=0`.
 pub fn dbCompleteJob(
     db: *c.sqlite3,
     job_id: []const u8,
@@ -5893,6 +6535,7 @@ pub fn dbCompleteJob(
     delete_after_run: bool,
     run_result: ?RunResult,
     trace_id: ?[]const u8,
+    manual: bool,
 ) !void {
     if (delete_after_run) {
         const del_sql = "DELETE FROM cron_jobs WHERE id=?1";
@@ -5948,8 +6591,8 @@ pub fn dbCompleteJob(
     // Append a run history row (best-effort; ignore errors so completion is never blocked).
     const ins_sql =
         "INSERT INTO cron_runs(job_id, started_at, finished_at, status, output, " ++
-        "exit_code, failure_class, repair_action, verified, trace_id) " ++
-        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)";
+        "exit_code, failure_class, repair_action, verified, trace_id, manual) " ++
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)";
     var ins_stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(db, ins_sql, -1, &ins_stmt, null) == c.SQLITE_OK) {
         _ = c.sqlite3_bind_text(ins_stmt, 1, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
@@ -5985,6 +6628,7 @@ pub fn dbCompleteJob(
         } else {
             _ = c.sqlite3_bind_null(ins_stmt, 10);
         }
+        _ = c.sqlite3_bind_int(ins_stmt, 11, if (manual) 1 else 0);
         _ = c.sqlite3_step(ins_stmt);
         _ = c.sqlite3_finalize(ins_stmt);
     }
@@ -8206,7 +8850,7 @@ test "dbCompleteJob writes result and removes queue row" {
     const dequeued = (try dbDequeueNextJob(db, std.testing.allocator)).?;
     defer std.testing.allocator.free(dequeued.job_id);
 
-    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", "output text", false, null, null);
+    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", "output text", false, null, null, false);
 
     // Queue should be empty.
     var stmt: ?*c.sqlite3_stmt = null;
@@ -8369,7 +9013,7 @@ test "dbCompleteJob inserts cron_runs history row" {
     const dequeued = (try dbDequeueNextJob(db, std.testing.allocator)).?;
     defer std.testing.allocator.free(dequeued.job_id);
 
-    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", "hello output", false, null, null);
+    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", "hello output", false, null, null, false);
 
     // cron_runs should have one row for this job.
     var stmt: ?*c.sqlite3_stmt = null;
@@ -8402,7 +9046,7 @@ test "dbListRunsJson returns JSON array of runs" {
 
     const dequeued = (try dbDequeueNextJob(db, std.testing.allocator)).?;
     defer std.testing.allocator.free(dequeued.job_id);
-    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", "out", false, null, null);
+    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", "out", false, null, null, false);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
@@ -8529,7 +9173,7 @@ test "cron_runs pruning removes rows older than 30 days" {
     _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
     const dequeued = (try dbDequeueNextJob(db, std.testing.allocator)).?;
     defer std.testing.allocator.free(dequeued.job_id);
-    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", null, false, null, null);
+    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", null, false, null, null, false);
 
     // Only the fresh row should remain.
     var cnt_stmt: ?*c.sqlite3_stmt = null;
@@ -8566,7 +9210,7 @@ test "cron_runs started_at differs from finished_at when worker delays" {
 
     // Simulate a job that takes time: finish_time > dequeue_time.
     const finish_time = dequeue_time + 5;
-    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, finish_time, "ok", null, false, null, null);
+    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, finish_time, "ok", null, false, null, null, false);
 
     // started_at should be <= dequeue_time, finished_at should be finish_time.
     var s: ?*c.sqlite3_stmt = null;
@@ -8705,7 +9349,7 @@ test "dbCompleteJob shell run with status=error writes verified=0 and is matched
     defer std.testing.allocator.free(dequeued.job_id);
 
     // Shell completion: run_result=null, status="error" — simulates a non-zero exit.
-    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "error", null, false, null, null);
+    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "error", null, false, null, null, false);
 
     // Verify: the run row has verified=0 (because run_result was null) and status='error'.
     var stmt: ?*c.sqlite3_stmt = null;

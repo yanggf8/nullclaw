@@ -110,7 +110,8 @@ Notes:
 | `nullclaw cron add-skill "0 * * * *" <skill> [--skill-args "..."] [--deliver-to <id>] [--account <id>] [--timeout <secs>] [--tz <offset>] [--verify <mode>] [--repair <policy>] [-- <skill-args...>]` | Add a recurring skill task. Use `--` to forward args to the skill verbatim (needed if the skill itself takes `--verify`/`--repair`) |
 | `nullclaw cron once <delay> "command"` | Add a one-shot delayed shell task |
 | `nullclaw cron once-agent <delay> "prompt" --model <model> [--session-target isolated\|main]` | Add a one-shot delayed agent task |
-| `nullclaw cron run <id>` | Run a task immediately |
+| `nullclaw cron run <id> [--dry-run]` | Run a task immediately with full verify/repair semantics (records a `manual=1` run row). `--dry-run` prints the resolved spec without executing |
+| `nullclaw cron show <id> [--runs N] [--json]` | Show a single job's full spec, next fire time, and last N runs (default 10) |
 | `nullclaw cron pause <id>` / `resume <id>` | Pause or resume a task |
 | `nullclaw cron remove <id>` | Delete a task |
 | `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>] [--verify <mode>] [--repair <policy>]` | Update an existing task; `--enable` also clears the paused flag, `--disable` sets it |

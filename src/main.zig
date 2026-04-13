@@ -39,7 +39,7 @@ const Command = enum {
 };
 
 const SERVICE_SUBCOMMANDS = "install|start|stop|restart|status|uninstall";
-const CRON_SUBCOMMANDS = "list|status|job-status|schedule|add|add-agent|add-skill|once|once-agent|remove|pause|resume|run|update|runs|degraded|run-by-trace|backup|restore|export-seed|init-seed";
+const CRON_SUBCOMMANDS = "list|show|status|job-status|schedule|add|add-agent|add-skill|once|once-agent|remove|pause|resume|run|update|runs|degraded|run-by-trace|backup|restore|export-seed|init-seed";
 const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
@@ -1063,7 +1063,10 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         \\  remove <id>                   Remove a scheduled task
         \\  pause <id>                    Pause a scheduled task (temporary hold)
         \\  resume <id>                   Resume a paused task
-        \\  run <id>                      Run a scheduled task immediately
+        \\  show <id> [--json] [--runs N]
+        \\                                Show full detail for a single job: spec, next fire, last N runs.
+        \\  run <id> [--dry-run]          Run a scheduled task immediately (manual=1 in cron_runs).
+        \\                                --dry-run prints the persisted spec without executing.
         \\  update <id> [--expression <expr>] [--command <cmd>] [--prompt <text>]
         \\             [--model <model>] [--session-target <isolated|main>]
         \\             [--enable] [--disable] [--tz <offset>]
@@ -1236,10 +1239,25 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliResumeJob(allocator, sub_args[1]);
     } else if (std.mem.eql(u8, subcmd, "run")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw cron run <id>\n", .{});
+            std.debug.print("Usage: nullclaw cron run <id> [--dry-run]\n", .{});
             std.process.exit(1);
         }
-        try yc.cron.cliRunJob(allocator, sub_args[1]);
+        var dry_run = false;
+        var run_id: ?[]const u8 = null;
+        var ri: usize = 1;
+        while (ri < sub_args.len) : (ri += 1) {
+            const a = sub_args[ri];
+            if (std.mem.eql(u8, a, "--dry-run")) {
+                dry_run = true;
+            } else if (run_id == null) {
+                run_id = a;
+            }
+        }
+        if (run_id == null) {
+            std.debug.print("Usage: nullclaw cron run <id> [--dry-run]\n", .{});
+            std.process.exit(1);
+        }
+        try yc.cron.cliRunJob(allocator, run_id.?, dry_run);
     } else if (std.mem.eql(u8, subcmd, "update")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <prompt>] [--model <model>] [--session-target <isolated|main>] [--enable] [--disable] [--tz <offset>] [--verify <mode>] [--repair <policy>]\n", .{});
@@ -1350,6 +1368,25 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             }
         }
         try yc.cron.cliListDegradedRuns(allocator, hours, job_filter, degraded_json);
+    } else if (std.mem.eql(u8, subcmd, "show")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw cron show <id> [--json] [--runs N]\n", .{});
+            std.process.exit(1);
+        }
+        var show_json = false;
+        var runs_limit: usize = 10;
+        {
+            var ri: usize = 2;
+            while (ri < sub_args.len) : (ri += 1) {
+                if (std.mem.eql(u8, sub_args[ri], "--json")) {
+                    show_json = true;
+                } else if (std.mem.eql(u8, sub_args[ri], "--runs") and ri + 1 < sub_args.len) {
+                    ri += 1;
+                    runs_limit = std.fmt.parseInt(usize, sub_args[ri], 10) catch 10;
+                }
+            }
+        }
+        try yc.cron.cliShowJob(allocator, sub_args[1], runs_limit, show_json);
     } else if (std.mem.eql(u8, subcmd, "run-by-trace")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron run-by-trace <trace_id> [--json]\n", .{});

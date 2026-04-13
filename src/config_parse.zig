@@ -265,12 +265,12 @@ fn parseNamedAgentObject(
             if (std.fs.path.isAbsolute(val) and std.mem.indexOfScalar(u8, val, '\n') == null) {
                 const file_content = blk: {
                     const file = std.fs.openFileAbsolute(val, .{}) catch |err| {
-                        std.log.warn("system_prompt looks like a file path but failed to open '{s}': {s}", .{ val, @errorName(err) });
+                        log.info("system_prompt looks like a file path but failed to open '{s}': {s}", .{ val, @errorName(err) });
                         break :blk null;
                     };
                     defer file.close();
                     break :blk file.readToEndAlloc(allocator, 64 * 1024) catch |err| {
-                        std.log.warn("system_prompt failed to read file '{s}': {s}", .{ val, @errorName(err) });
+                        log.info("system_prompt failed to read file '{s}': {s}", .{ val, @errorName(err) });
                         break :blk null;
                     };
                 };

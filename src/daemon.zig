@@ -1217,20 +1217,20 @@ fn pollDebouncedInbound(
     const maybe_msg = event_bus.consumeInboundTimeout(timeout_ms) catch |err| switch (err) {
         error.Timeout => {
             debouncer.flushMatured(inbound_debounce.nowMs(), ready_messages) catch |flush_err| {
-                log.warn("inbound debounce flush failed: {}", .{flush_err});
+                log.info("inbound debounce flush failed: {}", .{flush_err});
             };
             return if (ready_messages.items.len > 0) .ready else .idle;
         },
     };
     if (maybe_msg) |msg| {
         debouncer.push(msg, inbound_debounce.nowMs(), ready_messages) catch |push_err| {
-            log.warn("inbound debounce push failed: {}", .{push_err});
+            log.info("inbound debounce push failed: {}", .{push_err});
         };
         return if (ready_messages.items.len > 0) .ready else .idle;
     }
 
     debouncer.flushMatured(inbound_debounce.nowMs(), ready_messages) catch |flush_err| {
-        log.warn("inbound debounce flush failed: {}", .{flush_err});
+        log.info("inbound debounce flush failed: {}", .{flush_err});
     };
     return if (ready_messages.items.len > 0) .ready else .closed;
 }
@@ -3179,9 +3179,16 @@ test "schedulerThread respects shutdown and destroys runtime observer" {
     shutdown_requested.store(true, .release);
     defer shutdown_requested.store(false, .release);
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const config_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "config.json" });
+    defer std.testing.allocator.free(config_path);
+
     const config = Config{
-        .workspace_dir = "/tmp",
-        .config_path = "/tmp/config.json",
+        .workspace_dir = tmp_path,
+        .config_path = config_path,
         .allocator = std.testing.allocator,
     };
 

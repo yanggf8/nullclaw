@@ -51,6 +51,16 @@ pub const ScheduleTool = struct {
         tls_schedule_thread_id = thread_id;
     }
 
+    /// Expose the per-thread delivery chat ID for testing (set by setContext / setTurnToolContext).
+    pub fn getContextChatId(_: *const ScheduleTool) ?[]const u8 {
+        return tls_schedule_chat_id;
+    }
+
+    /// Expose the per-thread delivery peer ID for testing.
+    pub fn getContextPeerId(_: *const ScheduleTool) ?[]const u8 {
+        return tls_schedule_peer_id;
+    }
+
     pub fn tool(self: *ScheduleTool) Tool {
         return .{
             .ptr = @ptrCast(self),
