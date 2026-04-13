@@ -248,6 +248,7 @@ Never use `/skill <name>` or `-m /skill <name>` as a cron prompt. It spawns a su
 - `--verify skill_contract`: successful skill runs must emit two scheduler-parsed markers to stdout:
   - `[skill-status:ok]`
   - `[trace:<job_id>]`
+- Each marker must be emitted on its own line. A combined line such as `[skill-status:ok] [trace:<job_id>]` does not satisfy the parser.
 - To report a semantic problem while still exiting `0`, emit `[skill-status:degraded]` or `[skill-status:failed]` and still emit the trace marker. The scheduler records these as `failure_class=contract_degraded` / `contract_failed` and applies the configured repair policy.
 - Use non-zero exit codes for transport/execution failures (spawn error, timeout, uncaught exception). Use the skill-status markers for semantic “the script ran but the result is not good enough” outcomes.
 

@@ -116,7 +116,7 @@
   - `exit_only` — 只把非零 exit 視為失敗
   - `content_nonempty` — 空的 stdout 視為降級
   - `content_has_trace` — stdout 必須包含 job ID（技能可使用 `trace_marker.emit_trace()` 輔助函式）
-  - `skill_contract` — stdout 必須同時包含 `[skill-status:ok]` 與 `[trace:<job_id>]`; `[skill-status:degraded]` 會記成降級執行, `[skill-status:failed]` 會記成語義硬失敗
+  - `skill_contract` — stdout 必須同時包含 `[skill-status:ok]` 與 `[trace:<job_id>]`, 且各自獨立成行; `[skill-status:degraded]` 會記成降級執行, `[skill-status:failed]` 會記成語義硬失敗
 - `--repair <policy>` — 執行被判定為降級/失敗時排程器如何處理。可選值:
   - `none`（預設）— 僅記錄結果
   - `retry_once` — 立即重試一次;重試結果會被記成 `repair_action=retried_ok` 或 `retried_failed`
