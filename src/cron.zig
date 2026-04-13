@@ -2188,6 +2188,37 @@ pub fn openCronDbAtPath(path_z: [*:0]const u8) !*c.sqlite3 {
     return db.?;
 }
 
+fn openCronDbReadOnlyAtPath(allocator: std.mem.Allocator, path_z: [*:0]const u8) !*c.sqlite3 {
+    if (!build_options.enable_sqlite) return error.SqliteDisabled;
+
+    const path = std.mem.span(path_z);
+    const uri = try std.fmt.allocPrint(allocator, "file:{s}?mode=ro&immutable=1", .{path});
+    defer allocator.free(uri);
+    const uri_z = try allocator.dupeZ(u8, uri);
+    defer allocator.free(uri_z);
+
+    var db: ?*c.sqlite3 = null;
+    const flags = c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_URI;
+    const rc = c.sqlite3_open_v2(uri_z, &db, flags, null);
+    if (rc != c.SQLITE_OK) {
+        if (db) |d| _ = c.sqlite3_close(d);
+        return error.SqliteOpenFailed;
+    }
+    if (db) |d| _ = c.sqlite3_busy_timeout(d, 5000);
+    return db.?;
+}
+
+fn openCronDbForReadAtPath(allocator: std.mem.Allocator, path_z: [*:0]const u8) !*c.sqlite3 {
+    var db = try openCronDbAtPath(path_z);
+    errdefer closeCronDb(db);
+
+    ensureCronTable(db) catch {
+        closeCronDb(db);
+        db = try openCronDbReadOnlyAtPath(allocator, path_z);
+    };
+    return db;
+}
+
 /// Return the null-terminated path to the cron DB (~/.nullclaw/cron.db).
 /// Caller must free the returned slice with allocator.free().
 pub fn getCronDbPathZ(allocator: std.mem.Allocator) ![:0]u8 {
@@ -3201,6 +3232,40 @@ fn loadJobsFromDb(scheduler: *CronScheduler) !void {
     try dbLoadAllJobs(db, scheduler.allocator, scheduler);
 }
 
+/// Load jobs for read-only CLI inspection without requiring schema writes.
+/// Prefers cron.db and falls back to cron.json only when the DB cannot be read.
+fn loadJobsForRead(scheduler: *CronScheduler) !void {
+    if (build_options.enable_sqlite) {
+        const db_path_z = blk: {
+            if (scheduler.db_path) |path_z| {
+                break :blk try scheduler.allocator.dupeZ(u8, path_z[0..path_z.len]);
+            }
+            if (builtin.is_test) return error.TestDbIsolationRequired;
+            const path = try cronDbPath(scheduler.allocator);
+            defer scheduler.allocator.free(path);
+            break :blk try scheduler.allocator.dupeZ(u8, path);
+        };
+        defer scheduler.allocator.free(db_path_z);
+
+        log.info("loading cron jobs from DB...", .{});
+        if (openCronDbForReadAtPath(scheduler.allocator, db_path_z)) |db| {
+            defer closeCronDb(db);
+            try dbLoadAllJobs(db, scheduler.allocator, scheduler);
+            log.info("loaded {d} cron job(s) from DB", .{scheduler.jobs.items.len});
+            return;
+        } else |err| {
+            if (builtin.is_test)
+                log.info("cron DB read load skipped in test: {s}", .{@errorName(err)})
+            else
+                log.err("cron DB read load failed ({s}); falling back to cron.json", .{@errorName(err)});
+        }
+    }
+
+    log.info("loading cron jobs from cron.json...", .{});
+    try loadJobsWithPolicy(scheduler, .best_effort);
+    log.info("loaded {d} cron job(s) from cron.json", .{scheduler.jobs.items.len});
+}
+
 /// Replace in-memory jobs with the persisted store content.
 pub fn reloadJobs(scheduler: *CronScheduler) !void {
     var loaded = CronScheduler.init(scheduler.allocator, scheduler.max_tasks, scheduler.enabled);
@@ -3534,9 +3599,8 @@ pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool) !
         const db_path_z = getCronDbPathZ(allocator) catch null;
         defer if (db_path_z) |p| allocator.free(p);
         if (db_path_z) |dbp| db_blk: {
-            const db = openCronDbAtPath(dbp) catch break :db_blk;
+            const db = openCronDbForReadAtPath(allocator, dbp) catch break :db_blk;
             defer closeCronDb(db);
-            ensureCronTable(db) catch break :db_blk;
             var buf: std.ArrayListUnmanaged(u8) = .empty;
             defer buf.deinit(allocator);
             dbListJobsJson(db, &buf, allocator, json_limit) catch break :db_blk;
@@ -3554,7 +3618,7 @@ pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool) !
     // Human-readable path: weekly chronological table written to stdout (no log prefix).
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
-    try loadJobs(&scheduler);
+    try loadJobsForRead(&scheduler);
 
     // Scheduler health warnings go to stderr via log so they don't pollute stdout.
     const sched_status = checkSchedulerStatus(allocator);
@@ -3587,7 +3651,7 @@ pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool) !
 pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, show_today: bool, json_out: bool) !void {
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
-    try loadJobs(&scheduler);
+    try loadJobsForRead(&scheduler);
 
     const now = std.time.timestamp();
     const all_jobs = scheduler.listJobs();
@@ -3952,7 +4016,7 @@ pub fn cliStatus(allocator: std.mem.Allocator) !void {
     // Show job count
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
-    try loadJobs(&scheduler);
+    try loadJobsForRead(&scheduler);
     const jobs = scheduler.listJobs();
     log.info("  Jobs loaded: {d} total", .{jobs.len});
 
@@ -3977,9 +4041,8 @@ pub fn cliJobStatus(allocator: std.mem.Allocator, json_out: bool) !void {
     defer if (db_path_z) |p| allocator.free(p);
 
     if (db_path_z) |dbp| db_blk: {
-        const db = openCronDbAtPath(dbp) catch break :db_blk;
+        const db = openCronDbForReadAtPath(allocator, dbp) catch break :db_blk;
         defer closeCronDb(db);
-        ensureCronTable(db) catch break :db_blk;
 
         const sql =
             "SELECT id, expression, command, job_type, last_run_secs, last_status, paused, " ++
@@ -5181,11 +5244,8 @@ pub fn cliShowJob(
     const db_path_z = getCronDbPathZ(allocator) catch return error.CronDbUnavailable;
     defer allocator.free(db_path_z);
 
-    const db = openCronDbAtPath(db_path_z) catch return error.CronDbUnavailable;
+    const db = openCronDbForReadAtPath(allocator, db_path_z) catch return error.CronDbUnavailable;
     defer closeCronDb(db);
-    try ensureCronTable(db);
-    try ensureRunQueueTable(db);
-    try ensureCronRunsTable(db);
 
     // Query the cron_jobs row.
     const spec_sql =
@@ -5385,9 +5445,8 @@ pub fn cliListRuns(allocator: std.mem.Allocator, id: []const u8, limit: usize, j
 
     // Try to query history table from DB first.
     if (db_path_z) |dbp| db_blk: {
-        const db = openCronDbAtPath(dbp) catch break :db_blk;
+        const db = openCronDbForReadAtPath(allocator, dbp) catch break :db_blk;
         defer closeCronDb(db);
-        ensureCronTable(db) catch break :db_blk;
 
         if (json_out) {
             var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -5512,9 +5571,8 @@ pub fn cliListDegradedRuns(
     const db_path_z = getCronDbPathZ(allocator) catch return error.CronDbUnavailable;
     defer allocator.free(db_path_z);
 
-    const db = openCronDbAtPath(db_path_z) catch return error.CronDbUnavailable;
+    const db = openCronDbForReadAtPath(allocator, db_path_z) catch return error.CronDbUnavailable;
     defer closeCronDb(db);
-    try ensureCronTable(db);
 
     const now = std.time.timestamp();
     const cutoff: i64 = now - @as(i64, @intCast(hours)) * 3600;
@@ -5688,9 +5746,8 @@ pub fn cliFindRunByTrace(allocator: std.mem.Allocator, trace_id: []const u8, jso
     const db_path_z = getCronDbPathZ(allocator) catch return error.CronDbUnavailable;
     defer allocator.free(db_path_z);
 
-    const db = openCronDbAtPath(db_path_z) catch return error.CronDbUnavailable;
+    const db = openCronDbForReadAtPath(allocator, db_path_z) catch return error.CronDbUnavailable;
     defer closeCronDb(db);
-    try ensureCronTable(db);
 
     const sql =
         "SELECT id, job_id, started_at, finished_at, status, exit_code, " ++
@@ -5907,7 +5964,7 @@ pub fn cliExportSeed(allocator: std.mem.Allocator) !void {
     // Load all jobs from DB
     var scheduler = CronScheduler.init(allocator, 65535, true);
     defer scheduler.deinit();
-    try loadJobs(&scheduler);
+    try loadJobsForRead(&scheduler);
 
     // Build JSON array of enabled jobs (seed format: definition only, no runtime state)
     var buf: std.ArrayList(u8) = .empty;
@@ -8719,6 +8776,78 @@ test "ensureCronTable is idempotent" {
     try ensureCronTable(db);
     try ensureCronTable(db);
     try ensureCronTable(db);
+}
+
+test "openCronDbForReadAtPath falls back to immutable read-only when schema migration is blocked" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path = try std.fmt.allocPrint(allocator, "{s}/cron.db", .{base});
+    defer allocator.free(db_path);
+    const db_path_z = try allocator.dupeZ(u8, db_path);
+    defer allocator.free(db_path_z);
+
+    const db = try openCronDbAtPath(db_path_z);
+    try ensureCronTable(db);
+    _ = c.sqlite3_exec(db, "INSERT INTO cron_jobs(id, expression, command, next_run_secs) VALUES('job-readonly', '* * * * *', 'echo hi', 1)", null, null, null);
+    closeCronDb(db);
+    try std.posix.fchmodat(std.posix.AT.FDCWD, base, 0o555, 0);
+    defer std.posix.fchmodat(std.posix.AT.FDCWD, base, 0o755, 0) catch {};
+
+    var file = try std.fs.openFileAbsolute(db_path, .{ .mode = .read_only });
+    defer file.close();
+    try file.chmod(0o444);
+
+    const ro_db = try openCronDbForReadAtPath(allocator, db_path_z);
+    defer closeCronDb(ro_db);
+
+    const sql = "SELECT COUNT(*) FROM cron_jobs WHERE id='job-readonly'";
+    var stmt: ?*c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_prepare_v2(ro_db, sql, -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(c_int, 1), c.sqlite3_column_int(stmt, 0));
+}
+
+test "loadJobsForRead loads jobs from read-only cron DB" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path = try std.fmt.allocPrint(allocator, "{s}/cron.db", .{base});
+    defer allocator.free(db_path);
+    const db_path_z = try allocator.dupeZ(u8, db_path);
+    defer allocator.free(db_path_z);
+
+    const db = try openCronDbAtPath(db_path_z);
+    try ensureCronTable(db);
+    _ = c.sqlite3_exec(db, "INSERT INTO cron_jobs(id, expression, command, next_run_secs) VALUES('job-cli-read', '* * * * *', 'echo hi', 1)", null, null, null);
+    closeCronDb(db);
+
+    try std.posix.fchmodat(std.posix.AT.FDCWD, base, 0o555, 0);
+    defer std.posix.fchmodat(std.posix.AT.FDCWD, base, 0o755, 0) catch {};
+
+    var file = try std.fs.openFileAbsolute(db_path, .{ .mode = .read_only });
+    defer file.close();
+    try file.chmod(0o444);
+
+    var scheduler = CronScheduler.init(allocator, 16, true);
+    defer scheduler.deinit();
+    scheduler.db_path = db_path_z;
+
+    try loadJobsForRead(&scheduler);
+
+    try std.testing.expectEqual(@as(usize, 1), scheduler.jobs.items.len);
+    try std.testing.expectEqualStrings("job-cli-read", scheduler.jobs.items[0].id);
 }
 
 // ── Test helper ──────────────────────────────────────────────────
