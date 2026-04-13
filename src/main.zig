@@ -943,7 +943,7 @@ fn parseCronSessionTargetArg(raw: []const u8) !yc.cron.SessionTarget {
 fn parseCronVerifyArg(raw: []const u8) yc.cron.VerificationMode {
     return yc.cron.VerificationMode.parseStrict(raw) catch {
         std.debug.print(
-            "Invalid --verify value '{s}': expected one of none|exit_only|content_nonempty|content_has_trace\n",
+            "Invalid --verify value '{s}': expected one of none|exit_only|content_nonempty|content_has_trace|skill_contract\n",
             .{raw},
         );
         std.process.exit(1);
@@ -1053,7 +1053,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         \\             [--timeout <secs>] [--tz <offset>] [--verify <mode>] [--repair <policy>]
         \\             [-- <skill-args...>]
         \\                                Add a recurring skill cron job.
-        \\                                --verify one of: none|exit_only|content_nonempty|content_has_trace
+        \\                                --verify one of: none|exit_only|content_nonempty|content_has_trace|skill_contract
         \\                                --repair one of: none|retry_once|alert_only
         \\                                Use `--` to forward later args verbatim to the skill
         \\                                (needed if the skill itself takes --verify/--repair).
@@ -4647,6 +4647,7 @@ test "VerificationMode.parseStrict accepts valid values and rejects typos" {
     try std.testing.expectEqual(yc.cron.VerificationMode.exit_only, try yc.cron.VerificationMode.parseStrict("exit_only"));
     try std.testing.expectEqual(yc.cron.VerificationMode.content_nonempty, try yc.cron.VerificationMode.parseStrict("content_nonempty"));
     try std.testing.expectEqual(yc.cron.VerificationMode.content_has_trace, try yc.cron.VerificationMode.parseStrict("content_has_trace"));
+    try std.testing.expectEqual(yc.cron.VerificationMode.skill_contract, try yc.cron.VerificationMode.parseStrict("skill_contract"));
     // Case-insensitive.
     try std.testing.expectEqual(yc.cron.VerificationMode.exit_only, try yc.cron.VerificationMode.parseStrict("EXIT_ONLY"));
     // Typos must not silently map to .none.

@@ -242,6 +242,15 @@ Never use `/skill <name>` or `-m /skill <name>` as a cron prompt. It spawns a su
 - **Agent skills** set `delivery_mode: always`. The agent's stdout is captured and sent by the cron runner. No `--deliver-to` needed.
 - The `## Script` section in `SKILL.md` must contain the script path as its first non-empty, non-backtick line, prefixed with `~/`.
 
+#### Skill verification contract
+
+- `--verify content_has_trace`: successful skill runs must emit the `NULLCLAW_JOB_ID` to stdout. The recommended helper is `trace_marker.emit_trace()`, called only after delivery succeeds.
+- `--verify skill_contract`: successful skill runs must emit two scheduler-parsed markers to stdout:
+  - `[skill-status:ok]`
+  - `[trace:<job_id>]`
+- To report a semantic problem while still exiting `0`, emit `[skill-status:degraded]` or `[skill-status:failed]` and still emit the trace marker. The scheduler records these as `failure_class=contract_degraded` / `contract_failed` and applies the configured repair policy.
+- Use non-zero exit codes for transport/execution failures (spawn error, timeout, uncaught exception). Use the skill-status markers for semantic “the script ran but the result is not good enough” outcomes.
+
 #### Source of truth
 
 `~/.nullclaw/cron-seed.json` is the canonical job definition. To reload jobs from seed into the live DB:

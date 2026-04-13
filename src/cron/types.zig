@@ -155,6 +155,7 @@ pub const VerificationMode = enum {
     exit_only,
     content_nonempty,
     content_has_trace,
+    skill_contract,
 
     pub fn asStr(self: VerificationMode) []const u8 {
         return switch (self) {
@@ -162,6 +163,7 @@ pub const VerificationMode = enum {
             .exit_only => "exit_only",
             .content_nonempty => "content_nonempty",
             .content_has_trace => "content_has_trace",
+            .skill_contract => "skill_contract",
         };
     }
 
@@ -169,6 +171,7 @@ pub const VerificationMode = enum {
         if (std.ascii.eqlIgnoreCase(s, "exit_only")) return .exit_only;
         if (std.ascii.eqlIgnoreCase(s, "content_nonempty")) return .content_nonempty;
         if (std.ascii.eqlIgnoreCase(s, "content_has_trace")) return .content_has_trace;
+        if (std.ascii.eqlIgnoreCase(s, "skill_contract")) return .skill_contract;
         return .none;
     }
 
@@ -179,6 +182,7 @@ pub const VerificationMode = enum {
         if (std.ascii.eqlIgnoreCase(s, "exit_only")) return .exit_only;
         if (std.ascii.eqlIgnoreCase(s, "content_nonempty")) return .content_nonempty;
         if (std.ascii.eqlIgnoreCase(s, "content_has_trace")) return .content_has_trace;
+        if (std.ascii.eqlIgnoreCase(s, "skill_contract")) return .skill_contract;
         return error.InvalidVerificationMode;
     }
 };

@@ -77,6 +77,7 @@ pub const VerificationMode = enum {
     exit_only,
     content_nonempty,
     content_has_trace,
+    skill_contract,
 
     pub fn asStr(self: VerificationMode) []const u8 {
         return switch (self) {
@@ -84,6 +85,7 @@ pub const VerificationMode = enum {
             .exit_only => "exit_only",
             .content_nonempty => "content_nonempty",
             .content_has_trace => "content_has_trace",
+            .skill_contract => "skill_contract",
         };
     }
 
@@ -91,6 +93,7 @@ pub const VerificationMode = enum {
         if (std.ascii.eqlIgnoreCase(s, "exit_only")) return .exit_only;
         if (std.ascii.eqlIgnoreCase(s, "content_nonempty")) return .content_nonempty;
         if (std.ascii.eqlIgnoreCase(s, "content_has_trace")) return .content_has_trace;
+        if (std.ascii.eqlIgnoreCase(s, "skill_contract")) return .skill_contract;
         return .none;
     }
 
@@ -101,6 +104,7 @@ pub const VerificationMode = enum {
         if (std.ascii.eqlIgnoreCase(s, "exit_only")) return .exit_only;
         if (std.ascii.eqlIgnoreCase(s, "content_nonempty")) return .content_nonempty;
         if (std.ascii.eqlIgnoreCase(s, "content_has_trace")) return .content_has_trace;
+        if (std.ascii.eqlIgnoreCase(s, "skill_contract")) return .skill_contract;
         return error.InvalidVerificationMode;
     }
 };
@@ -6517,7 +6521,122 @@ pub fn classifySkillRun(
                 return .{ .exit_code = 0, .timed_out = false, .failure_class = "content_invalid", .verified = 2 };
             return .{ .exit_code = 0, .timed_out = false, .verified = 1 };
         },
+        .skill_contract => {
+            const marker = parseSkillContractMarker(stdout, trace_id);
+            if (!marker.has_trace)
+                return .{ .exit_code = 0, .timed_out = false, .failure_class = "content_invalid", .verified = 2 };
+            return switch (marker.status) {
+                .ok => .{ .exit_code = 0, .timed_out = false, .verified = 1 },
+                .degraded => .{ .exit_code = 0, .timed_out = false, .failure_class = "contract_degraded", .verified = 2 },
+                .failed => .{ .exit_code = 0, .timed_out = false, .failure_class = "contract_failed", .verified = 3 },
+                .missing => .{ .exit_code = 0, .timed_out = false, .failure_class = "contract_missing", .verified = 2 },
+            };
+        },
     }
+}
+
+const SkillContractStatus = enum {
+    missing,
+    ok,
+    degraded,
+    failed,
+};
+
+const SkillContractMarker = struct {
+    has_trace: bool = false,
+    status: SkillContractStatus = .missing,
+};
+
+fn parseSkillContractMarker(stdout: []const u8, trace_id: []const u8) SkillContractMarker {
+    var marker = SkillContractMarker{};
+    var lines = std.mem.tokenizeScalar(u8, stdout, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+        if (isTraceMarkerLine(line, trace_id)) {
+            marker.has_trace = true;
+            continue;
+        }
+        if (parseSkillStatusLine(line)) |status| {
+            marker.status = status;
+        }
+    }
+    return marker;
+}
+
+fn isTraceMarkerLine(line: []const u8, trace_id: []const u8) bool {
+    if (!std.mem.startsWith(u8, line, "[trace:")) return false;
+    if (!std.mem.endsWith(u8, line, "]")) return false;
+    const marker_id = line["[trace:".len .. line.len - 1];
+    return std.mem.eql(u8, marker_id, trace_id);
+}
+
+fn parseSkillStatusLine(line: []const u8) ?SkillContractStatus {
+    if (!std.mem.startsWith(u8, line, "[skill-status:")) return null;
+    if (!std.mem.endsWith(u8, line, "]")) return null;
+    const raw = line["[skill-status:".len .. line.len - 1];
+    if (std.mem.eql(u8, raw, "ok")) return .ok;
+    if (std.mem.eql(u8, raw, "degraded")) return .degraded;
+    if (std.mem.eql(u8, raw, "failed")) return .failed;
+    return null;
+}
+
+test "classifySkillRun skill_contract accepts ok marker and trace marker" {
+    const spec = struct {
+        verification_mode: VerificationMode = .skill_contract,
+    }{};
+    const stdout =
+        \\[skill-status:ok]
+        \\[trace:job-123]
+    ;
+    const result = classifySkillRun(spec, stdout, 0, false, "job-123");
+    try std.testing.expectEqual(@as(i32, 1), result.verified);
+    try std.testing.expectEqual(@as(?[]const u8, null), result.failure_class);
+}
+
+test "classifySkillRun skill_contract reports missing status marker" {
+    const spec = struct {
+        verification_mode: VerificationMode = .skill_contract,
+    }{};
+    const stdout =
+        \\[trace:job-123]
+    ;
+    const result = classifySkillRun(spec, stdout, 0, false, "job-123");
+    try std.testing.expectEqual(@as(i32, 2), result.verified);
+    try std.testing.expectEqualStrings("contract_missing", result.failure_class.?);
+}
+
+test "classifySkillRun skill_contract reports degraded and failed markers" {
+    const spec = struct {
+        verification_mode: VerificationMode = .skill_contract,
+    }{};
+    const degraded_stdout =
+        \\[skill-status:degraded]
+        \\[trace:job-123]
+    ;
+    const degraded = classifySkillRun(spec, degraded_stdout, 0, false, "job-123");
+    try std.testing.expectEqual(@as(i32, 2), degraded.verified);
+    try std.testing.expectEqualStrings("contract_degraded", degraded.failure_class.?);
+
+    const failed_stdout =
+        \\[skill-status:failed]
+        \\[trace:job-123]
+    ;
+    const failed = classifySkillRun(spec, failed_stdout, 0, false, "job-123");
+    try std.testing.expectEqual(@as(i32, 3), failed.verified);
+    try std.testing.expectEqualStrings("contract_failed", failed.failure_class.?);
+}
+
+test "classifySkillRun skill_contract still requires trace marker" {
+    const spec = struct {
+        verification_mode: VerificationMode = .skill_contract,
+    }{};
+    const stdout =
+        \\[skill-status:ok]
+    ;
+    const result = classifySkillRun(spec, stdout, 0, false, "job-123");
+    try std.testing.expectEqual(@as(i32, 2), result.verified);
+    try std.testing.expectEqualStrings("content_invalid", result.failure_class.?);
 }
 
 /// Write job completion back to cron_jobs and remove the run queue row.

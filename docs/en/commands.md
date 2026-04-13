@@ -130,6 +130,7 @@ Notes:
   - `exit_only` — only non-zero exit is treated as failure
   - `content_nonempty` — empty stdout is treated as degraded
   - `content_has_trace` — stdout must contain the job ID (skills can use the `trace_marker.emit_trace()` helper)
+  - `skill_contract` — stdout must include both `[skill-status:ok]` and `[trace:<job_id>]`; `[skill-status:degraded]` records a degraded run and `[skill-status:failed]` records a hard semantic failure
 - `--repair <policy>` — what the scheduler does when a run is marked degraded/failed. One of:
   - `none` (default) — record the outcome and move on
   - `retry_once` — immediately re-run once; the retry outcome is recorded as `repair_action=retried_ok` or `retried_failed`
