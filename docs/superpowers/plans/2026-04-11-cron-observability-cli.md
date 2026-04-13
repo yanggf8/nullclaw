@@ -1,8 +1,9 @@
 # Cron Observability CLI — Expose the Framework
 
-**Status:** approved (Gemini review: APPROVE WITH CHANGES, revisions applied)
+**Status: COMPLETE** (Items 1–4 implemented 2026-04-11; Item 5 implemented 2026-04-13)
 **Branch:** `feat/cron-subagent`
 **Depends on:** commits `3ff18d8`, `d833a3e`, `4ec6291`, `271e939` (scheduler observability framework)
+**Implementation commits:** `acc9a5b`, `325ec8e`, `979430d`
 
 ## Problem
 
@@ -345,3 +346,22 @@ Post-implementation review (commit under review, not yet landed). All three find
 | `--verify`/`--repair` silently downgrade typos to `.none` (worst on `update`, which overwrites existing policy) | P2 | **Accepted** — added `parseStrict` to both enums in `src/cron.zig` and `src/cron/types.zig`; added `parseCronVerifyArg`/`parseCronRepairArg` helpers in `src/main.zig` that print allowed values and exit 1 on invalid input; wired all four call sites (`add`, `add-agent`, `add-skill`, `update`). Two new unit tests exercise both the valid-value paths and the error paths. |
 | `cron degraded` only returns `verified >= 2`, so shell/agent runs with `status='error'` are invisible (they write `verified=0` because `dbCompleteJob` is called with `run_result = null` for non-skill jobs) | P2 | **Accepted** — widened `cliListDegradedRuns` filter to `(verified >= 2 OR status = 'error')`; added `status` to SELECT, JSON output, and human-readable output; updated the header and empty-state messages. |
 | `add-skill` parser unconditionally consumed `--verify`/`--repair` tokens, breaking any skill that uses those flag names itself | P3 | **Accepted** — introduced a `--` separator in `parseCronAddSkillOptions`. Scheduler-owned flags are parsed before `--`; everything after `--` is appended verbatim to `skill_args`. Usage heredoc and one-line usage print both updated. Regression test covers: pre-separator `--verify exit_only` reaches the scheduler, post-separator `--verify deep` and `--repair reload` reach the skill, the bare `--` token does not leak. |
+
+---
+
+## Post-implementation diagnosis (2026-04-13)
+
+### `cron runs` returns empty despite `last_status=ok`
+
+**Symptom:** `nullclaw cron runs <job-id> --json` returns `[]` for all jobs, even though `cron list` shows `[ok]` status.
+
+**Root cause:** The gateway process (PID 785) started Apr 1 and is running a binary from before commit `f0bdce2` (Apr 7), which added `cron_runs` history insertion via `dbCompleteJob`. The running binary predates the entire `cron_runs` feature — it updates `last_status`/`last_output` in memory and in `cron_jobs`, but never inserts history rows.
+
+**Execution path analysis:**
+- The DB-direct scheduler path (`gateway.zig:3992`) calls `classifySkillRun` → `complete()` → `dbCompleteJob`, which inserts into `cron_runs`.
+- The legacy in-memory path (`cron.zig:1203`) updates `job.last_run_secs`/`job.last_status` directly and never calls `dbCompleteJob`.
+- Both paths exist in the current source. The stale binary was built before the DB-direct path was wired.
+
+**Fix:** Restart the gateway to pick up the current binary. No code changes needed.
+
+**Lesson:** Gateway restarts are required after any binary rebuild that changes cron execution paths. This reinforces the need for a gateway self-restart mechanism (see `project_gateway_restart.md`).
