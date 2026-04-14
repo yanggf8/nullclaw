@@ -4006,19 +4006,19 @@ fn runQueueWorker(state: *GatewayState) void {
                         job_del
                     else
                         state.alert_delivery orelse cron_mod.DeliveryConfig{};
+                    // Per-run trace ID: job_id:queue_row_id (unique per execution).
+                    const run_trace_id = std.fmt.allocPrint(arena, "{s}:{d}", .{ spec.id, dr.queue_row_id }) catch spec.id;
+                    defer if (run_trace_id.ptr != spec.id.ptr) arena.free(run_trace_id);
                     const raw_skill_cmd = cron_mod.resolveSkillExec(arena, spec.skill_name, spec.skill_args) catch |err| {
                         log.err("[{s}] skill resolution failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, null, null);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id);
                         if (state.event_bus) |eb| {
-                            const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' resolution failed: {s}", .{ spec.skill_name orelse "?", @errorName(err) }) catch null;
+                            const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' resolution failed: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
                         }
                         continue;
                     };
                     defer arena.free(raw_skill_cmd);
-                    // Per-run trace ID: job_id:queue_row_id (unique per execution).
-                    const run_trace_id = std.fmt.allocPrint(arena, "{s}:{d}", .{ spec.id, dr.queue_row_id }) catch spec.id;
-                    defer if (run_trace_id.ptr != spec.id.ptr) arena.free(run_trace_id);
                     // Inject per-run trace ID as env var so scripts embed it in output.
                     const skill_cmd = std.fmt.allocPrint(arena, "NULLCLAW_JOB_ID={s} {s}", .{ run_trace_id, raw_skill_cmd }) catch raw_skill_cmd;
                     var skill_child = std.process.Child.init(
@@ -4031,9 +4031,9 @@ fn runQueueWorker(state: *GatewayState) void {
                     skill_child.cwd = state.cron_workspace_dir;
                     skill_child.spawn() catch |err| {
                         log.err("[{s}] skill exec failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, null, null);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id);
                         if (state.event_bus) |eb| {
-                            const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' failed to start: {s}", .{ spec.skill_name orelse "?", @errorName(err) }) catch null;
+                            const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' failed to start: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
                         }
                         continue;
@@ -4056,18 +4056,18 @@ fn runQueueWorker(state: *GatewayState) void {
                         skill_start_ns,
                     ) catch |err| {
                         log.err("[{s}] skill collect failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, null, run_trace_id);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id);
                         if (state.event_bus) |eb| {
-                            const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' output collection failed: {s}", .{ spec.skill_name orelse "?", @errorName(err) }) catch null;
+                            const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' output collection failed: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
                         }
                         continue;
                     };
                     const skill_term = skill_child.wait() catch |err| {
                         log.err("[{s}] skill wait failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, null, run_trace_id);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id);
                         if (state.event_bus) |eb| {
-                            const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' wait failed: {s}", .{ spec.skill_name orelse "?", @errorName(err) }) catch null;
+                            const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' wait failed: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
                         }
                         continue;

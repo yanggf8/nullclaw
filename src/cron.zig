@@ -151,6 +151,15 @@ pub const RunResult = struct {
     verified: u8 = 0,
 };
 
+pub fn execErrorRunResult() RunResult {
+    return .{
+        .exit_code = 1,
+        .timed_out = false,
+        .failure_class = "exec_error",
+        .verified = 3,
+    };
+}
+
 pub const DeliveryMode = enum {
     none,
     always,
@@ -4921,7 +4930,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             const raw_skill_cmd = resolveSkillExec(spec_alloc, spec.skill_name, spec.skill_args) catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: skill resolution failed: {s}\n", .{@errorName(err)}) catch "error: skill resolution failed\n";
                 stderr_h.writeAll(m) catch {};
-                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, null, run_trace_id, true) catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true) catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
             // Inject NULLCLAW_JOB_ID and NULLCLAW_SKILL_TIMEOUT so delivery.py can honor the budget.
@@ -4942,7 +4951,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             skill_child.spawn() catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: skill spawn failed: {s}\n", .{@errorName(err)}) catch "error: skill spawn failed\n";
                 stderr_h.writeAll(m) catch {};
-                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, null, run_trace_id, true) catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true) catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
 
@@ -5069,7 +5078,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             }) catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: shell spawn failed: {s}\n", .{@errorName(err)}) catch "error: shell spawn failed\n";
                 stderr_h.writeAll(m) catch {};
-                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, null, run_trace_id, true) catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true) catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
             if (result.stdout.len > 0) stdout_h.writeAll(result.stdout) catch {};
@@ -5103,7 +5112,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             const result = runAgentJob(spec_alloc, run_cwd, prompt, spec.model, effective_agent_timeout) catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: agent run failed: {s}\n", .{@errorName(err)}) catch "error: agent run failed\n";
                 stderr_h.writeAll(m) catch {};
-                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, null, run_trace_id, true) catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true) catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
             if (result.output.len > 0) stdout_h.writeAll(result.output) catch {};
@@ -9639,4 +9648,69 @@ test "dbCompleteJob shell run with status=error writes verified=0 and is matched
     _ = c.sqlite3_bind_text(deg_stmt, 1, dequeued.job_id.ptr, @intCast(dequeued.job_id.len), SQLITE_STATIC);
     try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(deg_stmt));
     try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(deg_stmt, 0));
+}
+
+test "dbCompleteJob persists run_result classification fields for exec errors" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const sched = &iso.scheduler;
+
+    const j = try sched.addJob("* * * * *", "echo exec-error-test");
+    const jid = try std.testing.allocator.dupe(u8, j.id);
+    defer std.testing.allocator.free(jid);
+    if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
+    try dbUpsertAndVerify(sched, sched.getJob(jid).?);
+
+    const now = std.time.timestamp();
+    _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
+
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer _ = c.sqlite3_close(db);
+    try ensureCronTable(db);
+
+    const dequeued = (try dbDequeueNextJob(db, std.testing.allocator)).?;
+    defer std.testing.allocator.free(dequeued.job_id);
+
+    // Regression: early skill failures used to pass run_result=null, losing
+    // exit_code/failure_class/verified in cron_runs.
+    try dbCompleteJob(
+        db,
+        dequeued.job_id,
+        dequeued.queue_row_id,
+        now,
+        "error",
+        null,
+        false,
+        execErrorRunResult(),
+        "trace-exec-error",
+        true,
+    );
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql =
+        "SELECT status, exit_code, failure_class, verified, trace_id, manual " ++
+        "FROM cron_runs WHERE job_id=?1";
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db, sql, -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, dequeued.job_id.ptr, @intCast(dequeued.job_id.len), SQLITE_STATIC);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+
+    const status_ptr = c.sqlite3_column_text(stmt, 0).?;
+    const status_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    try std.testing.expectEqualStrings("error", status_ptr[0..status_len]);
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 1));
+
+    const fc_ptr = c.sqlite3_column_text(stmt, 2).?;
+    const fc_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 2));
+    try std.testing.expectEqualStrings("exec_error", fc_ptr[0..fc_len]);
+
+    try std.testing.expectEqual(@as(i64, 3), c.sqlite3_column_int64(stmt, 3));
+
+    const trace_ptr = c.sqlite3_column_text(stmt, 4).?;
+    const trace_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 4));
+    try std.testing.expectEqualStrings("trace-exec-error", trace_ptr[0..trace_len]);
+
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 5));
 }
