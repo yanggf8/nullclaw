@@ -3938,6 +3938,14 @@ fn runQueueWorker(state: *GatewayState) void {
                         .Exited => |ec| ec,
                         else => 1,
                     };
+                    var run_result = cron_mod.classifyExecRun(exit_code, shell_timed_out);
+                    if (cron_mod.shouldPauseOnHardFailure(spec, run_result)) {
+                        if (pauseCronJobForRepair(state, spec.id)) {
+                            run_result.repair_action = "paused_job";
+                        } else {
+                            log.warn("[{s}] failed to pause job after hard failure", .{spec.id});
+                        }
+                    }
                     const success = !shell_timed_out and exit_code == 0;
                     const raw_output = if (shell_stdout.items.len > 0) shell_stdout.items else shell_stderr.items;
                     const output = std.fmt.allocPrint(arena, "{s}\n\n`{s}`", .{ raw_output, spec.id }) catch raw_output;
@@ -3952,7 +3960,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         }
                     }
                     const status = if (success) "ok" else "error";
-                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std.time.timestamp(), status, if (raw_output.len > 0) raw_output else null, spec.delete_after_run, delivered, null, run_trace_id);
+                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std.time.timestamp(), status, if (raw_output.len > 0) raw_output else null, spec.delete_after_run, delivered, run_result, run_trace_id);
                     log.info("[{s}] completed ({s})", .{ spec.id, status });
                 },
                 .agent => {
@@ -3987,8 +3995,16 @@ fn runQueueWorker(state: *GatewayState) void {
                             log.warn("[{s}] output not delivered (len={d})", .{ spec.id, agent_output.len });
                         }
                     }
+                    var run_result = cron_mod.classifyExecRun(agent_result.exit_code, agent_result.timed_out);
+                    if (cron_mod.shouldPauseOnHardFailure(spec, run_result)) {
+                        if (pauseCronJobForRepair(state, spec.id)) {
+                            run_result.repair_action = "paused_job";
+                        } else {
+                            log.warn("[{s}] failed to pause job after hard failure", .{spec.id});
+                        }
+                    }
                     const status = if (agent_result.success) "ok" else "error";
-                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std.time.timestamp(), status, if (raw_agent.len > 0) raw_agent else null, spec.delete_after_run, delivered, null, run_trace_id);
+                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std.time.timestamp(), status, if (raw_agent.len > 0) raw_agent else null, spec.delete_after_run, delivered, run_result, run_trace_id);
                     log.info("[{s}] completed ({s})", .{ spec.id, status });
                 },
                 .skill => {

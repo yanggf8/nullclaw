@@ -142,7 +142,7 @@ pub const RepairPolicy = enum {
     }
 };
 
-/// Classification result from a single skill execution.
+/// Classification result from a single cron job execution.
 /// All string fields point to string literals — no allocator needed.
 pub const RunResult = struct {
     exit_code: u8,
@@ -162,6 +162,12 @@ pub fn execErrorRunResult() RunResult {
         .failure_class = "exec_error",
         .verified = 3,
     };
+}
+
+pub fn classifyExecRun(exit_code: u8, timed_out: bool) RunResult {
+    if (timed_out) return .{ .exit_code = exit_code, .timed_out = true, .failure_class = "timeout", .verified = 3 };
+    if (exit_code != 0) return .{ .exit_code = exit_code, .timed_out = false, .failure_class = "exec_error", .verified = 3 };
+    return .{ .exit_code = 0, .timed_out = false, .verified = 1 };
 }
 
 pub fn shouldPauseOnHardFailure(spec: anytype, run_result: RunResult) bool {
@@ -1388,6 +1394,8 @@ pub const CronScheduler = struct {
 const AgentRunResult = struct {
     success: bool,
     output: []const u8,
+    exit_code: u8,
+    timed_out: bool,
 };
 
 const AGENT_MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -1835,12 +1843,13 @@ pub fn runAgentJob(
     );
 
     const term = try child.wait();
-    const success = !timed_out and switch (term) {
-        .Exited => |code| code == 0,
-        else => false,
+    const exit_code: u8 = switch (term) {
+        .Exited => |code| code,
+        else => 1,
     };
+    const success = !timed_out and exit_code == 0;
     const output = try buildAgentOutput(allocator, stdout.items, stderr.items, timeout_secs, timed_out);
-    return .{ .success = success, .output = output };
+    return .{ .success = success, .output = output, .exit_code = exit_code, .timed_out = timed_out };
 }
 
 const LoadPolicy = enum {
@@ -5124,6 +5133,19 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 .Exited => |ec| ec,
                 else => 1,
             };
+            var run_result = classifyExecRun(exit_code, false);
+            if (shouldPauseOnHardFailure(spec, run_result)) {
+                if (dbSetJobPaused(db, spec.id, true) catch false) {
+                    run_result.repair_action = "paused_job";
+                } else {
+                    const m = std.fmt.bufPrint(
+                        &msg_buf,
+                        "[cron] manual shell '{s}' pause_on_fail could not pause job trace={s}\n",
+                        .{ spec.id, run_trace_id },
+                    ) catch "";
+                    stderr_h.writeAll(m) catch {};
+                }
+            }
             const status_str: []const u8 = if (exit_code == 0) "ok" else "error";
             dbCompleteJob(
                 db,
@@ -5133,7 +5155,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 status_str,
                 if (result.stdout.len > 0) result.stdout else null,
                 false,
-                null,
+                run_result,
                 run_trace_id,
                 true,
             ) catch {};
@@ -5153,6 +5175,19 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 std.process.exit(CronRunExit.internal_error);
             };
             if (result.output.len > 0) stdout_h.writeAll(result.output) catch {};
+            var run_result = classifyExecRun(result.exit_code, result.timed_out);
+            if (shouldPauseOnHardFailure(spec, run_result)) {
+                if (dbSetJobPaused(db, spec.id, true) catch false) {
+                    run_result.repair_action = "paused_job";
+                } else {
+                    const m = std.fmt.bufPrint(
+                        &msg_buf,
+                        "[cron] manual agent '{s}' pause_on_fail could not pause job trace={s}\n",
+                        .{ spec.id, run_trace_id },
+                    ) catch "";
+                    stderr_h.writeAll(m) catch {};
+                }
+            }
             const status_str: []const u8 = if (result.success) "ok" else "error";
             dbCompleteJob(
                 db,
@@ -5162,7 +5197,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 status_str,
                 if (result.output.len > 0) result.output else null,
                 false,
-                null,
+                run_result,
                 run_trace_id,
                 true,
             ) catch {};
@@ -6772,6 +6807,23 @@ test "shouldPauseOnHardFailure only triggers for pause_on_fail hard failures" {
         .failure_class = "exec_error",
         .verified = 3,
     }));
+}
+
+test "classifyExecRun maps success timeout and exec errors" {
+    const ok = classifyExecRun(0, false);
+    try std.testing.expectEqual(@as(u8, 1), ok.verified);
+    try std.testing.expectEqual(@as(u8, 0), ok.exit_code);
+    try std.testing.expectEqual(@as(?[]const u8, null), ok.failure_class);
+
+    const timed_out = classifyExecRun(1, true);
+    try std.testing.expectEqual(@as(u8, 3), timed_out.verified);
+    try std.testing.expect(timed_out.timed_out);
+    try std.testing.expectEqualStrings("timeout", timed_out.failure_class.?);
+
+    const exec_error = classifyExecRun(7, false);
+    try std.testing.expectEqual(@as(u8, 3), exec_error.verified);
+    try std.testing.expectEqual(@as(u8, 7), exec_error.exit_code);
+    try std.testing.expectEqualStrings("exec_error", exec_error.failure_class.?);
 }
 
 /// Write job completion back to cron_jobs and remove the run queue row.

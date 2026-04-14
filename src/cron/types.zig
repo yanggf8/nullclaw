@@ -220,7 +220,7 @@ pub const RepairPolicy = enum {
     }
 };
 
-/// Classification result from a single skill execution.
+/// Classification result from a single cron job execution.
 /// All string fields point to string literals — no allocator needed.
 pub const RunResult = struct {
     exit_code: u8,

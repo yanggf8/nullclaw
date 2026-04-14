@@ -1,9 +1,9 @@
 # Cron Observability CLI — Expose the Framework
 
-**Status: COMPLETE AND VALIDATED** (framework landed 2026-04-11 to 2026-04-14; end-to-end scheduler-path validation closed 2026-04-14; `pause_on_fail` repair extension landed 2026-04-14)
+**Status: COMPLETE AND VALIDATED** (framework landed 2026-04-11 to 2026-04-14; end-to-end scheduler-path validation closed 2026-04-14; `pause_on_fail` repair extension landed 2026-04-14; shell/agent execution classification landed 2026-04-14)
 **Branch:** `feat/cron-subagent`
 **Depends on:** commits `3ff18d8`, `d833a3e`, `4ec6291`, `271e939` (scheduler observability framework)
-**Implementation commits:** `acc9a5b`, `325ec8e`, `979430d`, `bdb7002`, `4d85d57`, `8256b06`, `1ff4c8c`, `a618371`, `b8267e1`, `fcaecd4`, `de2ff27`, `39708ea`
+**Implementation commits:** `acc9a5b`, `325ec8e`, `979430d`, `bdb7002`, `4d85d57`, `8256b06`, `1ff4c8c`, `a618371`, `b8267e1`, `fcaecd4`, `de2ff27`, `39708ea`, `71de258`
 
 ## Final State
 
@@ -14,9 +14,11 @@ This plan is no longer just "implemented in code"; it is closed operationally.
 - `cron runs`, `cron degraded`, and `cron run-by-trace` are available for operator inspection.
 - Early failure classification is normalized across skill, shell, and agent jobs as `exec_error`.
 - Scheduled shell and agent runs persist `trace_id` on both success and early exec-error paths.
+- Shell and agent runs now persist classified `RunResult` metadata on ordinary completion as well, including `verified=1` on clean success and `failure_class=timeout|exec_error` on hard failures.
 - Read-only inspection commands work in the restricted shell path without requiring schema writes.
 - UTF-8 `skill_args` are accepted safely, which removed the CJK breakage in weather/commute jobs.
 - The raw DB worker fallback path now applies `pause_on_fail` correctly even when the cron backend vtable is not initialized, and that path is covered by a gateway regression test.
+- `pause_on_fail` now applies consistently to skill, shell, and agent jobs in both manual and DB-direct scheduler paths because shell/agent runs no longer write `run_result=null`.
 
 Operational rollout completed outside the repo as well:
 
