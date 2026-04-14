@@ -365,3 +365,26 @@ Post-implementation review (commit under review, not yet landed). All three find
 **Fix:** Restart the gateway to pick up the current binary. No code changes needed.
 
 **Lesson:** Gateway restarts are required after any binary rebuild that changes cron execution paths. This reinforces the need for a gateway self-restart mechanism (see `project_gateway_restart.md`).
+
+### UTF-8 skill args rejected as `UnsafeSkillArgs` (2026-04-14)
+
+**Symptom:** Three scheduled jobs (two `weather`, one `commute`) fired at 07:18/07:20 local with `last_status=error`. `cron_runs` rows showed the unclassified-failure fingerprint: `status='error'`, `exit_code=0`, `failure_class=NULL`, `verified=0`, `trace_id=NULL`, `output=NULL`. Manually running the jobs reproduced `error: skill resolution failed: UnsafeSkillArgs`.
+
+**Root cause:** `validateSkillArgsSafe` (`src/cron.zig:1645`) enforced an ASCII-only byte allowlist. Any byte ≥ 0x80 raised `UnsafeSkillArgs`, so every Traditional Chinese argument (`--location 新北市`, `--from 淡水安泰登峰`, etc.) was rejected at resolution time. The failing jobs all had CJK args; other weather/commute jobs with ASCII-only args stayed green.
+
+**Fix (commit `1ff4c8c`):** Accept bytes `0x80…0xFF` in the allowlist and require the full input to be well-formed UTF-8 via `std.unicode.utf8ValidateSlice`. Shell metacharacters are all ASCII (<0x80), so multi-byte UTF-8 sequences cannot form shell syntax. Regression test covers Traditional Chinese, Japanese, Korean, invalid UTF-8 rejection, and the escape-hatch guard (`新北市 | rm` still rejected).
+
+### Early skill failures stored as unclassified errors (2026-04-14)
+
+**Symptom:** The `cron_runs` rows for the CJK failures above (rows 8/12/13 on the live DB) wrote `exit_code=0, failure_class=NULL, verified=0, trace_id=NULL` — indistinguishable from a scheduler-side abort. Operators running `cron degraded` couldn't see them because the row carried no `failure_class` signal, only `status='error'`.
+
+**Root cause:** Both the DB-direct scheduler path (`gateway.zig` runQueueWorker skill branch) and the manual `cron run` path (`cron.zig` cliRunJob) called `dbCompleteJob(..., run_result=null, trace_id=null, ...)` on early failures (skill resolution, spawn, output collect, wait). The only path that populated `RunResult` was post-classification, after `classifySkillRun`. Early failures exited before classification.
+
+**Fix (commit `a618371`):**
+- New helper `execErrorRunResult()` in `src/cron.zig` returning `{exit_code=1, failure_class="exec_error", verified=3}`.
+- Gateway skill branch: pass `cron_mod.execErrorRunResult()` and `run_trace_id` at all four early-failure sites. Hoist `run_trace_id` allocation above `resolveSkillExec` so resolution failures also carry the trace.
+- Failure alerts now include `trace={id}` for operator correlation.
+- `cliRunJob` skill/shell/agent branches: same substitution for manual runs (which are logged with `manual=1`).
+- Regression test proves `dbCompleteJob` persists `exit_code=1`, `failure_class="exec_error"`, `verified=3`, `trace_id`, `manual=1` for the early-failure path.
+
+**Validation:** After gateway restart with commit `1ff4c8c`, the three jobs produced fresh `cron_runs` rows with `status='ok'`, `verified=1`, `trace_id` set (rows 14/15/16 on the live DB). Commit `a618371` ensures the earlier failure mode is now recorded as `failure_class="exec_error"` instead of an unclassified `status='error'` row when it occurs again.
