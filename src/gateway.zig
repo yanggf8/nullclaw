@@ -3934,11 +3934,59 @@ fn runQueueWorker(state: *GatewayState) void {
                         continue;
                     };
                     if (shell_timed_out) log.warn("[{s}] timed out after {d}s", .{ spec.id, timeout });
-                    const exit_code: u8 = switch (shell_term) {
+                    var current_exit_code: u8 = switch (shell_term) {
                         .Exited => |ec| ec,
                         else => 1,
                     };
-                    var run_result = cron_mod.classifyExecRun(exit_code, shell_timed_out);
+                    var current_timed_out = shell_timed_out;
+                    var run_result = cron_mod.classifyExecRun(current_exit_code, current_timed_out);
+                    var retry_count: u8 = 0;
+                    while (cron_mod.shouldRetryOnce(spec, run_result, retry_count)) {
+                        retry_count += 1;
+                        const saved_failure_class = run_result.failure_class;
+                        log.info("[{s}] shell retry 1 (failure_class={s})", .{ spec.id, saved_failure_class orelse "?" });
+                        var retry_child = std.process.Child.init(
+                            &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), shell_cmd },
+                            arena,
+                        );
+                        retry_child.stdin_behavior = .Ignore;
+                        retry_child.stdout_behavior = .Pipe;
+                        retry_child.stderr_behavior = .Pipe;
+                        retry_child.cwd = state.cron_workspace_dir;
+                        retry_child.spawn() catch |err| {
+                            log.err("[{s}] shell retry spawn failed: {s}", .{ spec.id, @errorName(err) });
+                            break;
+                        };
+                        var retry_stdout: std.ArrayList(u8) = .empty;
+                        defer retry_stdout.deinit(arena);
+                        var retry_stderr: std.ArrayList(u8) = .empty;
+                        defer retry_stderr.deinit(arena);
+                        const retry_start_ns = std.time.nanoTimestamp();
+                        const retry_timed_out = cron_mod.collectChildOutputWithTimeout(
+                            &retry_child,
+                            arena,
+                            &retry_stdout,
+                            &retry_stderr,
+                            timeout,
+                            retry_start_ns,
+                        ) catch false;
+                        const retry_term = retry_child.wait() catch break;
+                        current_exit_code = switch (retry_term) {
+                            .Exited => |ec| ec,
+                            else => 1,
+                        };
+                        current_timed_out = retry_timed_out;
+                        run_result = cron_mod.classifyExecRun(current_exit_code, current_timed_out);
+                        cron_mod.applyRetryOutcome(&run_result, saved_failure_class);
+                        if (retry_stdout.items.len > 0) {
+                            shell_stdout.clearAndFree(arena);
+                            shell_stdout.appendSlice(arena, retry_stdout.items) catch {};
+                        }
+                        if (retry_stderr.items.len > 0) {
+                            shell_stderr.clearAndFree(arena);
+                            shell_stderr.appendSlice(arena, retry_stderr.items) catch {};
+                        }
+                    }
                     if (cron_mod.shouldPauseOnHardFailure(spec, run_result)) {
                         if (pauseCronJobForRepair(state, spec.id)) {
                             run_result.repair_action = "paused_job";
@@ -3948,7 +3996,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     } else if (spec.repair_policy == .alert_only and run_result.verified != 1) {
                         run_result.repair_action = "alert_sent";
                     }
-                    const success = !shell_timed_out and exit_code == 0;
+                    const success = !current_timed_out and current_exit_code == 0;
                     const raw_output = if (shell_stdout.items.len > 0) shell_stdout.items else shell_stderr.items;
                     const output = std.fmt.allocPrint(arena, "{s}\n\n`{s}`", .{ raw_output, spec.id }) catch raw_output;
                     var delivered = false;
@@ -3983,28 +4031,25 @@ fn runQueueWorker(state: *GatewayState) void {
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
-                    defer arena.free(agent_result.output);
-                    const raw_agent = agent_result.output;
-                    const agent_output = std.fmt.allocPrint(arena, "{s}\n\n`{s}`", .{ raw_agent, spec.id }) catch raw_agent;
-                    var delivered = false;
-                    if (state.event_bus) |eb| {
-                        const job_name = spec.id;
-                        const session_target: cron_mod.SessionTarget = @enumFromInt(@intFromEnum(spec.session_target));
-                        delivered = if (session_target == .main)
-                            cron_mod.deliverViaMainAgent(state.allocator, delivery, agent_output, agent_result.success, eb, job_name) catch |err| blk: {
-                                log.err("[{s}] main-session delivery failed: {s}", .{ spec.id, @errorName(err) });
-                                break :blk false;
-                            }
-                        else
-                            cron_mod.deliverResult(state.allocator, delivery, agent_output, agent_result.success, eb) catch |err| blk: {
-                                log.err("[{s}] delivery failed: {s}", .{ spec.id, @errorName(err) });
-                                break :blk false;
-                            };
-                        if (!delivered and raw_agent.len > 0 and delivery.mode != .none and delivery.channel != null) {
-                            log.warn("[{s}] output not delivered (len={d})", .{ spec.id, agent_output.len });
-                        }
+                    var raw_agent = agent_result.output;
+                    var current_exit_code = agent_result.exit_code;
+                    var current_timed_out = agent_result.timed_out;
+                    var run_result = cron_mod.classifyExecRun(current_exit_code, current_timed_out);
+                    var retry_count: u8 = 0;
+                    while (cron_mod.shouldRetryOnce(spec, run_result, retry_count)) {
+                        retry_count += 1;
+                        const saved_failure_class = run_result.failure_class;
+                        log.info("[{s}] agent retry 1 (failure_class={s})", .{ spec.id, saved_failure_class orelse "?" });
+                        const retry_result = cron_mod.runAgentJob(arena, state.cron_workspace_dir, p, spec.model, timeout) catch |err| {
+                            log.err("[{s}] agent retry failed: {s}", .{ spec.id, @errorName(err) });
+                            break;
+                        };
+                        raw_agent = retry_result.output;
+                        current_exit_code = retry_result.exit_code;
+                        current_timed_out = retry_result.timed_out;
+                        run_result = cron_mod.classifyExecRun(current_exit_code, current_timed_out);
+                        cron_mod.applyRetryOutcome(&run_result, saved_failure_class);
                     }
-                    var run_result = cron_mod.classifyExecRun(agent_result.exit_code, agent_result.timed_out);
                     if (cron_mod.shouldPauseOnHardFailure(spec, run_result)) {
                         if (pauseCronJobForRepair(state, spec.id)) {
                             run_result.repair_action = "paused_job";
@@ -4014,7 +4059,27 @@ fn runQueueWorker(state: *GatewayState) void {
                     } else if (spec.repair_policy == .alert_only and run_result.verified != 1) {
                         run_result.repair_action = "alert_sent";
                     }
-                    const status = if (agent_result.success) "ok" else "error";
+                    const success = !current_timed_out and current_exit_code == 0;
+                    const agent_output = std.fmt.allocPrint(arena, "{s}\n\n`{s}`", .{ raw_agent, spec.id }) catch raw_agent;
+                    var delivered = false;
+                    if (state.event_bus) |eb| {
+                        const job_name = spec.id;
+                        const session_target: cron_mod.SessionTarget = @enumFromInt(@intFromEnum(spec.session_target));
+                        delivered = if (session_target == .main)
+                            cron_mod.deliverViaMainAgent(state.allocator, delivery, agent_output, success, eb, job_name) catch |err| blk: {
+                                log.err("[{s}] main-session delivery failed: {s}", .{ spec.id, @errorName(err) });
+                                break :blk false;
+                            }
+                        else
+                            cron_mod.deliverResult(state.allocator, delivery, agent_output, success, eb) catch |err| blk: {
+                                log.err("[{s}] delivery failed: {s}", .{ spec.id, @errorName(err) });
+                                break :blk false;
+                            };
+                        if (!delivered and raw_agent.len > 0 and delivery.mode != .none and delivery.channel != null) {
+                            log.warn("[{s}] output not delivered (len={d})", .{ spec.id, agent_output.len });
+                        }
+                    }
+                    const status = if (success) "ok" else "error";
                     complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std.time.timestamp(), status, if (raw_agent.len > 0) raw_agent else null, spec.delete_after_run, delivered, run_result, run_trace_id);
                     if (spec.repair_policy == .alert_only and run_result.verified != 1) {
                         const preview = if (raw_agent.len > 0)

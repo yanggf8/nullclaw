@@ -170,6 +170,15 @@ pub fn classifyExecRun(exit_code: u8, timed_out: bool) RunResult {
     return .{ .exit_code = 0, .timed_out = false, .verified = 1 };
 }
 
+pub fn shouldRetryOnce(spec: anytype, run_result: RunResult, retry_count: u8) bool {
+    return run_result.verified != 1 and spec.repair_policy == .retry_once and retry_count == 0;
+}
+
+pub fn applyRetryOutcome(run_result: *RunResult, saved_failure_class: ?[]const u8) void {
+    run_result.repair_action = if (run_result.verified == 1) "retried_ok" else "retried_failed";
+    if (run_result.failure_class == null) run_result.failure_class = saved_failure_class;
+}
+
 pub fn shouldPauseOnHardFailure(spec: anytype, run_result: RunResult) bool {
     return spec.repair_policy == .pause_on_fail and run_result.verified == 3;
 }
@@ -5127,13 +5136,36 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true) catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
-            if (result.stdout.len > 0) stdout_h.writeAll(result.stdout) catch {};
-            if (result.stderr.len > 0) stderr_h.writeAll(result.stderr) catch {};
-            const exit_code: u8 = switch (result.term) {
+            var current_stdout = result.stdout;
+            var current_stderr = result.stderr;
+            var current_exit_code: u8 = switch (result.term) {
                 .Exited => |ec| ec,
                 else => 1,
             };
-            var run_result = classifyExecRun(exit_code, false);
+            var run_result = classifyExecRun(current_exit_code, false);
+            var retry_count: u8 = 0;
+            while (shouldRetryOnce(spec, run_result, retry_count)) {
+                retry_count += 1;
+                const saved_failure_class = run_result.failure_class;
+                stdout_h.writeAll("[manual run] retrying once...\n") catch {};
+                const retry_result = std.process.Child.run(.{
+                    .allocator = spec_alloc,
+                    .argv = &.{ platform.getShell(), platform.getShellFlag(), effective_cmd },
+                    .cwd = run_cwd,
+                }) catch |err| {
+                    const m = std.fmt.bufPrint(&msg_buf, "error: retry spawn failed: {s}\n", .{@errorName(err)}) catch "error: retry spawn failed\n";
+                    stderr_h.writeAll(m) catch {};
+                    break;
+                };
+                current_exit_code = switch (retry_result.term) {
+                    .Exited => |ec| ec,
+                    else => 1,
+                };
+                run_result = classifyExecRun(current_exit_code, false);
+                applyRetryOutcome(&run_result, saved_failure_class);
+                if (retry_result.stdout.len > 0) current_stdout = retry_result.stdout;
+                if (retry_result.stderr.len > 0) current_stderr = retry_result.stderr;
+            }
             if (shouldPauseOnHardFailure(spec, run_result)) {
                 if (dbSetJobPaused(db, spec.id, true) catch false) {
                     run_result.repair_action = "paused_job";
@@ -5146,20 +5178,22 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                     stderr_h.writeAll(m) catch {};
                 }
             }
-            const status_str: []const u8 = if (exit_code == 0) "ok" else "error";
+            if (current_stdout.len > 0) stdout_h.writeAll(current_stdout) catch {};
+            if (current_stderr.len > 0) stderr_h.writeAll(current_stderr) catch {};
+            const status_str: []const u8 = if (current_exit_code == 0) "ok" else "error";
             dbCompleteJob(
                 db,
                 spec.id,
                 queue_row_id,
                 std.time.timestamp(),
                 status_str,
-                if (result.stdout.len > 0) result.stdout else null,
+                if (current_stdout.len > 0) current_stdout else null,
                 false,
                 run_result,
                 run_trace_id,
                 true,
             ) catch {};
-            std.process.exit(exit_code);
+            std.process.exit(current_exit_code);
         },
         .agent => {
             const raw_prompt = spec.prompt orelse spec.command;
@@ -5174,8 +5208,26 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true) catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
-            if (result.output.len > 0) stdout_h.writeAll(result.output) catch {};
-            var run_result = classifyExecRun(result.exit_code, result.timed_out);
+            var final_output = result.output;
+            var current_exit_code = result.exit_code;
+            var current_timed_out = result.timed_out;
+            var run_result = classifyExecRun(current_exit_code, current_timed_out);
+            var retry_count: u8 = 0;
+            while (shouldRetryOnce(spec, run_result, retry_count)) {
+                retry_count += 1;
+                const saved_failure_class = run_result.failure_class;
+                stdout_h.writeAll("[manual run] retrying once...\n") catch {};
+                const retry_result = runAgentJob(spec_alloc, run_cwd, prompt, spec.model, effective_agent_timeout) catch |err| {
+                    const m = std.fmt.bufPrint(&msg_buf, "error: agent retry failed: {s}\n", .{@errorName(err)}) catch "error: agent retry failed\n";
+                    stderr_h.writeAll(m) catch {};
+                    break;
+                };
+                final_output = retry_result.output;
+                current_exit_code = retry_result.exit_code;
+                current_timed_out = retry_result.timed_out;
+                run_result = classifyExecRun(current_exit_code, current_timed_out);
+                applyRetryOutcome(&run_result, saved_failure_class);
+            }
             if (shouldPauseOnHardFailure(spec, run_result)) {
                 if (dbSetJobPaused(db, spec.id, true) catch false) {
                     run_result.repair_action = "paused_job";
@@ -5188,20 +5240,21 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                     stderr_h.writeAll(m) catch {};
                 }
             }
-            const status_str: []const u8 = if (result.success) "ok" else "error";
+            if (final_output.len > 0) stdout_h.writeAll(final_output) catch {};
+            const status_str: []const u8 = if (!current_timed_out and current_exit_code == 0) "ok" else "error";
             dbCompleteJob(
                 db,
                 spec.id,
                 queue_row_id,
                 std.time.timestamp(),
                 status_str,
-                if (result.output.len > 0) result.output else null,
+                if (final_output.len > 0) final_output else null,
                 false,
                 run_result,
                 run_trace_id,
                 true,
             ) catch {};
-            std.process.exit(if (result.success) CronRunExit.ok else CronRunExit.internal_error);
+            std.process.exit(if (!current_timed_out and current_exit_code == 0) CronRunExit.ok else CronRunExit.internal_error);
         },
     }
 }
@@ -6824,6 +6877,45 @@ test "classifyExecRun maps success timeout and exec errors" {
     try std.testing.expectEqual(@as(u8, 3), exec_error.verified);
     try std.testing.expectEqual(@as(u8, 7), exec_error.exit_code);
     try std.testing.expectEqualStrings("exec_error", exec_error.failure_class.?);
+}
+
+test "retry helpers gate first retry and preserve prior failure class" {
+    const retry_spec = struct {
+        repair_policy: RepairPolicy = .retry_once,
+    }{};
+    const none_spec = struct {
+        repair_policy: RepairPolicy = .none,
+    }{};
+
+    const failed = RunResult{
+        .exit_code = 1,
+        .timed_out = false,
+        .failure_class = "exec_error",
+        .verified = 3,
+    };
+    try std.testing.expect(shouldRetryOnce(retry_spec, failed, 0));
+    try std.testing.expect(!shouldRetryOnce(retry_spec, failed, 1));
+    try std.testing.expect(!shouldRetryOnce(none_spec, failed, 0));
+
+    var retried_ok = RunResult{
+        .exit_code = 0,
+        .timed_out = false,
+        .failure_class = null,
+        .verified = 1,
+    };
+    applyRetryOutcome(&retried_ok, "exec_error");
+    try std.testing.expectEqualStrings("retried_ok", retried_ok.repair_action.?);
+    try std.testing.expectEqualStrings("exec_error", retried_ok.failure_class.?);
+
+    var retried_failed = RunResult{
+        .exit_code = 1,
+        .timed_out = false,
+        .failure_class = "timeout",
+        .verified = 3,
+    };
+    applyRetryOutcome(&retried_failed, "exec_error");
+    try std.testing.expectEqualStrings("retried_failed", retried_failed.repair_action.?);
+    try std.testing.expectEqualStrings("timeout", retried_failed.failure_class.?);
 }
 
 /// Write job completion back to cron_jobs and remove the run queue row.
