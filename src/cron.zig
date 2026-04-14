@@ -160,6 +160,10 @@ pub fn execErrorRunResult() RunResult {
     };
 }
 
+pub fn makeRunTraceId(allocator: std.mem.Allocator, job_id: []const u8, run_id: i64) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}:{d}", .{ job_id, run_id });
+}
+
 pub const DeliveryMode = enum {
     none,
     always,
@@ -4912,7 +4916,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
     };
 
     // Per-run trace ID: {job_id}:{queue_row_id}.
-    const run_trace_id = std.fmt.allocPrint(spec_alloc, "{s}:{d}", .{ spec.id, queue_row_id }) catch spec.id;
+    const run_trace_id = makeRunTraceId(spec_alloc, spec.id, queue_row_id) catch spec.id;
 
     // Effective timeout for skills/shells: spec override, else 120s default.
     const skill_timeout: u64 = if (spec.timeout_secs) |t| t else 120;
@@ -9650,6 +9654,63 @@ test "dbCompleteJob shell run with status=error writes verified=0 and is matched
     try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(deg_stmt, 0));
 }
 
+test "dbCompleteJob persists trace_id when run_result is null" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const sched = &iso.scheduler;
+
+    const j = try sched.addJob("* * * * *", "echo trace-only-test");
+    const jid = try std.testing.allocator.dupe(u8, j.id);
+    defer std.testing.allocator.free(jid);
+    if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
+    try dbUpsertAndVerify(sched, sched.getJob(jid).?);
+
+    const now = std.time.timestamp();
+    _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
+
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer _ = c.sqlite3_close(db);
+    try ensureCronTable(db);
+
+    const dequeued = (try dbDequeueNextJob(db, std.testing.allocator)).?;
+    defer std.testing.allocator.free(dequeued.job_id);
+
+    // Regression: scheduled shell/agent success rows should be able to persist
+    // trace_id even when run_result is null.
+    try dbCompleteJob(
+        db,
+        dequeued.job_id,
+        dequeued.queue_row_id,
+        now,
+        "ok",
+        "hello",
+        false,
+        null,
+        "trace-success",
+        false,
+    );
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "SELECT status, verified, trace_id, manual FROM cron_runs WHERE job_id=?1";
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db, sql, -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, dequeued.job_id.ptr, @intCast(dequeued.job_id.len), SQLITE_STATIC);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+
+    const status_ptr = c.sqlite3_column_text(stmt, 0).?;
+    const status_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    try std.testing.expectEqualStrings("ok", status_ptr[0..status_len]);
+    try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 1));
+
+    const trace_ptr = c.sqlite3_column_text(stmt, 2).?;
+    const trace_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 2));
+    try std.testing.expectEqualStrings("trace-success", trace_ptr[0..trace_len]);
+
+    try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 3));
+}
+
 test "dbCompleteJob persists run_result classification fields for exec errors" {
     if (!build_options.enable_sqlite) return error.SkipZigTest;
 
@@ -9713,4 +9774,11 @@ test "dbCompleteJob persists run_result classification fields for exec errors" {
     try std.testing.expectEqualStrings("trace-exec-error", trace_ptr[0..trace_len]);
 
     try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 5));
+}
+
+test "makeRunTraceId formats job id and run id" {
+    const trace_id = try makeRunTraceId(std.testing.allocator, "job-abc", 42);
+    defer std.testing.allocator.free(trace_id);
+
+    try std.testing.expectEqualStrings("job-abc:42", trace_id);
 }
