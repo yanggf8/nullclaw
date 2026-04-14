@@ -191,18 +191,21 @@ pub const RepairPolicy = enum {
     none,
     retry_once,
     alert_only,
+    pause_on_fail,
 
     pub fn asStr(self: RepairPolicy) []const u8 {
         return switch (self) {
             .none => "none",
             .retry_once => "retry_once",
             .alert_only => "alert_only",
+            .pause_on_fail => "pause_on_fail",
         };
     }
 
     pub fn parse(s: []const u8) RepairPolicy {
         if (std.ascii.eqlIgnoreCase(s, "retry_once")) return .retry_once;
         if (std.ascii.eqlIgnoreCase(s, "alert_only")) return .alert_only;
+        if (std.ascii.eqlIgnoreCase(s, "pause_on_fail")) return .pause_on_fail;
         return .none;
     }
 
@@ -212,6 +215,7 @@ pub const RepairPolicy = enum {
         if (std.ascii.eqlIgnoreCase(s, "none")) return .none;
         if (std.ascii.eqlIgnoreCase(s, "retry_once")) return .retry_once;
         if (std.ascii.eqlIgnoreCase(s, "alert_only")) return .alert_only;
+        if (std.ascii.eqlIgnoreCase(s, "pause_on_fail")) return .pause_on_fail;
         return error.InvalidRepairPolicy;
     }
 };
@@ -223,7 +227,7 @@ pub const RunResult = struct {
     timed_out: bool,
     /// "timeout" | "exec_error" | "content_empty" | "content_invalid" | null
     failure_class: ?[]const u8 = null,
-    /// "retried_ok" | "retried_failed" | "alert_sent" | null
+    /// "retried_ok" | "retried_failed" | "alert_sent" | "paused_job" | null
     repair_action: ?[]const u8 = null,
     /// 0=unverified 1=ok 2=degraded 3=failed_verify
     verified: u8 = 0,

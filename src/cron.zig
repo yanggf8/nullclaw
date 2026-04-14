@@ -113,18 +113,21 @@ pub const RepairPolicy = enum {
     none,
     retry_once,
     alert_only,
+    pause_on_fail,
 
     pub fn asStr(self: RepairPolicy) []const u8 {
         return switch (self) {
             .none => "none",
             .retry_once => "retry_once",
             .alert_only => "alert_only",
+            .pause_on_fail => "pause_on_fail",
         };
     }
 
     pub fn parse(s: []const u8) RepairPolicy {
         if (std.ascii.eqlIgnoreCase(s, "retry_once")) return .retry_once;
         if (std.ascii.eqlIgnoreCase(s, "alert_only")) return .alert_only;
+        if (std.ascii.eqlIgnoreCase(s, "pause_on_fail")) return .pause_on_fail;
         return .none;
     }
 
@@ -134,6 +137,7 @@ pub const RepairPolicy = enum {
         if (std.ascii.eqlIgnoreCase(s, "none")) return .none;
         if (std.ascii.eqlIgnoreCase(s, "retry_once")) return .retry_once;
         if (std.ascii.eqlIgnoreCase(s, "alert_only")) return .alert_only;
+        if (std.ascii.eqlIgnoreCase(s, "pause_on_fail")) return .pause_on_fail;
         return error.InvalidRepairPolicy;
     }
 };
@@ -145,7 +149,7 @@ pub const RunResult = struct {
     timed_out: bool,
     /// "timeout" | "exec_error" | "content_empty" | "content_invalid" | null
     failure_class: ?[]const u8 = null,
-    /// "retried_ok" | "retried_failed" | "alert_sent" | null
+    /// "retried_ok" | "retried_failed" | "alert_sent" | "paused_job" | null
     repair_action: ?[]const u8 = null,
     /// 0=unverified 1=ok 2=degraded 3=failed_verify
     verified: u8 = 0,
@@ -158,6 +162,10 @@ pub fn execErrorRunResult() RunResult {
         .failure_class = "exec_error",
         .verified = 3,
     };
+}
+
+pub fn shouldPauseOnHardFailure(spec: anytype, run_result: RunResult) bool {
+    return spec.repair_policy == .pause_on_fail and run_result.verified == 3;
 }
 
 pub fn makeRunTraceId(allocator: std.mem.Allocator, job_id: []const u8, run_id: i64) ![]u8 {
@@ -2517,6 +2525,20 @@ fn dbDeleteJob(db: *c.sqlite3, id: []const u8) !void {
     _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
     rc = c.sqlite3_step(stmt);
     if (rc != c.SQLITE_DONE) return error.StepFailed;
+}
+
+pub fn dbSetJobPaused(db: *c.sqlite3, id: []const u8, paused: bool) !bool {
+    const sql = "UPDATE cron_jobs SET paused = ?2 WHERE id = ?1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
+    if (rc != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+
+    _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_int(stmt, 2, if (paused) 1 else 0);
+    rc = c.sqlite3_step(stmt);
+    if (rc != c.SQLITE_DONE) return error.StepFailed;
+    return c.sqlite3_changes(db) > 0;
 }
 
 /// Read back a single job row by id and return its id string (caller frees).
@@ -5026,7 +5048,18 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                     stderr_h.writeAll(m) catch {};
                 }
             }
-            if (spec.repair_policy == .alert_only and run_result.verified != 1)
+            if (shouldPauseOnHardFailure(spec, run_result)) {
+                if (dbSetJobPaused(db, spec.id, true) catch false) {
+                    run_result.repair_action = "paused_job";
+                } else {
+                    const m = std.fmt.bufPrint(
+                        &msg_buf,
+                        "[cron] manual skill '{s}' pause_on_fail could not pause job trace={s}\n",
+                        .{ spec.skill_name orelse "?", run_trace_id },
+                    ) catch "";
+                    stderr_h.writeAll(m) catch {};
+                }
+            } else if (spec.repair_policy == .alert_only and run_result.verified != 1)
                 run_result.repair_action = "alert_sent";
 
             // Stream child output to operator stdout/stderr.
@@ -6711,6 +6744,34 @@ test "classifySkillRun skill_contract still requires trace marker" {
     const result = classifySkillRun(spec, stdout, 0, false, "job-123");
     try std.testing.expectEqual(@as(i32, 2), result.verified);
     try std.testing.expectEqualStrings("content_invalid", result.failure_class.?);
+}
+
+test "shouldPauseOnHardFailure only triggers for pause_on_fail hard failures" {
+    const pause_spec = struct {
+        repair_policy: RepairPolicy = .pause_on_fail,
+    }{};
+    const retry_spec = struct {
+        repair_policy: RepairPolicy = .retry_once,
+    }{};
+
+    try std.testing.expect(shouldPauseOnHardFailure(pause_spec, .{
+        .exit_code = 1,
+        .timed_out = false,
+        .failure_class = "exec_error",
+        .verified = 3,
+    }));
+    try std.testing.expect(!shouldPauseOnHardFailure(pause_spec, .{
+        .exit_code = 0,
+        .timed_out = false,
+        .failure_class = "contract_degraded",
+        .verified = 2,
+    }));
+    try std.testing.expect(!shouldPauseOnHardFailure(retry_spec, .{
+        .exit_code = 1,
+        .timed_out = false,
+        .failure_class = "exec_error",
+        .verified = 3,
+    }));
 }
 
 /// Write job completion back to cron_jobs and remove the run queue row.
@@ -8750,6 +8811,44 @@ test "dbDeleteJob removes a row" {
     try std.testing.expectEqual(@as(usize, 1), dbCountJobs(db));
     try dbDeleteJob(db, job_id);
     try std.testing.expectEqual(@as(usize, 0), dbCountJobs(db));
+}
+
+test "dbSetJobPaused updates paused flag" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/pause-helper.db", .{base});
+    defer std.testing.allocator.free(db_path_str);
+    const db_path_z = try std.testing.allocator.dupeZ(u8, db_path_str);
+    defer std.testing.allocator.free(db_path_z);
+
+    const db = try openCronDbAtPath(db_path_z);
+    defer _ = c.sqlite3_close(db);
+    try ensureCronTable(db);
+
+    var temp = CronScheduler.init(std.testing.allocator, 10, true);
+    defer temp.deinit();
+    const job = try temp.addJob("*/5 * * * *", "echo pause-me");
+    const job_id = try std.testing.allocator.dupe(u8, job.id);
+    defer std.testing.allocator.free(job_id);
+    try dbSaveJob(db, job);
+
+    try std.testing.expect(try dbSetJobPaused(db, job_id, true));
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    try std.testing.expectEqual(
+        c.SQLITE_OK,
+        c.sqlite3_prepare_v2(db, "SELECT paused FROM cron_jobs WHERE id=?1", -1, &stmt, null),
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(i32, 1), c.sqlite3_column_int(stmt, 0));
 }
 
 test "dbCountJobs returns zero on empty table" {

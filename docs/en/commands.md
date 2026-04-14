@@ -135,6 +135,7 @@ Notes:
   - `none` (default) — record the outcome and move on
   - `retry_once` — immediately re-run once; the retry outcome is recorded as `repair_action=retried_ok` or `retried_failed`
   - `alert_only` — send an operator alert without retrying (`repair_action=alert_sent`)
+  - `pause_on_fail` — pause the job after a hard failure (`verified=3`), recording `repair_action=paused_job`; degraded runs (`verified=2`) stay active
 
 Unrecognized values are rejected with an error listing the allowed values — a typo on `cron update` will not silently clear an existing policy.
 

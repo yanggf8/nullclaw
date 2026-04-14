@@ -121,6 +121,7 @@
   - `none`（預設）— 僅記錄結果
   - `retry_once` — 立即重試一次;重試結果會被記成 `repair_action=retried_ok` 或 `retried_failed`
   - `alert_only` — 發送操作者告警但不重試（`repair_action=alert_sent`）
+  - `pause_on_fail` — 發生硬失敗（`verified=3`）後自動暫停該 job，並記成 `repair_action=paused_job`; 降級執行（`verified=2`）不會被暫停
 
 無法辨識的值會直接被拒絕並列出合法選項 — `cron update` 時的拼字錯誤不會靜默清除既有策略。
 

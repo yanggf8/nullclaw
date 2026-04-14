@@ -955,7 +955,7 @@ fn parseCronVerifyArg(raw: []const u8) yc.cron.VerificationMode {
 fn parseCronRepairArg(raw: []const u8) yc.cron.RepairPolicy {
     return yc.cron.RepairPolicy.parseStrict(raw) catch {
         std.debug.print(
-            "Invalid --repair value '{s}': expected one of none|retry_once|alert_only\n",
+            "Invalid --repair value '{s}': expected one of none|retry_once|alert_only|pause_on_fail\n",
             .{raw},
         );
         std.process.exit(1);
@@ -1054,7 +1054,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         \\             [-- <skill-args...>]
         \\                                Add a recurring skill cron job.
         \\                                --verify one of: none|exit_only|content_nonempty|content_has_trace|skill_contract
-        \\                                --repair one of: none|retry_once|alert_only
+        \\                                --repair one of: none|retry_once|alert_only|pause_on_fail
         \\                                Use `--` to forward later args verbatim to the skill
         \\                                (needed if the skill itself takes --verify/--repair).
         \\  once <delay> <command>        Add a one-shot delayed task
@@ -4660,6 +4660,7 @@ test "RepairPolicy.parseStrict accepts valid values and rejects typos" {
     try std.testing.expectEqual(yc.cron.RepairPolicy.none, try yc.cron.RepairPolicy.parseStrict("none"));
     try std.testing.expectEqual(yc.cron.RepairPolicy.retry_once, try yc.cron.RepairPolicy.parseStrict("retry_once"));
     try std.testing.expectEqual(yc.cron.RepairPolicy.alert_only, try yc.cron.RepairPolicy.parseStrict("alert_only"));
+    try std.testing.expectEqual(yc.cron.RepairPolicy.pause_on_fail, try yc.cron.RepairPolicy.parseStrict("pause_on_fail"));
     try std.testing.expectError(error.InvalidRepairPolicy, yc.cron.RepairPolicy.parseStrict("retry-once"));
     try std.testing.expectError(error.InvalidRepairPolicy, yc.cron.RepairPolicy.parseStrict(""));
 }

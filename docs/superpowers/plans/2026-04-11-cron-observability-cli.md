@@ -1,20 +1,22 @@
 # Cron Observability CLI — Expose the Framework
 
-**Status: COMPLETE AND VALIDATED** (framework landed 2026-04-11 to 2026-04-14; end-to-end scheduler-path validation closed 2026-04-14)
+**Status: COMPLETE AND VALIDATED** (framework landed 2026-04-11 to 2026-04-14; end-to-end scheduler-path validation closed 2026-04-14; `pause_on_fail` repair extension landed 2026-04-14)
 **Branch:** `feat/cron-subagent`
 **Depends on:** commits `3ff18d8`, `d833a3e`, `4ec6291`, `271e939` (scheduler observability framework)
-**Implementation commits:** `acc9a5b`, `325ec8e`, `979430d`, `bdb7002`, `4d85d57`, `8256b06`, `1ff4c8c`, `a618371`, `b8267e1`, `fcaecd4`, `de2ff27`
+**Implementation commits:** `acc9a5b`, `325ec8e`, `979430d`, `bdb7002`, `4d85d57`, `8256b06`, `1ff4c8c`, `a618371`, `b8267e1`, `fcaecd4`, `de2ff27`, `39708ea`
 
 ## Final State
 
 This plan is no longer just "implemented in code"; it is closed operationally.
 
 - Scheduler-owned verification and repair are exposed in the CLI and persisted in `cron_jobs`.
+- Repair policies now include `pause_on_fail`, which auto-pauses jobs after hard failures and records `repair_action=paused_job`.
 - `cron runs`, `cron degraded`, and `cron run-by-trace` are available for operator inspection.
 - Early failure classification is normalized across skill, shell, and agent jobs as `exec_error`.
 - Scheduled shell and agent runs persist `trace_id` on both success and early exec-error paths.
 - Read-only inspection commands work in the restricted shell path without requiring schema writes.
 - UTF-8 `skill_args` are accepted safely, which removed the CJK breakage in weather/commute jobs.
+- The raw DB worker fallback path now applies `pause_on_fail` correctly even when the cron backend vtable is not initialized, and that path is covered by a gateway regression test.
 
 Operational rollout completed outside the repo as well:
 

@@ -4128,7 +4128,13 @@ fn runQueueWorker(state: *GatewayState) void {
                             skill_stderr.appendSlice(arena, retry_stderr.items) catch {};
                         }
                     }
-                    if (spec.repair_policy == .alert_only and run_result.verified != 1)
+                    if (cron_mod.shouldPauseOnHardFailure(spec, run_result)) {
+                        if (pauseCronJobForRepair(state, spec.id)) {
+                            run_result.repair_action = "paused_job";
+                        } else {
+                            log.warn("[{s}] failed to pause job after hard failure", .{spec.id});
+                        }
+                    } else if (spec.repair_policy == .alert_only and run_result.verified != 1)
                         run_result.repair_action = "alert_sent";
                     const skill_ok = run_result.verified == 1;
                     const skill_output = if (skill_stdout.items.len > 0) skill_stdout.items else skill_stderr.items;
@@ -4471,6 +4477,18 @@ fn runQueueWorker(state: *GatewayState) void {
             }
         }
     }
+}
+
+fn pauseCronJobForRepair(state: *GatewayState, job_id: []const u8) bool {
+    if (state.cron_db_backend) |*be| {
+        return be.backend().pause(job_id) catch false;
+    }
+    if (state.cron_db_path) |db_path| {
+        const db = cron_mod.openCronDbAtPath(db_path) catch return false;
+        defer cron_mod.closeCronDb(db);
+        return cron_mod.dbSetJobPaused(db, job_id, true) catch false;
+    }
+    return false;
 }
 
 fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
@@ -8001,6 +8019,45 @@ test "GatewayState init has empty verify token" {
     var state = GatewayState.init(std.testing.allocator);
     defer state.deinit();
     try std.testing.expectEqualStrings("", state.whatsapp_verify_token);
+}
+
+test "pauseCronJobForRepair falls back to cron_db_path when backend is null" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/pause_fallback.db", .{base});
+    defer std.testing.allocator.free(db_path_str);
+    const db_path_z = try std.testing.allocator.dupeZ(u8, db_path_str);
+    defer std.testing.allocator.free(db_path_z);
+
+    var backend = try cron_db_mod.DbCronBackend.init(std.testing.allocator, db_path_z);
+    defer backend.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const job = try backend.backend().add(a, .{
+        .expression = "0 8 * * *",
+        .job_type = .skill,
+        .command = "",
+        .skill_name = "weather",
+        .skill_args = "--location 臺北市",
+        .verification_mode = .skill_contract,
+        .repair_policy = .pause_on_fail,
+    });
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.cron_db_path = db_path_z;
+    // Intentionally leave cron_db_backend null to exercise the raw DB fallback.
+    try std.testing.expect(pauseCronJobForRepair(&state, job.id));
+
+    const loaded = (try backend.backend().get(a, job.id)).?;
+    try std.testing.expect(loaded.paused);
 }
 
 // ── Bearer Token Validation tests ───────────────────────────────
