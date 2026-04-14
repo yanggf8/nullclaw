@@ -1640,9 +1640,12 @@ fn validateSkillNameSafe(name: []const u8) !void {
 
 /// Validate that skill_args contain no shell metacharacters.
 /// Skill args are passed verbatim into a sh -c string; any shell syntax
-/// in args would be executed. Only allow word characters, spaces, hyphens,
-/// underscores, dots, forward slashes, and @.
+/// in args would be executed. Allow word characters, spaces, hyphens,
+/// underscores, dots, forward slashes, @, and valid UTF-8 bytes (>=0x80).
+/// Shell metacharacters are all ASCII (<0x80), so multi-byte UTF-8
+/// sequences cannot form shell syntax. The input must be valid UTF-8.
 fn validateSkillArgsSafe(args: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(args)) return error.UnsafeSkillArgs;
     for (args) |ch| {
         switch (ch) {
             'a'...'z',
@@ -1657,6 +1660,7 @@ fn validateSkillArgsSafe(args: []const u8) !void {
             '+',
             '=',
             ':',
+            0x80...0xFF,
             => {},
             else => return error.UnsafeSkillArgs,
         }
@@ -9191,6 +9195,20 @@ test "validateSkillArgsSafe rejects shell metacharacters" {
     try validateSkillArgsSafe("--deliver-to 7972814626 --account ping --account-topics");
     try validateSkillArgsSafe("--lang zh");
     try validateSkillArgsSafe("--mode record");
+}
+
+test "validateSkillArgsSafe accepts valid UTF-8 (CJK)" {
+    // Traditional Chinese locations commonly used with weather/commute skills.
+    try validateSkillArgsSafe("--location 新北市 --location 臺北市");
+    try validateSkillArgsSafe("--from 淡水安泰登峰 --to 小巨蛋");
+    try validateSkillArgsSafe("--topic 科技");
+    // Japanese + Korean mix is still valid UTF-8.
+    try validateSkillArgsSafe("--label こんにちは --tag 안녕");
+    // Invalid UTF-8 must still be rejected.
+    try std.testing.expectError(error.UnsafeSkillArgs, validateSkillArgsSafe("--x \xC0\xAF"));
+    try std.testing.expectError(error.UnsafeSkillArgs, validateSkillArgsSafe("--x \xFF"));
+    // UTF-8 bytes do not open an escape hatch for ASCII metacharacters.
+    try std.testing.expectError(error.UnsafeSkillArgs, validateSkillArgsSafe("新北市 | rm"));
 }
 
 test "resolveSkillExecFrom rejects unsafe skill_name" {
