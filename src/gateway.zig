@@ -3945,6 +3945,8 @@ fn runQueueWorker(state: *GatewayState) void {
                         } else {
                             log.warn("[{s}] failed to pause job after hard failure", .{spec.id});
                         }
+                    } else if (spec.repair_policy == .alert_only and run_result.verified != 1) {
+                        run_result.repair_action = "alert_sent";
                     }
                     const success = !shell_timed_out and exit_code == 0;
                     const raw_output = if (shell_stdout.items.len > 0) shell_stdout.items else shell_stderr.items;
@@ -3961,6 +3963,13 @@ fn runQueueWorker(state: *GatewayState) void {
                     }
                     const status = if (success) "ok" else "error";
                     complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std.time.timestamp(), status, if (raw_output.len > 0) raw_output else null, spec.delete_after_run, delivered, run_result, run_trace_id);
+                    if (spec.repair_policy == .alert_only and run_result.verified != 1) {
+                        const preview = if (raw_output.len > 0)
+                            raw_output[0..@min(raw_output.len, 200)]
+                        else
+                            "no output";
+                        sendCronRepairAlert(state, arena, spec, "shell", run_result, run_trace_id, preview);
+                    }
                     log.info("[{s}] completed ({s})", .{ spec.id, status });
                 },
                 .agent => {
@@ -4002,9 +4011,18 @@ fn runQueueWorker(state: *GatewayState) void {
                         } else {
                             log.warn("[{s}] failed to pause job after hard failure", .{spec.id});
                         }
+                    } else if (spec.repair_policy == .alert_only and run_result.verified != 1) {
+                        run_result.repair_action = "alert_sent";
                     }
                     const status = if (agent_result.success) "ok" else "error";
                     complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std.time.timestamp(), status, if (raw_agent.len > 0) raw_agent else null, spec.delete_after_run, delivered, run_result, run_trace_id);
+                    if (spec.repair_policy == .alert_only and run_result.verified != 1) {
+                        const preview = if (raw_agent.len > 0)
+                            raw_agent[0..@min(raw_agent.len, 200)]
+                        else
+                            "no output";
+                        sendCronRepairAlert(state, arena, spec, "agent", run_result, run_trace_id, preview);
+                    }
                     log.info("[{s}] completed ({s})", .{ spec.id, status });
                 },
                 .skill => {
@@ -4505,6 +4523,41 @@ fn pauseCronJobForRepair(state: *GatewayState, job_id: []const u8) bool {
         return cron_mod.dbSetJobPaused(db, job_id, true) catch false;
     }
     return false;
+}
+
+fn cronRepairAlertDelivery(state: *const GatewayState, spec: anytype) cron_mod.DeliveryConfig {
+    if (spec.delivery.mode != .none) {
+        return .{
+            .mode = @enumFromInt(@intFromEnum(spec.delivery.mode)),
+            .channel = spec.delivery.channel,
+            .account_id = spec.delivery.account_id,
+            .to = spec.delivery.to,
+            .best_effort = true,
+        };
+    }
+    return state.alert_delivery orelse cron_mod.DeliveryConfig{};
+}
+
+fn sendCronRepairAlert(
+    state: *const GatewayState,
+    allocator: std.mem.Allocator,
+    spec: anytype,
+    job_kind: []const u8,
+    run_result: cron_mod.RunResult,
+    trace_id: []const u8,
+    preview: []const u8,
+) void {
+    const eb = state.event_bus orelse return;
+    const fc = run_result.failure_class orelse "unknown";
+    const ra = run_result.repair_action orelse "none";
+    const alert_del = cronRepairAlertDelivery(state, spec);
+    const msg = std.fmt.allocPrint(
+        allocator,
+        "[cron] {s} '{s}' degraded: failure={s} repair={s} trace={s}\n{s}",
+        .{ job_kind, spec.id, fc, ra, trace_id, preview },
+    ) catch return;
+    defer allocator.free(msg);
+    _ = cron_mod.deliverResult(allocator, alert_del, msg, false, eb) catch {};
 }
 
 fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
@@ -8074,6 +8127,47 @@ test "pauseCronJobForRepair falls back to cron_db_path when backend is null" {
 
     const loaded = (try backend.backend().get(a, job.id)).?;
     try std.testing.expect(loaded.paused);
+}
+
+test "sendCronRepairAlert uses alert delivery fallback for alert_only shell failures" {
+    const allocator = std.testing.allocator;
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+
+    var test_bus = bus_mod.Bus.init();
+    defer test_bus.close();
+    state.event_bus = &test_bus;
+    state.alert_delivery = .{
+        .mode = .always,
+        .channel = "telegram",
+        .to = "ops-chat",
+        .best_effort = true,
+    };
+
+    const spec = struct {
+        id: []const u8 = "shell-job-1",
+        repair_policy: cron_mod.RepairPolicy = .alert_only,
+        delivery: cron_mod.DeliveryConfig = .{},
+    }{};
+    const run_result = cron_mod.RunResult{
+        .exit_code = 1,
+        .timed_out = false,
+        .failure_class = "exec_error",
+        .repair_action = "alert_sent",
+        .verified = 3,
+    };
+
+    sendCronRepairAlert(&state, allocator, spec, "shell", run_result, "trace-shell-1", "stderr preview");
+
+    try std.testing.expectEqual(@as(usize, 1), test_bus.outboundDepth());
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("ops-chat", msg.chat_id);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "shell 'shell-job-1' degraded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "failure=exec_error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "repair=alert_sent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "trace=trace-shell-1") != null);
 }
 
 // ── Bearer Token Validation tests ───────────────────────────────
