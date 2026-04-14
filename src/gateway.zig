@@ -4026,7 +4026,10 @@ fn runQueueWorker(state: *GatewayState) void {
                     const resolved_p = cron_mod.resolveSkillPrompt(arena, raw_p) catch null;
                     defer if (resolved_p) |rp| arena.free(rp);
                     const p = resolved_p orelse raw_p;
-                    const agent_result = cron_mod.runAgentJob(arena, state.cron_workspace_dir, p, spec.model, timeout) catch |err| {
+                    const agent_result = cron_mod.runAgentJob(arena, state.cron_workspace_dir, p, spec.model, timeout, .{
+                        .source = "cron_scheduler_agent",
+                        .trace_id = run_trace_id,
+                    }) catch |err| {
                         log.err("[{s}] agent failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
@@ -4040,7 +4043,10 @@ fn runQueueWorker(state: *GatewayState) void {
                         retry_count += 1;
                         const saved_failure_class = run_result.failure_class;
                         log.info("[{s}] agent retry 1 (failure_class={s})", .{ spec.id, saved_failure_class orelse "?" });
-                        const retry_result = cron_mod.runAgentJob(arena, state.cron_workspace_dir, p, spec.model, timeout) catch |err| {
+                        const retry_result = cron_mod.runAgentJob(arena, state.cron_workspace_dir, p, spec.model, timeout, .{
+                            .source = "cron_scheduler_agent",
+                            .trace_id = run_trace_id,
+                        }) catch |err| {
                             log.err("[{s}] agent retry failed: {s}", .{ spec.id, @errorName(err) });
                             break;
                         };
@@ -4428,7 +4434,9 @@ fn runQueueWorker(state: *GatewayState) void {
                 },
                 .agent => {
                     const p = prompt orelse command;
-                    const agent_result = cron_mod.runAgentJob(allocator, run_cwd, p, model, timeout) catch |err| {
+                    const agent_result = cron_mod.runAgentJob(allocator, run_cwd, p, model, timeout, .{
+                        .source = "cron_legacy_scheduler_agent",
+                    }) catch |err| {
                         log.err("[{s}] agent failed: {s}", .{ id, @errorName(err) });
                         state.scheduler_mutex.lock();
                         if (sched.getMutableJob(id)) |j| {

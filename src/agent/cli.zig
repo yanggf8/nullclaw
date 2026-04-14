@@ -6,6 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const log = std.log.scoped(.agent);
+const platform = @import("../platform.zig");
 const Config = @import("../config.zig").Config;
 const config_types = @import("../config_types.zig");
 const agent_routing = @import("../agent_routing.zig");
@@ -56,8 +57,60 @@ const CliProviderContext = struct {
     }
 };
 
+const EXECUTION_SOURCE_ENV = "NULLCLAW_EXECUTION_SOURCE";
+const EXECUTION_TRACE_ENV = "NULLCLAW_EXECUTION_TRACE_ID";
+const SENSORIUM_STATE_ENV = "NULLCLAW_SENSORIUM_STATE";
+
+const CliExecutionContext = struct {
+    source: ?[]u8 = null,
+    trace_id: ?[]u8 = null,
+    sensorium_state: ?[]u8 = null,
+
+    fn deinit(self: *CliExecutionContext, allocator: std.mem.Allocator) void {
+        if (self.source) |v| allocator.free(v);
+        if (self.trace_id) |v| allocator.free(v);
+        if (self.sensorium_state) |v| allocator.free(v);
+        self.* = .{};
+    }
+};
+
 fn shouldPrintTurnResponse(supports_streaming: bool, emitted_text: bool) bool {
     return !supports_streaming or !emitted_text;
+}
+
+fn readCliExecutionContext(allocator: std.mem.Allocator) CliExecutionContext {
+    return .{
+        .source = platform.getEnvOrNull(allocator, EXECUTION_SOURCE_ENV),
+        .trace_id = platform.getEnvOrNull(allocator, EXECUTION_TRACE_ENV),
+        .sensorium_state = platform.getEnvOrNull(allocator, SENSORIUM_STATE_ENV),
+    };
+}
+
+fn formatCliExecutionContextMessage(
+    allocator: std.mem.Allocator,
+    message: []const u8,
+    exec_ctx: CliExecutionContext,
+) ![]u8 {
+    if (exec_ctx.source == null and exec_ctx.trace_id == null and exec_ctx.sensorium_state == null) {
+        return allocator.dupe(u8, message);
+    }
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("[Execution context]\n");
+    if (exec_ctx.source) |source| try w.print("- source: {s}\n", .{source});
+    if (exec_ctx.trace_id) |trace_id| try w.print("- trace_id: {s}\n", .{trace_id});
+    if (exec_ctx.sensorium_state) |sensorium_state| {
+        if (std.mem.eql(u8, sensorium_state, "session_only_not_attached")) {
+            try w.writeAll("- sensorium: session-only sensorium is not attached in this subprocess\n");
+        } else {
+            try w.print("- sensorium: {s}\n", .{sensorium_state});
+        }
+    }
+    try w.writeAll("\n");
+    try w.writeAll(message);
+    return try buf.toOwnedSlice(allocator);
 }
 
 fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
@@ -480,6 +533,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 log.info("Session: {s}", .{sid});
             }
         }
+        var exec_ctx = readCliExecutionContext(allocator);
+        defer exec_ctx.deinit(allocator);
+        const effective_message = try formatCliExecutionContextMessage(allocator, message, exec_ctx);
+        defer allocator.free(effective_message);
 
         var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_i, tools, mem_opt, obs, selected_profile_storage);
         agent.policy = &policy;
@@ -511,7 +568,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
 
         stream_ctx.emitted_text = false;
-        const response = agent.turn(message) catch |err| {
+        const response = agent.turn(effective_message) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
                 try w.flush();
@@ -1012,4 +1069,27 @@ test "writeRateLimitHint mentions reliability knobs and logs" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "reliability.provider_backoff_ms") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "~/.nullclaw/logs/daemon.stdout.log") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "kimi appears rate-limited or quota-constrained") != null);
+}
+
+test "formatCliExecutionContextMessage prepends cron subprocess context" {
+    var exec_ctx = CliExecutionContext{
+        .source = try std.testing.allocator.dupe(u8, "cron_scheduler_agent"),
+        .trace_id = try std.testing.allocator.dupe(u8, "job-123:7"),
+        .sensorium_state = try std.testing.allocator.dupe(u8, "session_only_not_attached"),
+    };
+    defer exec_ctx.deinit(std.testing.allocator);
+    const rendered = try formatCliExecutionContextMessage(std.testing.allocator, "analyze this", exec_ctx);
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.startsWith(u8, rendered, "[Execution context]\n"));
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "- source: cron_scheduler_agent\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "- trace_id: job-123:7\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "session-only sensorium is not attached in this subprocess") != null);
+    try std.testing.expect(std.mem.endsWith(u8, rendered, "analyze this"));
+}
+
+test "formatCliExecutionContextMessage returns original message when no context is present" {
+    const rendered = try formatCliExecutionContextMessage(std.testing.allocator, "hello", .{});
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings("hello", rendered);
 }

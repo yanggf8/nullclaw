@@ -1211,7 +1211,9 @@ pub const CronScheduler = struct {
                             }
                         }
                     } else {
-                        const exec_result = runAgentJob(self.allocator, self.shell_cwd, agent_output, job.model, self.agent_timeout_secs) catch |err| {
+                        const exec_result = runAgentJob(self.allocator, self.shell_cwd, agent_output, job.model, self.agent_timeout_secs, .{
+                            .source = "cron_legacy_scheduler_agent",
+                        }) catch |err| {
                             log.err("cron agent job '{s}' execution failed: {s}", .{ job.id, @errorName(err) });
                             job.last_run_secs = now;
                             job.last_status = "error";
@@ -1407,10 +1409,19 @@ const AgentRunResult = struct {
     timed_out: bool,
 };
 
+pub const AgentExecutionContext = struct {
+    source: []const u8,
+    trace_id: ?[]const u8 = null,
+};
+
 const AGENT_MAX_OUTPUT_BYTES: usize = 1_048_576;
 const AGENT_POLL_STEP_NS: u64 = 200 * std.time.ns_per_ms;
 const LINUX_SELF_EXE_PATH = "/proc/self/exe";
 const DELETED_EXE_SUFFIX = " (deleted)";
+const EXECUTION_SOURCE_ENV = "NULLCLAW_EXECUTION_SOURCE";
+const EXECUTION_TRACE_ENV = "NULLCLAW_EXECUTION_TRACE_ID";
+const SENSORIUM_STATE_ENV = "NULLCLAW_SENSORIUM_STATE";
+const SENSORIUM_STATE_SESSION_ONLY = "session_only_not_attached";
 
 fn pathAgentExecutableName() []const u8 {
     return if (comptime builtin.os.tag == .windows) "nullclaw.exe" else "nullclaw";
@@ -1761,6 +1772,7 @@ pub fn runAgentJob(
     prompt: []const u8,
     model: ?[]const u8,
     timeout_secs: u64,
+    exec_ctx: ?AgentExecutionContext,
 ) !AgentRunResult {
     const exe_path = try std.fs.selfExePathAlloc(allocator);
     defer allocator.free(exe_path);
@@ -1773,6 +1785,9 @@ pub fn runAgentJob(
 
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(allocator);
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+    if (exec_ctx) |ctx| try putAgentExecutionEnv(&env_map, ctx);
 
     var child: std.process.Child = undefined;
     spawn_loop: while (true) {
@@ -1791,6 +1806,7 @@ pub fn runAgentJob(
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
         child.cwd = exec_cwd;
+        child.env_map = &env_map;
 
         child.spawn() catch |err| switch (err) {
             error.FileNotFound => {
@@ -1859,6 +1875,16 @@ pub fn runAgentJob(
     const success = !timed_out and exit_code == 0;
     const output = try buildAgentOutput(allocator, stdout.items, stderr.items, timeout_secs, timed_out);
     return .{ .success = success, .output = output, .exit_code = exit_code, .timed_out = timed_out };
+}
+
+pub fn putAgentExecutionEnv(env_map: *std.process.EnvMap, exec_ctx: AgentExecutionContext) !void {
+    try env_map.put(EXECUTION_SOURCE_ENV, exec_ctx.source);
+    try env_map.put(SENSORIUM_STATE_ENV, SENSORIUM_STATE_SESSION_ONLY);
+    if (exec_ctx.trace_id) |trace_id| {
+        try env_map.put(EXECUTION_TRACE_ENV, trace_id);
+    } else {
+        env_map.remove(EXECUTION_TRACE_ENV);
+    }
 }
 
 const LoadPolicy = enum {
@@ -4833,7 +4859,9 @@ fn cliRunJobLegacy(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) 
             defer if (resolved_prompt) |rp| allocator.free(rp);
             const prompt = resolved_prompt orelse raw_prompt;
             const effective_timeout: u64 = if (job.timeout_secs) |t| t else scheduler.agent_timeout_secs;
-            const result = runAgentJob(allocator, run_cwd, prompt, job.model, effective_timeout) catch |err| {
+            const result = runAgentJob(allocator, run_cwd, prompt, job.model, effective_timeout, .{
+                .source = "cron_manual_agent",
+            }) catch |err| {
                 log.err("Agent job '{s}' failed: {s}", .{ id, @errorName(err) });
                 std.process.exit(CronRunExit.internal_error);
             };
@@ -5202,7 +5230,10 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             const prompt = resolved_prompt orelse raw_prompt;
             // Honor per-job timeout_secs override, falling back to the config default.
             const effective_agent_timeout: u64 = if (spec.timeout_secs) |t| t else agent_timeout;
-            const result = runAgentJob(spec_alloc, run_cwd, prompt, spec.model, effective_agent_timeout) catch |err| {
+            const result = runAgentJob(spec_alloc, run_cwd, prompt, spec.model, effective_agent_timeout, .{
+                .source = "cron_manual_agent",
+                .trace_id = run_trace_id,
+            }) catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: agent run failed: {s}\n", .{@errorName(err)}) catch "error: agent run failed\n";
                 stderr_h.writeAll(m) catch {};
                 dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true) catch {};
@@ -5217,7 +5248,10 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 retry_count += 1;
                 const saved_failure_class = run_result.failure_class;
                 stdout_h.writeAll("[manual run] retrying once...\n") catch {};
-                const retry_result = runAgentJob(spec_alloc, run_cwd, prompt, spec.model, effective_agent_timeout) catch |err| {
+                const retry_result = runAgentJob(spec_alloc, run_cwd, prompt, spec.model, effective_agent_timeout, .{
+                    .source = "cron_manual_agent",
+                    .trace_id = run_trace_id,
+                }) catch |err| {
                     const m = std.fmt.bufPrint(&msg_buf, "error: agent retry failed: {s}\n", .{@errorName(err)}) catch "error: agent retry failed\n";
                     stderr_h.writeAll(m) catch {};
                     break;
@@ -10024,4 +10058,18 @@ test "makeRunTraceId formats job id and run id" {
     defer std.testing.allocator.free(trace_id);
 
     try std.testing.expectEqualStrings("job-abc:42", trace_id);
+}
+
+test "putAgentExecutionEnv sets cron subprocess markers" {
+    var env_map = std.process.EnvMap.init(std.testing.allocator);
+    defer env_map.deinit();
+
+    try putAgentExecutionEnv(&env_map, .{
+        .source = "cron_scheduler_agent",
+        .trace_id = "job-abc:42",
+    });
+
+    try std.testing.expectEqualStrings("cron_scheduler_agent", env_map.get(EXECUTION_SOURCE_ENV).?);
+    try std.testing.expectEqualStrings("job-abc:42", env_map.get(EXECUTION_TRACE_ENV).?);
+    try std.testing.expectEqualStrings(SENSORIUM_STATE_SESSION_ONLY, env_map.get(SENSORIUM_STATE_ENV).?);
 }

@@ -1,9 +1,9 @@
 # Cron Observability CLI — Expose the Framework
 
-**Status: COMPLETE AND VALIDATED** (framework landed 2026-04-11 to 2026-04-14; end-to-end scheduler-path validation closed 2026-04-14; `pause_on_fail` repair extension landed 2026-04-14; shell/agent execution classification landed 2026-04-14; `alert_only` shell/agent repair extension landed 2026-04-14)
+**Status: COMPLETE AND VALIDATED** (framework landed 2026-04-11 to 2026-04-14; end-to-end scheduler-path validation closed 2026-04-14; `pause_on_fail` repair extension landed 2026-04-14; shell/agent execution classification landed 2026-04-14; `alert_only` shell/agent repair extension landed 2026-04-14; `retry_once` shell/agent parity landed 2026-04-14; cron agent execution-context injection landed 2026-04-14)
 **Branch:** `feat/cron-subagent`
 **Depends on:** commits `3ff18d8`, `d833a3e`, `4ec6291`, `271e939` (scheduler observability framework)
-**Implementation commits:** `acc9a5b`, `325ec8e`, `979430d`, `bdb7002`, `4d85d57`, `8256b06`, `1ff4c8c`, `a618371`, `b8267e1`, `fcaecd4`, `de2ff27`, `39708ea`, `71de258`, `877091b`
+**Implementation commits:** `acc9a5b`, `325ec8e`, `979430d`, `bdb7002`, `4d85d57`, `8256b06`, `1ff4c8c`, `a618371`, `b8267e1`, `fcaecd4`, `de2ff27`, `39708ea`, `71de258`, `877091b`, `4818066`, `5c4e2e6`, plus the follow-up cron agent execution-context injection commit on 2026-04-14
 
 ## Final State
 
@@ -16,10 +16,12 @@ This plan is no longer just "implemented in code"; it is closed operationally.
 - Scheduled shell and agent runs persist `trace_id` on both success and early exec-error paths.
 - Shell and agent runs now persist classified `RunResult` metadata on ordinary completion as well, including `verified=1` on clean success and `failure_class=timeout|exec_error` on hard failures.
 - DB-direct scheduled shell and agent jobs now honor `repair_policy=alert_only`, recording `repair_action=alert_sent` and sending operator alerts through the same delivery fallback chain used by skills.
+- Shell and agent jobs now honor `repair_policy=retry_once` consistently in both DB-direct scheduler and manual `cron run` paths, with final output/status derived from the retry attempt and `repair_action=retried_ok|retried_failed`.
 - Read-only inspection commands work in the restricted shell path without requiring schema writes.
 - UTF-8 `skill_args` are accepted safely, which removed the CJK breakage in weather/commute jobs.
 - The raw DB worker fallback path now applies `pause_on_fail` correctly even when the cron backend vtable is not initialized, and that path is covered by a gateway regression test.
 - `pause_on_fail` now applies consistently to skill, shell, and agent jobs in both manual and DB-direct scheduler paths because shell/agent runs no longer write `run_result=null`.
+- Cron-launched `nullclaw agent -m ...` subprocesses now receive explicit execution-context env vars (`NULLCLAW_EXECUTION_SOURCE`, `NULLCLAW_EXECUTION_TRACE_ID`, `NULLCLAW_SENSORIUM_STATE=session_only_not_attached`), and the CLI one-shot agent path prepends that context to the message so the model can diagnose why live session sensorium is absent.
 
 Operational rollout completed outside the repo as well:
 
