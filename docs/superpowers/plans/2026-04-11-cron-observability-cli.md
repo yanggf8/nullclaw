@@ -1,9 +1,35 @@
 # Cron Observability CLI — Expose the Framework
 
-**Status: COMPLETE** (Items 1–4 implemented 2026-04-11; Item 5 implemented 2026-04-13)
+**Status: COMPLETE AND VALIDATED** (framework landed 2026-04-11 to 2026-04-14; end-to-end scheduler-path validation closed 2026-04-14)
 **Branch:** `feat/cron-subagent`
 **Depends on:** commits `3ff18d8`, `d833a3e`, `4ec6291`, `271e939` (scheduler observability framework)
-**Implementation commits:** `acc9a5b`, `325ec8e`, `979430d`
+**Implementation commits:** `acc9a5b`, `325ec8e`, `979430d`, `bdb7002`, `4d85d57`, `8256b06`, `1ff4c8c`, `a618371`, `b8267e1`, `fcaecd4`, `de2ff27`
+
+## Final State
+
+This plan is no longer just "implemented in code"; it is closed operationally.
+
+- Scheduler-owned verification and repair are exposed in the CLI and persisted in `cron_jobs`.
+- `cron runs`, `cron degraded`, and `cron run-by-trace` are available for operator inspection.
+- Early failure classification is normalized across skill, shell, and agent jobs as `exec_error`.
+- Scheduled shell and agent runs persist `trace_id` on both success and early exec-error paths.
+- Read-only inspection commands work in the restricted shell path without requiring schema writes.
+- UTF-8 `skill_args` are accepted safely, which removed the CJK breakage in weather/commute jobs.
+
+Operational rollout completed outside the repo as well:
+
+- `news`, `weather`, `commute`, and `doughcon` were migrated to scheduler-owned `skill_contract`.
+- All 23 live cron jobs in those four families now use `verification_mode=skill_contract` and `repair_policy=retry_once`.
+- The live skill copies and the source mirror under `/home/yanggf/a/claw-skills` were kept in sync for the migrated files.
+
+Validation status:
+
+- Real scheduled production runs validated `news` and `doughcon` with `status=ok`, `exit_code=0`, `verified=1`, and populated `trace_id`.
+- Temporary no-delivery scheduler-path jobs validated `weather` and `commute` through the real gateway queue worker, then were removed.
+- Final temporary validation rows:
+  - `weather` → trace `job-de9f9c2c-f41d-426c-8062-157757ac5e29:2296`
+  - `commute` → trace `job-936285ba-fcbc-4ce4-9994-1764f1d975e8:2297`
+- Schedule and job count were confirmed clean after removal of the temporary jobs.
 
 ## Problem
 
@@ -388,3 +414,19 @@ Post-implementation review (commit under review, not yet landed). All three find
 - Regression test proves `dbCompleteJob` persists `exit_code=1`, `failure_class="exec_error"`, `verified=3`, `trace_id`, `manual=1` for the early-failure path.
 
 **Validation:** After gateway restart with commit `1ff4c8c`, the three jobs produced fresh `cron_runs` rows with `status='ok'`, `verified=1`, `trace_id` set (rows 14/15/16 on the live DB). Commit `a618371` ensures the earlier failure mode is now recorded as `failure_class="exec_error"` instead of an unclassified `status='error'` row when it occurs again.
+
+## Deferred follow-ups
+
+### Switch inspection paths to pure read-only
+
+**Status:** Parked. Not blocking. Pick up if/when convenient.
+
+**What:** `cron list` and `cron show` open the cron DB with the same handle mode as the writer paths. Give pure-inspection call sites a `SQLITE_OPEN_READONLY` handle so they cannot accidentally mutate state, even if a future refactor introduces a stray `UPDATE`/`DELETE` on the inspection codepath.
+
+**Why deferred:** Defensive hardening, not a correctness fix. No user-visible symptom, no data at risk today, no blocking dependency. Was flagged during the post-implementation audit of commit `8256b06` and consciously deferred with verdict "land as-is". Recorded here so it is not silently lost.
+
+**Scope when picked up:**
+- Audit `cron list` / `cron show` / any other read-only callers in `src/cron.zig` and `src/cron/db.zig` for shared open helpers.
+- Add an `openCronDbReadOnly(path)` wrapper that passes `SQLITE_OPEN_READONLY` to `sqlite3_open_v2`.
+- Switch the inspection callers; leave writer callers alone.
+- Test: a write attempt through the read-only handle must return `SQLITE_READONLY`.
