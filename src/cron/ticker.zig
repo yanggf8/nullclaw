@@ -26,6 +26,13 @@ pub const CronTicker = struct {
             .shutdown = shutdown,
         };
     }
+
+    /// Delegate to the backend's atomic tick. Returns the number of rows
+    /// inserted into cron_run_queue. Callers decide whether to signal the
+    /// worker condvar; the ticker itself has no knowledge of the worker.
+    pub fn tick(self: *CronTicker, now: i64) !usize {
+        return self.backend.tick(now);
+    }
 };
 
 test "CronTicker can be constructed against MemoryCronBackend" {
@@ -39,4 +46,17 @@ test "CronTicker can be constructed against MemoryCronBackend" {
 
     const ticker = CronTicker.init(be, 1, &shutdown);
     try std.testing.expectEqual(std.time.ns_per_s, ticker.poll_interval_ns);
+}
+
+test "CronTicker.tick forwards to backend and reports count" {
+    const allocator = std.testing.allocator;
+
+    var mem = memory_backend.MemoryCronBackend.init(allocator);
+    defer mem.deinit();
+
+    var shutdown = std.atomic.Value(bool).init(false);
+    var ticker = CronTicker.init(mem.backend(), 1, &shutdown);
+
+    const enqueued = try ticker.tick(std.time.timestamp());
+    try std.testing.expectEqual(@as(usize, 0), enqueued);
 }
