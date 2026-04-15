@@ -32,6 +32,7 @@ pub const NewJobSpec = types.NewJobSpec;
 pub const VerificationMode = types.VerificationMode;
 pub const RepairPolicy = types.RepairPolicy;
 pub const RunResult = types.RunResult;
+pub const Ticker = @import("ticker.zig").CronTicker;
 
 pub const CronBackend = struct {
     ptr: *anyopaque,
