@@ -1917,9 +1917,9 @@ pub fn buildCronChildEnv(
 fn buildManualSkillChildEnv(
     allocator: std.mem.Allocator,
     trace_id: []const u8,
-    timeout_secs: ?u64,
+    timeout_secs: ?u32,
 ) !std.process.EnvMap {
-    const effective_timeout = timeout_secs orelse 120;
+    const effective_timeout: u64 = timeout_secs orelse 120;
     var env_map = try buildCronChildEnv(allocator, .{
         .source = "cron_manual_skill",
         .trace_id = trace_id,

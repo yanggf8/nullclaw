@@ -62,9 +62,9 @@ const EXECUTION_TRACE_ENV = "NULLCLAW_EXECUTION_TRACE_ID";
 const SENSORIUM_STATE_ENV = "NULLCLAW_SENSORIUM_STATE";
 
 const CliExecutionContext = struct {
-    source: ?[]u8 = null,
-    trace_id: ?[]u8 = null,
-    sensorium_state: ?[]u8 = null,
+    source: ?[]const u8 = null,
+    trace_id: ?[]const u8 = null,
+    sensorium_state: ?[]const u8 = null,
 
     fn deinit(self: *CliExecutionContext, allocator: std.mem.Allocator) void {
         if (self.source) |v| allocator.free(v);
