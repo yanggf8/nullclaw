@@ -275,7 +275,7 @@ pub const DbCronBackend = struct {
         // We need delete_after_run to decide the completion path.
         // Load it cheaply from the DB.
         const dar = try dbGetDeleteAfterRun(db, id);
-        try cron.dbCompleteJob(db, id, row_id, now, status, output, dar, null, null, false);
+        try cron.dbCompleteJob(db, id, row_id, now, status, output, dar, null, null, false, null);
     }
 
     fn vtableResetInProgress(ptr: *anyopaque) anyerror!void {

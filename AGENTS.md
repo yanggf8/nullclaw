@@ -310,22 +310,34 @@ Every completed job execution is appended to the `cron_runs` table (created by `
 
 ```sql
 CREATE TABLE IF NOT EXISTS cron_runs (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  job_id      TEXT NOT NULL,
-  started_at  INTEGER NOT NULL DEFAULT 0,
-  finished_at INTEGER NOT NULL DEFAULT 0,
-  status      TEXT NOT NULL DEFAULT 'ok',
-  output      TEXT
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id         TEXT NOT NULL,
+  started_at     INTEGER NOT NULL DEFAULT 0,
+  finished_at    INTEGER NOT NULL DEFAULT 0,
+  status         TEXT NOT NULL DEFAULT 'ok',
+  output         TEXT,
+  exit_code      INTEGER,
+  failure_class  TEXT,
+  repair_action  TEXT,
+  verified       INTEGER NOT NULL DEFAULT 0,
+  trace_id       TEXT,
+  manual         INTEGER NOT NULL DEFAULT 0,
+  source         TEXT
 );
 ```
 
+`source` records the execution path that spawned the run — one of `cron_scheduler_{agent,skill,shell}`, `cron_legacy_scheduler_{agent,skill,shell}`, or `cron_manual_{agent,skill,shell}`. It mirrors the `NULLCLAW_EXECUTION_SOURCE` env var injected into the subprocess and is `NULL` for pre-migration rows (the `manual` column is used as a display fallback in that case).
+
 `dbCompleteJob` INSERTs the row and immediately prunes rows older than 30 days for that job (inline `DELETE`; no separate vacuum job needed).
 
-CLI access:
-- `nullclaw cron runs <id> [--limit N] [--json]` — per-job history (last 50 by default)
+CLI access (all inspection commands open the DB read-only via `openCronDbReadOnlyAtPath`):
+- `nullclaw cron runs <id> [--limit N] [--json]` — per-job history (last 50 by default); shows `src=` and `trace=` columns
+- `nullclaw cron show <id> [--runs N]` — spec + recent runs; displays `(auto-paused)` suffix when the last run recorded `repair_action=paused_job`, plus `fc=`/`ra=` per run
 - `nullclaw cron job-status [--json]` — last known status per job, sorted by recency
 - `nullclaw cron list [--limit N] [--json]` — all jobs as JSON array (stdout)
 - `nullclaw cron schedule [--hours N] [--all] [--today] [--json]` — upcoming fires as JSON array
+- `nullclaw cron run <id>` — manual trigger; prints `[manual run] job='<id>' trace=<trace_id>` on startup for log correlation
+- `nullclaw cron unpause <id>` — alias for `resume`, aligned with the `pause_on_fail` repair policy terminology
 
 `--json` always writes to stdout (not stderr). Human-readable output continues to use `log.info` (stderr).
 

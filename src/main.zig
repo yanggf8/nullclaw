@@ -39,7 +39,7 @@ const Command = enum {
 };
 
 const SERVICE_SUBCOMMANDS = "install|start|stop|restart|status|uninstall";
-const CRON_SUBCOMMANDS = "list|show|status|job-status|schedule|add|add-agent|add-skill|once|once-agent|remove|pause|resume|run|update|runs|degraded|run-by-trace|backup|restore|export-seed|init-seed";
+const CRON_SUBCOMMANDS = "list|show|status|job-status|schedule|add|add-agent|add-skill|once|once-agent|remove|pause|resume|unpause|run|update|runs|degraded|run-by-trace|backup|restore|export-seed|init-seed";
 const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
@@ -1063,6 +1063,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         \\  remove <id>                   Remove a scheduled task
         \\  pause <id>                    Pause a scheduled task (temporary hold)
         \\  resume <id>                   Resume a paused task
+        \\  unpause <id>                  Alias for resume
         \\  show <id> [--json] [--runs N]
         \\                                Show full detail for a single job: spec, next fire, last N runs.
         \\  run <id> [--dry-run]          Run a scheduled task immediately (manual=1 in cron_runs).
@@ -1231,9 +1232,9 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.process.exit(1);
         }
         try yc.cron.cliPauseJob(allocator, sub_args[1]);
-    } else if (std.mem.eql(u8, subcmd, "resume")) {
+    } else if (std.mem.eql(u8, subcmd, "resume") or std.mem.eql(u8, subcmd, "unpause")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw cron resume <id>\n", .{});
+            std.debug.print("Usage: nullclaw cron {s} <id>\n", .{subcmd});
             std.process.exit(1);
         }
         try yc.cron.cliResumeJob(allocator, sub_args[1]);
