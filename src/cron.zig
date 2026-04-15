@@ -1426,6 +1426,7 @@ const EXECUTION_TRACE_ENV = "NULLCLAW_EXECUTION_TRACE_ID";
 const SENSORIUM_STATE_ENV = "NULLCLAW_SENSORIUM_STATE";
 const SENSORIUM_STATE_SESSION_ONLY = "session_only_not_attached";
 const JOB_ID_ENV = "NULLCLAW_JOB_ID";
+const SKILL_TIMEOUT_ENV = "NULLCLAW_SKILL_TIMEOUT";
 
 fn pathAgentExecutableName() []const u8 {
     return if (comptime builtin.os.tag == .windows) "nullclaw.exe" else "nullclaw";
@@ -1910,6 +1911,24 @@ pub fn buildCronChildEnv(
     var env_map = try std.process.getEnvMap(allocator);
     errdefer env_map.deinit();
     try putCronSubprocessEnv(&env_map, exec_ctx);
+    return env_map;
+}
+
+fn buildManualSkillChildEnv(
+    allocator: std.mem.Allocator,
+    trace_id: []const u8,
+    timeout_secs: ?u64,
+) !std.process.EnvMap {
+    const effective_timeout = timeout_secs orelse 120;
+    var env_map = try buildCronChildEnv(allocator, .{
+        .source = "cron_manual_skill",
+        .trace_id = trace_id,
+    });
+    errdefer env_map.deinit();
+
+    var timeout_buf: [32]u8 = undefined;
+    const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{effective_timeout}) catch "120";
+    try env_map.put(SKILL_TIMEOUT_ENV, timeout_str);
     return env_map;
 }
 
@@ -5034,21 +5053,13 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             const skill_cmd = raw_skill_cmd;
             // Clone parent env and inject cron subprocess markers plus the
             // manual-run-only NULLCLAW_SKILL_TIMEOUT budget for delivery.py.
-            var skill_env = buildCronChildEnv(spec_alloc, .{
-                .source = "cron_manual_skill",
-                .trace_id = run_trace_id,
-            }) catch |err| {
+            var skill_env = buildManualSkillChildEnv(spec_alloc, run_trace_id, spec.timeout_secs) catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: env setup failed: {s}\n", .{@errorName(err)}) catch "error: env setup failed\n";
                 stderr_h.writeAll(m) catch {};
                 dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true) catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
             defer skill_env.deinit();
-            {
-                var timeout_buf: [32]u8 = undefined;
-                const tval = std.fmt.bufPrint(&timeout_buf, "{d}", .{skill_timeout}) catch "120";
-                skill_env.put("NULLCLAW_SKILL_TIMEOUT", tval) catch {};
-            }
 
             var skill_child = std.process.Child.init(
                 &.{ platform.getShell(), platform.getShellFlag(), skill_cmd },
@@ -10130,4 +10141,24 @@ test "putCronSubprocessEnv clears trace and job id when trace_id null" {
     try std.testing.expectEqualStrings("cron_scheduler_skill", env_map.get(EXECUTION_SOURCE_ENV).?);
     try std.testing.expect(env_map.get(EXECUTION_TRACE_ENV) == null);
     try std.testing.expect(env_map.get(JOB_ID_ENV) == null);
+}
+
+test "buildManualSkillChildEnv layers manual skill markers and timeout" {
+    // Regression: manual `cron run` skill jobs must keep the same env-layering
+    // semantics as the scheduler worker without spawning a real subprocess.
+    var env_map = try buildManualSkillChildEnv(std.testing.allocator, "job-abc:42", 45);
+    defer env_map.deinit();
+
+    try std.testing.expectEqualStrings("cron_manual_skill", env_map.get(EXECUTION_SOURCE_ENV).?);
+    try std.testing.expectEqualStrings("job-abc:42", env_map.get(EXECUTION_TRACE_ENV).?);
+    try std.testing.expectEqualStrings("job-abc:42", env_map.get(JOB_ID_ENV).?);
+    try std.testing.expectEqualStrings(SENSORIUM_STATE_SESSION_ONLY, env_map.get(SENSORIUM_STATE_ENV).?);
+    try std.testing.expectEqualStrings("45", env_map.get(SKILL_TIMEOUT_ENV).?);
+}
+
+test "buildManualSkillChildEnv defaults timeout to 120 seconds" {
+    var env_map = try buildManualSkillChildEnv(std.testing.allocator, "job-abc:99", null);
+    defer env_map.deinit();
+
+    try std.testing.expectEqualStrings("120", env_map.get(SKILL_TIMEOUT_ENV).?);
 }

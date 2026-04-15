@@ -1,6 +1,6 @@
 # Cron Observability CLI — Expose the Framework
 
-**Status: COMPLETE AND VALIDATED** (framework landed 2026-04-11 to 2026-04-14; end-to-end scheduler-path validation closed 2026-04-14; `pause_on_fail` repair extension landed 2026-04-14; shell/agent execution classification landed 2026-04-14; `alert_only` shell/agent repair extension landed 2026-04-14; `retry_once` shell/agent parity landed 2026-04-14; cron agent execution-context injection landed 2026-04-14)
+**Status: COMPLETE AND VALIDATED** (framework landed 2026-04-11 to 2026-04-14; end-to-end scheduler-path validation closed 2026-04-14; `pause_on_fail` repair extension landed 2026-04-14; shell/agent execution classification landed 2026-04-14; `alert_only` shell/agent repair extension landed 2026-04-14; `retry_once` shell/agent parity landed 2026-04-14; cron agent execution-context injection landed 2026-04-14; manual skill env-layering regression coverage landed 2026-04-15)
 **Branch:** `feat/cron-subagent`
 **Depends on:** commits `3ff18d8`, `d833a3e`, `4ec6291`, `271e939` (scheduler observability framework)
 **Implementation commits:** `acc9a5b`, `325ec8e`, `979430d`, `bdb7002`, `4d85d57`, `8256b06`, `1ff4c8c`, `a618371`, `b8267e1`, `fcaecd4`, `de2ff27`, `39708ea`, `71de258`, `877091b`, `4818066`, `5c4e2e6`, plus the follow-up cron agent execution-context injection commit on 2026-04-14

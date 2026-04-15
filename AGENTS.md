@@ -231,9 +231,11 @@ All cron-spawned subprocesses (`shell`, `skill`, and `agent` job types, across b
 
 Retry children (`retry_once` repair policy) reuse the same env_map as their initial spawn.
 
+Manual `cron run` skill jobs also receive `NULLCLAW_SKILL_TIMEOUT=<seconds>` via `buildManualSkillChildEnv()` so `delivery.py` and similar helpers can honor the per-run timeout budget. When `timeout_secs` is unset on the job, this defaults to `120`.
+
 #### First-class `skill` job type
 
-Set `job_type: "skill"`, `skill_name: "<name>"`, and optionally `skill_args: "<args>"`. The gateway calls `resolveSkillExec()` (or the testable `resolveSkillExecFrom()`) in `src/cron.zig` to read `## Script` from `~/.claude/skills/<name>/SKILL.md`, expand `~/`, and build `python3 <path> [args]`. The subprocess receives the execution-context env vars described above — scripts can read `NULLCLAW_JOB_ID` to embed the trace ID in their output.
+Set `job_type: "skill"`, `skill_name: "<name>"`, and optionally `skill_args: "<args>"`. The gateway calls `resolveSkillExec()` (or the testable `resolveSkillExecFrom()`) in `src/cron.zig` to read `## Script` from `~/.claude/skills/<name>/SKILL.md`, expand `~/`, and build `python3 <path> [args]`. The subprocess receives the execution-context env vars described above — scripts can read `NULLCLAW_JOB_ID` to embed the trace ID in their output, and manual `cron run` executions also receive `NULLCLAW_SKILL_TIMEOUT`.
 
 Both execution paths (DB-direct via `DbCronBackend` and legacy via `CronScheduler`) support skill jobs. The `vtableAdd` in `src/cron/db.zig` heap-dupes all delivery fields (`channel`, `account_id`, `to`, `best_effort`) for ownership consistency.
 
