@@ -3894,6 +3894,15 @@ fn runQueueWorker(state: *GatewayState) void {
                     const resolved_cmd = cron_mod.resolveSkillCommand(arena, spec.command) catch null;
                     defer if (resolved_cmd) |rc| arena.free(rc);
                     const shell_cmd = resolved_cmd orelse spec.command;
+                    var shell_env = cron_mod.buildCronChildEnv(arena, .{
+                        .source = "cron_scheduler_shell",
+                        .trace_id = run_trace_id,
+                    }) catch |err| {
+                        log.err("[{s}] env setup failed: {s}", .{ spec.id, @errorName(err) });
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id);
+                        continue;
+                    };
+                    defer shell_env.deinit();
                     var shell_child = std.process.Child.init(
                         &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), shell_cmd },
                         arena,
@@ -3902,6 +3911,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     shell_child.stdout_behavior = .Pipe;
                     shell_child.stderr_behavior = .Pipe;
                     shell_child.cwd = state.cron_workspace_dir;
+                    shell_child.env_map = &shell_env;
                     shell_child.spawn() catch |err| {
                         log.err("[{s}] exec failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id);
@@ -3953,6 +3963,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         retry_child.stdout_behavior = .Pipe;
                         retry_child.stderr_behavior = .Pipe;
                         retry_child.cwd = state.cron_workspace_dir;
+                        retry_child.env_map = &shell_env;
                         retry_child.spawn() catch |err| {
                             log.err("[{s}] shell retry spawn failed: {s}", .{ spec.id, @errorName(err) });
                             break;
@@ -4126,8 +4137,16 @@ fn runQueueWorker(state: *GatewayState) void {
                         continue;
                     };
                     defer arena.free(raw_skill_cmd);
-                    // Inject per-run trace ID as env var so scripts embed it in output.
-                    const skill_cmd = std.fmt.allocPrint(arena, "NULLCLAW_JOB_ID={s} {s}", .{ run_trace_id, raw_skill_cmd }) catch raw_skill_cmd;
+                    const skill_cmd = raw_skill_cmd;
+                    var skill_env = cron_mod.buildCronChildEnv(arena, .{
+                        .source = "cron_scheduler_skill",
+                        .trace_id = run_trace_id,
+                    }) catch |err| {
+                        log.err("[{s}] skill env setup failed: {s}", .{ spec.id, @errorName(err) });
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id);
+                        continue;
+                    };
+                    defer skill_env.deinit();
                     var skill_child = std.process.Child.init(
                         &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), skill_cmd },
                         arena,
@@ -4136,6 +4155,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     skill_child.stdout_behavior = .Pipe;
                     skill_child.stderr_behavior = .Pipe;
                     skill_child.cwd = state.cron_workspace_dir;
+                    skill_child.env_map = &skill_env;
                     skill_child.spawn() catch |err| {
                         log.err("[{s}] skill exec failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id);
@@ -4202,6 +4222,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         retry_child.stdout_behavior = .Pipe;
                         retry_child.stderr_behavior = .Pipe;
                         retry_child.cwd = state.cron_workspace_dir;
+                        retry_child.env_map = &skill_env;
                         retry_child.spawn() catch |err| {
                             log.err("[{s}] skill retry spawn failed: {s}", .{ spec.id, @errorName(err) });
                             break;
@@ -4341,6 +4362,20 @@ fn runQueueWorker(state: *GatewayState) void {
 
             switch (job_type) {
                 .shell => {
+                    var shell_env = cron_mod.buildCronChildEnv(allocator, .{
+                        .source = "cron_legacy_scheduler_shell",
+                    }) catch |err| {
+                        log.err("job '{s}' env setup failed: {s}", .{ id, @errorName(err) });
+                        state.scheduler_mutex.lock();
+                        if (sched.getMutableJob(id)) |j| {
+                            j.last_run_secs = now;
+                            j.last_status = "error";
+                        }
+                        state.scheduler_mutex.unlock();
+                        _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
+                        continue;
+                    };
+                    defer shell_env.deinit();
                     var shell_child = std.process.Child.init(
                         &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), command },
                         allocator,
@@ -4349,6 +4384,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     shell_child.stdout_behavior = .Pipe;
                     shell_child.stderr_behavior = .Pipe;
                     shell_child.cwd = run_cwd;
+                    shell_child.env_map = &shell_env;
                     shell_child.spawn() catch |err| {
                         log.err("job '{s}' exec failed: {s}", .{ id, @errorName(err) });
                         state.scheduler_mutex.lock();
@@ -4493,8 +4529,22 @@ fn runQueueWorker(state: *GatewayState) void {
                     // Per-run trace ID: job_id:timestamp (unique per execution in legacy path).
                     const legacy_trace_id = std.fmt.allocPrint(allocator, "{s}:{d}", .{ id, now }) catch id;
                     defer if (legacy_trace_id.ptr != id.ptr) allocator.free(legacy_trace_id);
-                    // Inject per-run trace ID as env var so scripts embed it in output.
-                    const skill_cmd = std.fmt.allocPrint(allocator, "NULLCLAW_JOB_ID={s} {s}", .{ legacy_trace_id, raw_skill_cmd }) catch raw_skill_cmd;
+                    const skill_cmd = raw_skill_cmd;
+                    var skill_env = cron_mod.buildCronChildEnv(allocator, .{
+                        .source = "cron_legacy_scheduler_skill",
+                        .trace_id = legacy_trace_id,
+                    }) catch |err| {
+                        log.err("[{s}] skill env setup failed: {s}", .{ id, @errorName(err) });
+                        state.scheduler_mutex.lock();
+                        if (sched.getMutableJob(id)) |j| {
+                            j.last_run_secs = now;
+                            j.last_status = "error";
+                        }
+                        state.scheduler_mutex.unlock();
+                        _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
+                        continue;
+                    };
+                    defer skill_env.deinit();
                     var skill_child = std.process.Child.init(
                         &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), skill_cmd },
                         allocator,
@@ -4503,6 +4553,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     skill_child.stdout_behavior = .Pipe;
                     skill_child.stderr_behavior = .Pipe;
                     skill_child.cwd = run_cwd;
+                    skill_child.env_map = &skill_env;
                     skill_child.spawn() catch |err| {
                         log.err("[{s}] skill exec failed: {s}", .{ id, @errorName(err) });
                         state.scheduler_mutex.lock();

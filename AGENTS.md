@@ -218,11 +218,22 @@ Apply these naming rules consistently:
 |------------|-----------|----------|
 | `shell`    | subprocess via `sh -c <command>` | script self-delivers via `--deliver-to`; set `delivery_mode: none` |
 | `agent`    | inline agent loop | cron delivers stdout; set `delivery_mode: always` + `delivery_channel` + `delivery_to` |
-| `skill`    | `resolveSkillExec` → `python3 <script> [args]` subprocess | script self-delivers; gateway injects `NULLCLAW_JOB_ID` env var |
+| `skill`    | `resolveSkillExec` → `python3 <script> [args]` subprocess | script self-delivers; cron injects execution-context env vars |
+
+#### Cron subprocess execution context
+
+All cron-spawned subprocesses (`shell`, `skill`, and `agent` job types, across both the DB-direct and legacy gateway paths as well as manual `cron run-job`) receive a common set of execution-context environment variables via `cron_mod.buildCronChildEnv()` / `putCronSubprocessEnv()` in `src/cron.zig`:
+
+- `NULLCLAW_EXECUTION_SOURCE` — one of `cron_scheduler_{agent,skill,shell}`, `cron_legacy_scheduler_{agent,skill,shell}`, or `cron_manual_{agent,skill}`. Identifies which code path spawned the subprocess.
+- `NULLCLAW_EXECUTION_TRACE_ID` — `{job_id}:{queue_row_id}` (DB-direct) or `{job_id}:{timestamp}` (legacy). Absent for legacy shell jobs that have no trace context.
+- `NULLCLAW_JOB_ID` — back-compat alias carrying the same value as `NULLCLAW_EXECUTION_TRACE_ID` so existing skill scripts continue to work unchanged.
+- `NULLCLAW_SENSORIUM_STATE=session_only_not_attached` — marker that subprocess state must not persist beyond the run.
+
+Retry children (`retry_once` repair policy) reuse the same env_map as their initial spawn.
 
 #### First-class `skill` job type
 
-Set `job_type: "skill"`, `skill_name: "<name>"`, and optionally `skill_args: "<args>"`. The gateway calls `resolveSkillExec()` (or the testable `resolveSkillExecFrom()`) in `src/cron.zig` to read `## Script` from `~/.claude/skills/<name>/SKILL.md`, expand `~/`, and build `python3 <path> [args]`. The subprocess receives `NULLCLAW_JOB_ID=<job-instance-id>` as an environment variable so scripts can embed the job ID in their output for tracking.
+Set `job_type: "skill"`, `skill_name: "<name>"`, and optionally `skill_args: "<args>"`. The gateway calls `resolveSkillExec()` (or the testable `resolveSkillExecFrom()`) in `src/cron.zig` to read `## Script` from `~/.claude/skills/<name>/SKILL.md`, expand `~/`, and build `python3 <path> [args]`. The subprocess receives the execution-context env vars described above — scripts can read `NULLCLAW_JOB_ID` to embed the trace ID in their output.
 
 Both execution paths (DB-direct via `DbCronBackend` and legacy via `CronScheduler`) support skill jobs. The `vtableAdd` in `src/cron/db.zig` heap-dupes all delivery fields (`channel`, `account_id`, `to`, `best_effort`) for ownership consistency.
 

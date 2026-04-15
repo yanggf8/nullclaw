@@ -1409,10 +1409,13 @@ const AgentRunResult = struct {
     timed_out: bool,
 };
 
-pub const AgentExecutionContext = struct {
+pub const CronSubprocessContext = struct {
     source: []const u8,
     trace_id: ?[]const u8 = null,
 };
+
+/// Back-compat alias for call sites written against the original name.
+pub const AgentExecutionContext = CronSubprocessContext;
 
 const AGENT_MAX_OUTPUT_BYTES: usize = 1_048_576;
 const AGENT_POLL_STEP_NS: u64 = 200 * std.time.ns_per_ms;
@@ -1422,6 +1425,7 @@ const EXECUTION_SOURCE_ENV = "NULLCLAW_EXECUTION_SOURCE";
 const EXECUTION_TRACE_ENV = "NULLCLAW_EXECUTION_TRACE_ID";
 const SENSORIUM_STATE_ENV = "NULLCLAW_SENSORIUM_STATE";
 const SENSORIUM_STATE_SESSION_ONLY = "session_only_not_attached";
+const JOB_ID_ENV = "NULLCLAW_JOB_ID";
 
 fn pathAgentExecutableName() []const u8 {
     return if (comptime builtin.os.tag == .windows) "nullclaw.exe" else "nullclaw";
@@ -1877,14 +1881,36 @@ pub fn runAgentJob(
     return .{ .success = success, .output = output, .exit_code = exit_code, .timed_out = timed_out };
 }
 
-pub fn putAgentExecutionEnv(env_map: *std.process.EnvMap, exec_ctx: AgentExecutionContext) !void {
+/// Apply cron subprocess markers to a cloned env map. Used by agent, skill,
+/// and shell spawn paths so every cron-launched child sees the same context.
+/// Also sets `NULLCLAW_JOB_ID` to the trace id for back-compat with existing
+/// Python skills that read that variable directly.
+pub fn putCronSubprocessEnv(env_map: *std.process.EnvMap, exec_ctx: CronSubprocessContext) !void {
     try env_map.put(EXECUTION_SOURCE_ENV, exec_ctx.source);
     try env_map.put(SENSORIUM_STATE_ENV, SENSORIUM_STATE_SESSION_ONLY);
     if (exec_ctx.trace_id) |trace_id| {
         try env_map.put(EXECUTION_TRACE_ENV, trace_id);
+        try env_map.put(JOB_ID_ENV, trace_id);
     } else {
         env_map.remove(EXECUTION_TRACE_ENV);
+        env_map.remove(JOB_ID_ENV);
     }
+}
+
+/// Back-compat alias for call sites that haven't migrated yet.
+pub const putAgentExecutionEnv = putCronSubprocessEnv;
+
+/// Build a fresh env map seeded from the parent environment with the cron
+/// subprocess markers applied. Caller owns the returned map and must call
+/// `.deinit()` when done.
+pub fn buildCronChildEnv(
+    allocator: std.mem.Allocator,
+    exec_ctx: CronSubprocessContext,
+) !std.process.EnvMap {
+    var env_map = try std.process.getEnvMap(allocator);
+    errdefer env_map.deinit();
+    try putCronSubprocessEnv(&env_map, exec_ctx);
+    return env_map;
 }
 
 const LoadPolicy = enum {
@@ -5005,12 +5031,24 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true) catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
-            // Inject NULLCLAW_JOB_ID and NULLCLAW_SKILL_TIMEOUT so delivery.py can honor the budget.
-            const skill_cmd = std.fmt.allocPrint(
-                spec_alloc,
-                "NULLCLAW_JOB_ID={s} NULLCLAW_SKILL_TIMEOUT={d} {s}",
-                .{ run_trace_id, skill_timeout, raw_skill_cmd },
-            ) catch raw_skill_cmd;
+            const skill_cmd = raw_skill_cmd;
+            // Clone parent env and inject cron subprocess markers plus the
+            // manual-run-only NULLCLAW_SKILL_TIMEOUT budget for delivery.py.
+            var skill_env = buildCronChildEnv(spec_alloc, .{
+                .source = "cron_manual_skill",
+                .trace_id = run_trace_id,
+            }) catch |err| {
+                const m = std.fmt.bufPrint(&msg_buf, "error: env setup failed: {s}\n", .{@errorName(err)}) catch "error: env setup failed\n";
+                stderr_h.writeAll(m) catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true) catch {};
+                std.process.exit(CronRunExit.internal_error);
+            };
+            defer skill_env.deinit();
+            {
+                var timeout_buf: [32]u8 = undefined;
+                const tval = std.fmt.bufPrint(&timeout_buf, "{d}", .{skill_timeout}) catch "120";
+                skill_env.put("NULLCLAW_SKILL_TIMEOUT", tval) catch {};
+            }
 
             var skill_child = std.process.Child.init(
                 &.{ platform.getShell(), platform.getShellFlag(), skill_cmd },
@@ -5020,6 +5058,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             skill_child.stdout_behavior = .Pipe;
             skill_child.stderr_behavior = .Pipe;
             skill_child.cwd = run_cwd;
+            skill_child.env_map = &skill_env;
             skill_child.spawn() catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: skill spawn failed: {s}\n", .{@errorName(err)}) catch "error: skill spawn failed\n";
                 stderr_h.writeAll(m) catch {};
@@ -5063,6 +5102,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 retry_child.stdout_behavior = .Pipe;
                 retry_child.stderr_behavior = .Pipe;
                 retry_child.cwd = run_cwd;
+                retry_child.env_map = &skill_env;
                 if (retry_child.spawn()) |_| {
                     const retry_start_ns = std.time.nanoTimestamp();
                     const retry_timed_out = collectChildOutputWithTimeout(
@@ -10060,16 +10100,34 @@ test "makeRunTraceId formats job id and run id" {
     try std.testing.expectEqualStrings("job-abc:42", trace_id);
 }
 
-test "putAgentExecutionEnv sets cron subprocess markers" {
+test "putCronSubprocessEnv sets cron subprocess markers" {
     var env_map = std.process.EnvMap.init(std.testing.allocator);
     defer env_map.deinit();
 
-    try putAgentExecutionEnv(&env_map, .{
+    try putCronSubprocessEnv(&env_map, .{
         .source = "cron_scheduler_agent",
         .trace_id = "job-abc:42",
     });
 
     try std.testing.expectEqualStrings("cron_scheduler_agent", env_map.get(EXECUTION_SOURCE_ENV).?);
     try std.testing.expectEqualStrings("job-abc:42", env_map.get(EXECUTION_TRACE_ENV).?);
+    try std.testing.expectEqualStrings("job-abc:42", env_map.get(JOB_ID_ENV).?);
     try std.testing.expectEqualStrings(SENSORIUM_STATE_SESSION_ONLY, env_map.get(SENSORIUM_STATE_ENV).?);
+}
+
+test "putCronSubprocessEnv clears trace and job id when trace_id null" {
+    var env_map = std.process.EnvMap.init(std.testing.allocator);
+    defer env_map.deinit();
+
+    try env_map.put(EXECUTION_TRACE_ENV, "stale-trace");
+    try env_map.put(JOB_ID_ENV, "stale-job");
+
+    try putCronSubprocessEnv(&env_map, .{
+        .source = "cron_scheduler_skill",
+        .trace_id = null,
+    });
+
+    try std.testing.expectEqualStrings("cron_scheduler_skill", env_map.get(EXECUTION_SOURCE_ENV).?);
+    try std.testing.expect(env_map.get(EXECUTION_TRACE_ENV) == null);
+    try std.testing.expect(env_map.get(JOB_ID_ENV) == null);
 }
