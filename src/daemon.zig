@@ -565,33 +565,48 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     state.markRunning("scheduler");
     health.markComponentOk("scheduler");
 
-    // Emit a heartbeat log every ~5 minutes so a silent scheduler is detectable.
-    const heartbeat_ticks: u64 = @max(1, 300 / @max(poll_secs, 1));
-    var tick_count: u64 = 0;
+    // Heartbeat logging now lives inside CronTicker.run for the DB-direct
+    // path. The legacy in-memory path below emits a heartbeat via its own
+    // reload/snapshot cadence — no daemon-level counter needed.
 
     while (!isShutdownRequested()) {
         const now = std.time.timestamp();
 
-        // DB-direct path: no in-memory scheduler needed — tick atomically in SQLite.
-        // Do NOT hold scheduler_mutex here; the DB backend uses its own connection.
+        // DB-direct path: delegate the tick loop to CronTicker on its own
+        // thread. hasDbScheduler() may return false at the first few poll
+        // iterations during gateway startup; once it flips to true we spawn
+        // the ticker once and wait here until shutdown. Phase 4 removes this
+        // wrapper loop entirely — until then it preserves the legacy
+        // schedulerThread shape for the in-memory fallback path.
         if (gateway_mod.hasDbScheduler()) {
-            const n = gateway_mod.tickDbScheduler(now);
-            if (n > 0) {
-                log.info("scheduler: enqueued {d} job(s) via DbCronBackend", .{n});
+            const cron_ticker_mod = @import("cron/ticker.zig");
+            const backend_opt = gateway_mod.sharedDbBackend();
+            if (backend_opt) |backend| {
+                var ticker = cron_ticker_mod.CronTicker.init(backend, poll_secs, &shutdown_requested);
+
+                const ticker_thread = std.Thread.spawn(
+                    .{ .stack_size = thread_stacks.DAEMON_SERVICE_STACK_SIZE },
+                    cron_ticker_mod.CronTicker.run,
+                    .{&ticker},
+                ) catch |err| {
+                    log.err("failed to spawn CronTicker thread: {s}", .{@errorName(err)});
+                    return;
+                };
+
                 state.markRunning("scheduler");
                 health.markComponentOk("scheduler");
-            } else {
-                tick_count += 1;
-                if (tick_count >= heartbeat_ticks) {
-                    tick_count = 0;
-                    log.info("scheduler: alive, 0 jobs due (DbCronBackend)", .{});
+                log.info("scheduler: CronTicker thread running (DbCronBackend)", .{});
+
+                while (!isShutdownRequested()) {
+                    std.Thread.sleep(std.time.ns_per_s);
                 }
+
+                ticker_thread.join();
+                return;
             }
-            var slept2: u64 = 0;
-            while (slept2 < poll_secs and !isShutdownRequested()) : (slept2 += 1) {
-                std.Thread.sleep(std.time.ns_per_s);
-            }
-            continue;
+            // sharedDbBackend() returned null despite hasDbScheduler() true —
+            // race during gateway teardown. Fall through and sleep one poll
+            // cycle, then the outer while will re-evaluate.
         }
 
         // Legacy in-memory path: hold scheduler_mutex only for the in-memory

@@ -6721,6 +6721,20 @@ pub fn hasDbScheduler() bool {
     return gs.cron_db_backend != null;
 }
 
+/// Returns the live DbCronBackend vtable value used by the gateway for the
+/// DB-direct scheduler path, or null if the gateway has not yet initialized
+/// the backend. Safe to call from any thread — takes g_state_mutex for the
+/// snapshot, then releases before returning. The fat pointer's inner *ptr
+/// aliases gateway state and is only valid while the gateway is running;
+/// callers (daemon CronTicker) must not outlive the gateway.
+pub fn sharedDbBackend() ?cron_backend_mod.CronBackend {
+    g_state_mutex.lock();
+    defer g_state_mutex.unlock();
+    const gs = g_state_ptr orelse return null;
+    if (gs.cron_db_backend) |*be| return be.backend();
+    return null;
+}
+
 /// Wake the run queue worker without pushing to the in-memory ArrayList.
 /// Used by the DB-direct scheduler path: jobs are already in cron_run_queue,
 /// we just need the worker to wake up and drain the table.
