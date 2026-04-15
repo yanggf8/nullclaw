@@ -166,7 +166,7 @@ pub const MemoryCronBackend = struct {
             .timeout_secs = patch.timeout_secs,
             .next_run_secs = patch.next_run_secs,
             .tz_offset_s = patch.tz_offset_s,
-            .session_target = patch.session_target,
+            .session_target = if (patch.session_target) |st| @as(cron.SessionTarget, @enumFromInt(@intFromEnum(st))) else null,
         };
         return self.sched.updateJob(self.allocator, id, legacy_patch);
     }
