@@ -62,6 +62,7 @@ Focus on:
 - [External Channel Plugins](./external-channels.md)
 - [Configuration](./configuration.md)
 - [Usage and Operations](./usage.md)
+- [Cron Operations](./cron.md)
 - [Architecture](./architecture.md)
 
 ### 4. I want to contribute code or docs
@@ -80,6 +81,7 @@ QV:- [Beginner's Guide](./beginners-guide.md)  ← start here if you are new to 
 - [Termux Guide](./termux.md)
 - [Configuration](./configuration.md)
 - [Usage and Operations](./usage.md)
+- [Cron Operations](./cron.md)
 - [Architecture](./architecture.md)
 - [Security](./security.md)
 - [Gateway API](./gateway-api.md)
@@ -119,11 +121,13 @@ If you are not installing via Homebrew, start with [Installation](./installation
 - Follow [Installation](./installation.md) for setup from Homebrew, container, or source
 - Continue to [Configuration](./configuration.md) to wire providers, memory, channels, and gateway settings
 - Use [Usage and Operations](./usage.md) once you want to run NullClaw day to day
+- Use [Cron Operations](./cron.md) when you are adding, troubleshooting, backing up, or restoring scheduled jobs
 
 ## Related Pages
 
 - [Termux Guide](./termux.md)
 - [Commands](./commands.md)
+- [Cron Operations](./cron.md)
 - [Development](./development.md)
 - [Architecture](./architecture.md)
 - [Gateway API](./gateway-api.md)
