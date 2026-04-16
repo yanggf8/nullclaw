@@ -1083,7 +1083,8 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         \\  backup                        Backup cron.db to ~/.nullclaw/backup/
         \\  restore [file]                Restore cron.db from latest backup or specified file
         \\  export-seed                   Export enabled jobs to ~/.nullclaw/cron-seed.json
-        \\  init-seed                     Initialize DB from ~/.nullclaw/cron-seed.json (DESTRUCTIVE: requires 3x confirmation)
+        \\  init-seed [--rebuild]         Initialize an empty DB from ~/.nullclaw/cron-seed.json
+        \\                                --rebuild deliberately wipes and rebuilds a populated DB
         \\
     , .{CRON_SUBCOMMANDS});
 
@@ -1415,7 +1416,17 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     } else if (std.mem.eql(u8, subcmd, "export-seed")) {
         try yc.cron.cliExportSeed(allocator);
     } else if (std.mem.eql(u8, subcmd, "init-seed")) {
-        try yc.cron.cliInitSeed(allocator);
+        var rebuild = false;
+        var i: usize = 1;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--rebuild")) {
+                rebuild = true;
+            } else {
+                std.debug.print("Usage: nullclaw cron init-seed [--rebuild]\n", .{});
+                return error.InvalidCronArgs;
+            }
+        }
+        try yc.cron.cliInitSeed(allocator, rebuild);
     } else {
         std.debug.print("Unknown cron command: {s}\n", .{subcmd});
         std.process.exit(1);

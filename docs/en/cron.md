@@ -21,7 +21,7 @@ Backups use the live DB. `nullclaw cron backup` writes a timestamped backup file
 
 `~/.nullclaw/cron-seed.json` is a bootstrap artifact for first install only. After a claw is running, do not use seed reloads for routine changes.
 
-`nullclaw cron init-seed` is destructive bootstrap tooling for new installs. It is not the normal way to update jobs on a running claw.
+`nullclaw cron init-seed` is bootstrap tooling for new installs with an empty cron DB. On a populated DB it refuses to run unless you pass `--rebuild`, which deliberately wipes existing jobs and run history before loading the seed. It is not the normal way to update jobs on a running claw.
 
 ## Job Types
 

@@ -6291,15 +6291,70 @@ pub fn cliExportSeed(allocator: std.mem.Allocator) !void {
     log.info("Exported {d} jobs to {s}", .{ count, seed_path });
 }
 
-/// CLI: load jobs from ~/.nullclaw/cron-seed.json into DB (DB-direct, no gateway).
-/// Initialize cron DB from seed file. DESTRUCTIVE: clears all existing jobs and run queue.
-/// Use only for fresh system setup. For operational changes, use update/remove/add-skill.
-/// For recovery, use `cron restore`.
-pub fn cliInitSeed(allocator: std.mem.Allocator) !void {
-    const home = try platform.getHomeDir(allocator);
-    defer allocator.free(home);
-    const seed_path = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron-seed.json" });
-    defer allocator.free(seed_path);
+const InitSeedConfirmReader = *const fn (ctx: ?*anyopaque, prompt_index: u8) anyerror!bool;
+
+fn stdinInitSeedConfirm(_: ?*anyopaque, _: u8) !bool {
+    const stdin = std.fs.File.stdin();
+    var buf: [64]u8 = undefined;
+    const n = stdin.read(&buf) catch 0;
+    const input = std.mem.trimRight(u8, buf[0..n], "\r\n ");
+    return std.mem.eql(u8, input, "yes");
+}
+
+fn confirmInitSeed(seed_path: []const u8, existing_count: usize, rebuild: bool, confirm_ctx: ?*anyopaque, confirm_reader: InitSeedConfirmReader) !bool {
+    if (existing_count > 0 and !rebuild) {
+        std.debug.print(
+            "cron DB already has {d} job(s). init-seed is for new installs only.\n\n" ++
+                "For routine changes:    nullclaw cron add|update|remove\n" ++
+                "For disaster recovery:  nullclaw cron restore [<file>]\n\n" ++
+                "To deliberately wipe and rebuild from seed, re-run with --rebuild.\n",
+            .{existing_count},
+        );
+        return error.CronInitSeedRequiresRebuild;
+    }
+
+    const required_confirms: u8 = if (existing_count > 0) 3 else 1;
+    if (existing_count > 0) {
+        std.debug.print(
+            "WARNING: Rebuilding from seed will DELETE all existing jobs and their run history.\n" ++
+                "Type 'yes' to confirm: ",
+            .{},
+        );
+    } else {
+        std.debug.print(
+            "New install detected: cron DB is empty. Initialize from {s}? Type 'yes' to confirm: ",
+            .{seed_path},
+        );
+    }
+
+    var confirms: u8 = 0;
+    while (confirms < required_confirms) {
+        if (!try confirm_reader(confirm_ctx, confirms + 1)) {
+            log.info("Aborted.", .{});
+            return false;
+        }
+        confirms += 1;
+        if (confirms < required_confirms) {
+            std.debug.print("Confirm again ({d}/3): ", .{confirms + 1});
+        }
+    }
+    return true;
+}
+
+fn cliInitSeedAtPath(
+    allocator: std.mem.Allocator,
+    seed_path: []const u8,
+    db_path_z: [:0]const u8,
+    rebuild: bool,
+    confirm_ctx: ?*anyopaque,
+    confirm_reader: InitSeedConfirmReader,
+) !void {
+    const db = try openCronDbAtPath(db_path_z);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    const existing_count = dbCountJobs(db);
+    if (!try confirmInitSeed(seed_path, existing_count, rebuild, confirm_ctx, confirm_reader)) return;
 
     const content = std.fs.cwd().readFileAlloc(allocator, seed_path, 1024 * 1024) catch |err| {
         log.err("Cannot read {s}: {s}", .{ seed_path, @errorName(err) });
@@ -6318,55 +6373,21 @@ pub fn cliInitSeed(allocator: std.mem.Allocator) !void {
         return error.InvalidSeedFormat;
     }
 
-    const db = try openCronDb(allocator);
-    defer closeCronDb(db);
-    try ensureCronTable(db);
-
-    // Check if DB already has jobs — warn and require confirmation.
-    const existing_count = blk: {
-        var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM cron_jobs", -1, &stmt, null) != c.SQLITE_OK) break :blk @as(i64, 0);
-        defer _ = c.sqlite3_finalize(stmt);
-        if (c.sqlite3_step(stmt) == c.SQLITE_ROW) break :blk c.sqlite3_column_int64(stmt, 0);
-        break :blk @as(i64, 0);
-    };
-
-    if (existing_count > 0) {
-        std.debug.print(
-            "WARNING: cron DB has {d} existing job(s). init-seed will DELETE ALL of them.\n" ++
-                "This is for fresh system setup only. For recovery, use 'cron restore'.\n" ++
-                "Type 'yes' to confirm: ",
-            .{existing_count},
-        );
-    } else {
-        std.debug.print(
-            "init-seed will initialize the cron DB from {s}.\n" ++
-                "Type 'yes' to confirm: ",
-            .{seed_path},
-        );
+    if (c.sqlite3_exec(db, "BEGIN IMMEDIATE", null, null, null) != c.SQLITE_OK)
+        return error.TransactionBeginFailed;
+    var tx_open = true;
+    errdefer {
+        if (tx_open) _ = c.sqlite3_exec(db, "ROLLBACK", null, null, null);
     }
 
-    // Require 3 consecutive "yes" confirmations to prevent accidental execution.
-    var confirms: u8 = 0;
-    while (confirms < 3) {
-        const stdin = std.fs.File.stdin();
-        var buf: [64]u8 = undefined;
-        const n = stdin.read(&buf) catch 0;
-        const input = std.mem.trimRight(u8, buf[0..n], "\r\n ");
-        if (!std.mem.eql(u8, input, "yes")) {
-            log.info("Aborted.", .{});
-            return;
-        }
-        confirms += 1;
-        if (confirms < 3) {
-            std.debug.print("Confirm again ({d}/3): ", .{confirms + 1});
-        }
-    }
-
-    // DESTRUCTIVE: init-seed replaces ALL jobs. Use only for fresh setup.
-    log.warn("init-seed: WIPING all existing jobs and run queue", .{});
-    _ = c.sqlite3_exec(db, "DELETE FROM cron_jobs", null, null, null);
-    _ = c.sqlite3_exec(db, "DELETE FROM cron_run_queue", null, null, null);
+    // DESTRUCTIVE: init-seed replaces ALL jobs. Use only for fresh setup or explicit rebuild.
+    log.warn("init-seed: WIPING all existing jobs, run queue, and run history", .{});
+    if (c.sqlite3_exec(db, "DELETE FROM cron_jobs", null, null, null) != c.SQLITE_OK)
+        return error.DeleteFailed;
+    if (c.sqlite3_exec(db, "DELETE FROM cron_run_queue", null, null, null) != c.SQLITE_OK)
+        return error.DeleteFailed;
+    if (c.sqlite3_exec(db, "DELETE FROM cron_runs", null, null, null) != c.SQLITE_OK)
+        return error.DeleteFailed;
 
     var count: usize = 0;
     for (parsed.value.array.items) |item| {
@@ -6447,7 +6468,25 @@ pub fn cliInitSeed(allocator: std.mem.Allocator) !void {
         _ = dbSaveJob(db, job) catch continue;
         count += 1;
     }
+    if (c.sqlite3_exec(db, "COMMIT", null, null, null) != c.SQLITE_OK)
+        return error.TransactionCommitFailed;
+    tx_open = false;
     log.info("Loaded {d} jobs from {s}", .{ count, seed_path });
+}
+
+/// CLI: load jobs from ~/.nullclaw/cron-seed.json into DB (DB-direct, no gateway).
+/// Initialize cron DB from seed file. DESTRUCTIVE with --rebuild: clears jobs, run queue, and run history.
+/// Use only for fresh system setup. For operational changes, use add/update/remove/pause/resume.
+/// For recovery, use `cron restore`.
+pub fn cliInitSeed(allocator: std.mem.Allocator, rebuild: bool) !void {
+    const home = try platform.getHomeDir(allocator);
+    defer allocator.free(home);
+    const seed_path = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron-seed.json" });
+    defer allocator.free(seed_path);
+
+    const db_path_z = try getCronDbPathZ(allocator);
+    defer allocator.free(db_path_z);
+    try cliInitSeedAtPath(allocator, seed_path, db_path_z, rebuild, null, stdinInitSeedConfirm);
 }
 
 fn jsonStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -9302,7 +9341,146 @@ fn makeIsolatedTestScheduler() !IsolatedTestScheduler {
     return .{ .scheduler = sched, .tmp = tmp, .db_path_buf = db_path };
 }
 
+const FakeInitSeedConfirms = struct {
+    answers: []const bool,
+    index: usize = 0,
+};
+
+fn fakeInitSeedConfirm(ctx: ?*anyopaque, _: u8) !bool {
+    const fake: *FakeInitSeedConfirms = @ptrCast(@alignCast(ctx.?));
+    if (fake.index >= fake.answers.len) return false;
+    const answer = fake.answers[fake.index];
+    fake.index += 1;
+    return answer;
+}
+
+fn writeInitSeedFixture(allocator: std.mem.Allocator, dir: []const u8) ![]const u8 {
+    const seed_path = try std.fs.path.join(allocator, &.{ dir, "cron-seed.json" });
+    errdefer allocator.free(seed_path);
+    const file = try std.fs.createFileAbsolute(seed_path, .{});
+    defer file.close();
+    try file.writeAll(
+        \\[{"expression":"*/5 * * * *","job_type":"shell","command":"echo seeded"}]
+    );
+    return seed_path;
+}
+
+fn seedExistingInitSeedRows(db_path_z: [:0]const u8) !void {
+    const db = try openCronDbAtPath(db_path_z);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+    if (c.sqlite3_exec(db, "INSERT INTO cron_jobs(id, expression, command, next_run_secs, enabled, delivery_mode) VALUES('existing', '* * * * *', 'echo old', 1, 1, 'none')", null, null, null) != c.SQLITE_OK)
+        return error.InsertFailed;
+    if (c.sqlite3_exec(db, "INSERT INTO cron_runs(job_id, started_at, finished_at, status) VALUES('existing', 1, 2, 'ok')", null, null, null) != c.SQLITE_OK)
+        return error.InsertFailed;
+}
+
+fn countInitSeedRuns(db_path_z: [:0]const u8) !usize {
+    const db = try openCronDbAtPath(db_path_z);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM cron_runs", -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    const n = c.sqlite3_column_int64(stmt, 0);
+    return if (n < 0) 0 else @intCast(n);
+}
+
+fn countInitSeedJobs(db_path_z: [:0]const u8) !usize {
+    const db = try openCronDbAtPath(db_path_z);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+    return dbCountJobs(db);
+}
+
+fn initSeedJobExists(db_path_z: [:0]const u8, id: []const u8) !bool {
+    const db = try openCronDbAtPath(db_path_z);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db, "SELECT 1 FROM cron_jobs WHERE id=?1", -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
 // ── Regression tests for concurrency bugs fixed in this session ──
+
+test "init-seed refuses on populated DB without rebuild" {
+    // Regression: init-seed must remain a bootstrap path and refuse to wipe a live DB unless --rebuild is explicit.
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+
+    const seed_dir = std.fs.path.dirname(iso.db_path_buf).?;
+    const seed_path = try writeInitSeedFixture(std.testing.allocator, seed_dir);
+    defer std.testing.allocator.free(seed_path);
+    try seedExistingInitSeedRows(iso.db_path_buf);
+
+    const answers = [_]bool{ true, true, true };
+    var confirms = FakeInitSeedConfirms{ .answers = &answers };
+    try std.testing.expectError(
+        error.CronInitSeedRequiresRebuild,
+        cliInitSeedAtPath(std.testing.allocator, seed_path, iso.db_path_buf, false, &confirms, fakeInitSeedConfirm),
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), confirms.index);
+    try std.testing.expectEqual(@as(usize, 1), try countInitSeedJobs(iso.db_path_buf));
+    try std.testing.expectEqual(@as(usize, 1), try countInitSeedRuns(iso.db_path_buf));
+    try std.testing.expect(try initSeedJobExists(iso.db_path_buf, "existing"));
+}
+
+test "init-seed with rebuild on populated DB respects three confirmations" {
+    // Regression: --rebuild keeps the old 3x yes destructive confirmation before wiping jobs.
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+
+    const seed_dir = std.fs.path.dirname(iso.db_path_buf).?;
+    const seed_path = try writeInitSeedFixture(std.testing.allocator, seed_dir);
+    defer std.testing.allocator.free(seed_path);
+    try seedExistingInitSeedRows(iso.db_path_buf);
+
+    const short_answers = [_]bool{ true, true };
+    var short_confirms = FakeInitSeedConfirms{ .answers = &short_answers };
+    try cliInitSeedAtPath(std.testing.allocator, seed_path, iso.db_path_buf, true, &short_confirms, fakeInitSeedConfirm);
+    try std.testing.expectEqual(@as(usize, 2), short_confirms.index);
+    try std.testing.expectEqual(@as(usize, 1), try countInitSeedJobs(iso.db_path_buf));
+    try std.testing.expectEqual(@as(usize, 1), try countInitSeedRuns(iso.db_path_buf));
+    try std.testing.expect(try initSeedJobExists(iso.db_path_buf, "existing"));
+
+    const answers = [_]bool{ true, true, true };
+    var confirms = FakeInitSeedConfirms{ .answers = &answers };
+    try cliInitSeedAtPath(std.testing.allocator, seed_path, iso.db_path_buf, true, &confirms, fakeInitSeedConfirm);
+    try std.testing.expectEqual(@as(usize, 3), confirms.index);
+    try std.testing.expectEqual(@as(usize, 1), try countInitSeedJobs(iso.db_path_buf));
+    try std.testing.expectEqual(@as(usize, 0), try countInitSeedRuns(iso.db_path_buf));
+    try std.testing.expect(!try initSeedJobExists(iso.db_path_buf, "existing"));
+}
+
+test "init-seed on empty DB requires single confirmation" {
+    // Regression: empty new-install DBs should not require the destructive 3x confirmation ritual.
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+
+    const seed_dir = std.fs.path.dirname(iso.db_path_buf).?;
+    const seed_path = try writeInitSeedFixture(std.testing.allocator, seed_dir);
+    defer std.testing.allocator.free(seed_path);
+
+    const answers = [_]bool{true};
+    var confirms = FakeInitSeedConfirms{ .answers = &answers };
+    try cliInitSeedAtPath(std.testing.allocator, seed_path, iso.db_path_buf, false, &confirms, fakeInitSeedConfirm);
+
+    try std.testing.expectEqual(@as(usize, 1), confirms.index);
+    try std.testing.expectEqual(@as(usize, 1), try countInitSeedJobs(iso.db_path_buf));
+}
 
 test "default-store isolation: two schedulers on separate DBs do not share jobs" {
     // Regression for the class of test failures where loadJobsStrict hit the

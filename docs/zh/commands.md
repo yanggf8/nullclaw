@@ -107,7 +107,7 @@
 | `nullclaw cron backup` | 將所有任務匯出為帶時間戳記的 seed 檔案 |
 | `nullclaw cron restore [<file>]` | 從 seed 檔案還原任務 |
 | `nullclaw cron export-seed` | 以可攜式 JSON 格式列印任務 |
-| `nullclaw cron init-seed` | 將 seed 檔案載入全新 DB（僅用於新安裝） |
+| `nullclaw cron init-seed [--rebuild]` | 將 seed 檔案載入空的 DB，供全新安裝使用；已有任務時會拒絕執行，除非傳入 `--rebuild` |
 
 **驗證與修復策略**（`--verify` / `--repair`）:
 

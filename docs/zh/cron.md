@@ -21,7 +21,7 @@ nullclaw cron run <id>
 
 `~/.nullclaw/cron-seed.json` 只是在首次安裝時使用的 bootstrap artifact。claw 已經開始執行後，不要用 seed reload 來做日常變更。
 
-`nullclaw cron init-seed` 是破壞性的首次安裝 bootstrap 工具。它不是更新既有任務的正常方式。
+`nullclaw cron init-seed` 是給空 cron DB 使用的首次安裝 bootstrap 工具。若 DB 已有任務，它會拒絕執行；只有傳入 `--rebuild` 時，才會刻意清除既有任務與執行歷史後載入 seed。它不是更新既有任務的正常方式。
 
 ## 任務類型
 

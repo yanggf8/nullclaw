@@ -121,7 +121,7 @@ Notes:
 | `nullclaw cron backup` | Export all jobs to a timestamped seed file |
 | `nullclaw cron restore [<file>]` | Restore jobs from a seed file |
 | `nullclaw cron export-seed` | Print jobs as a portable seed JSON |
-| `nullclaw cron init-seed` | Load seed file into a fresh DB (new installs only) |
+| `nullclaw cron init-seed [--rebuild]` | Load seed file into an empty DB for a new install. Refuses a populated DB unless `--rebuild` is passed |
 
 **Verification and repair policies** (`--verify` / `--repair`):
 
