@@ -1,12 +1,96 @@
 # Cron-as-Subagent: Standalone Daemon with Bus-Driven Execution
 
-**Date**: 2026-03-27
-**Status**: Draft v6
+**Date**: 2026-04-16
+**Status**: Draft v7
 **Scope**: Decouple cron scheduling and execution from the gateway. Cron jobs execute as spawned sub-agent threads, using the bus outbound queue for delivery only.
 
 **Changelog**:
+- v7 (2026-04-16): Reconcile with observability framework that landed 2026-04-11 to 2026-04-15. Vtable `complete()` signature currently does NOT carry `RunResult`/`trace_id`; the observability-rich write path lives in the free function `dbCompleteJob` in `src/cron.zig`. Phase 2 must widen the vtable (or add a `completeWithResult` method) before the job thread can call it without regressing observability. Fix `DequeueResult` ownership note: the struct does not carry an arena — `CronBackend.dequeue(allocator)` writes into the caller-supplied allocator, so each worker-side dispatch creates a per-job arena before `dequeue` and transfers it to the `JobContext`. Scope the minimum viable channel-registry init path as an open question (not punt). Record test-migration plan for legacy `schedulerThread` tests in `src/daemon.zig`. Flag RSS budget (~12–14 MiB) as needing explicit sign-off vs the repo-wide ~1 MiB principle in `CLAUDE.md`.
 - v6 (2026-03-27): Fix CompletionFn signature, add mutual exclusion protocol, fix arena ownership, fix ticker/worker mutex interaction, address one-shot race, add graceful shutdown, fix SubagentManager comparison, add channel registry for standalone daemon, expand Phase 4 dead code list, add daemon health/observability.
 - v5 (2026-03-26): Fix cross-process wakeup, lease TOCTOU, RSS target.
+
+---
+
+## v7 Reconciliation Notes (Read First)
+
+These items reflect the codebase as of 2026-04-16 on branch `feat/cron-subagent`. They override any conflicting text later in the document.
+
+### R1. Vtable `complete()` vs observability-rich write path
+
+Current `CronBackend.VTable.complete` (`src/cron/root.zig:85`) takes 7 args — exactly what this spec describes elsewhere:
+
+```zig
+complete: *const fn (
+    ptr: *anyopaque,
+    id: []const u8,
+    row_id: i64,
+    now: i64,
+    status: []const u8,
+    output: ?[]const u8,
+    delivered: bool,
+) anyerror!void,
+```
+
+However, the observability framework that landed in `feat/cron-subagent` (commits `3ff18d8`, `d833a3e`, `acc9a5b`, `4818066`, `5c4e2e6`) persists **much more** than status+output+delivered: `RunResult` (failure_class, verified, exit_code, duration_ms), `trace_id`, `repair_action`, `source`, `manual`. That write path is **not** on the vtable — it is the free function `dbCompleteJob` in `src/cron.zig` (referenced from `src/cron.zig:5045`, `:5268`, `:5287`, `:5336`, etc.).
+
+**Implication for Phase 2**: If the job thread calls `backend.complete(...)` as written in this spec, it regresses every observability column. Before Phase 2 can start, we must either:
+
+- **Option A (preferred)**: Add a new vtable method `completeWithResult` that takes `RunResult`, `trace_id`, `manual`, and `source`, implemented in `db.zig` by delegating to (or replacing) `dbCompleteJob`. Keep the 7-arg `complete` as a thin wrapper for callers that don't care. Update `memory.zig` accordingly.
+- **Option B**: Extend the existing `complete` with an additional `run_result: ?RunResult`, `trace_id: ?[]const u8`, `manual: bool`, `source: []const u8` tail and update all callers.
+
+Option A is less invasive and keeps the existing 7-arg signature valid for any call sites that only need status/output. Implementation of Option A is a prerequisite for Phase 2 and belongs in a small preparatory step.
+
+### R2. `DequeueResult` does not own an arena
+
+`src/cron/types.zig:253`:
+
+```zig
+pub const DequeueResult = struct {
+    queue_row_id: i64,
+    spec: CronJobSpec,
+};
+```
+
+The vtable signature is `dequeue(ptr, allocator) !?DequeueResult` — strings are written into the **caller-supplied** allocator, and the caller frees them. There is no arena embedded in `DequeueResult`.
+
+**Corrected ownership model for Phase 2**:
+
+1. `CronWorker.drainQueue()` creates a fresh `std.heap.ArenaAllocator` from the long-lived daemon GPA **before** calling `dequeue`.
+2. It calls `backend.dequeue(arena.allocator())`. If null, deinit the arena and break.
+3. On success, it builds a `JobContext` that **owns** the arena (`arena: std.heap.ArenaAllocator`, passed by value).
+4. The job thread calls `defer ctx.arena.deinit()` as its first statement.
+5. If `trySpawnJob` fails, the worker calls `arena.deinit()` and then `backend.resetRow(row_id)` so the row can be re-claimed cleanly.
+
+This also resolves what "arena transferred to job thread" means in practice — it's a move of the `ArenaAllocator` struct itself, not a pointer handoff. No thread frees an arena it did not originate.
+
+### R3. Channel registry minimal init — still an open question
+
+Phase 3 claims the daemon can "reuse `channels/root.zig` channel factory." Today `src/channels/root.zig` is invoked from `gateway.zig` with a full `GatewayState` / `Config` graph. A true standalone daemon needs a minimum viable init path that:
+
+- Takes only a `*const Config` and an allocator.
+- Returns a `std.StringArrayHashMap(Channel)` keyed by channel name.
+- Handles only the channels selected at build time via `-Dchannels=…`.
+
+Specifying this is a **blocker for Phase 3** and should be done as a follow-up spec (`docs/superpowers/specs/2026-04-16-cron-daemon-channel-registry.md`) before Phase 3 is handed to any implementer. Phase 1 and Phase 2 do not need this resolved.
+
+### R4. Legacy test migration
+
+`src/daemon.zig` contains tests that depend on `schedulerThread` (see `src/daemon.zig:3178`, `:3200`). Phase 4's cleanup deletes the legacy in-memory path those tests exercise. Before Phase 4:
+
+- Identify every test that spawns `schedulerThread` directly or asserts on `collectDueJobs` / `enqueueScheduledJob`.
+- Port them to drive `CronTicker` and `CronWorker` directly (they are designed to be injectable).
+- Preserve the shutdown/RuntimeObserver regression coverage (`schedulerThread respects shutdown and destroys runtime observer`) by replicating it against the new `CronWorker.run` loop.
+
+### R5. RSS budget vs `~1 MiB` CLAUDE.md principle — explicit sign-off required
+
+The daemon's projected RSS is 12–14 MiB (4 job threads × 2 MiB `HEAVY_RUNTIME_STACK_SIZE` + 3 infra threads + SQLite/arenas/bus). `CLAUDE.md` states "Hard constraints: 678 KB binary, ~1 MB peak RSS." The daemon intentionally trades memory for concurrency.
+
+**Required**: Before Phase 2 lands, get explicit sign-off on relaxing the RSS target for the `nullclaw cron daemon` subcommand specifically (not for the main binary). Two viable stances:
+
+- **Accept**: Document that the daemon is exempt from the 1 MiB RSS target and record the accepted ceiling (e.g. 16 MiB).
+- **Reduce**: Lower `max_concurrent` default to 2 and/or use default stacks for skill/shell jobs, reserving `HEAVY_RUNTIME_STACK_SIZE` only for `job_type=agent`. This brings the ceiling closer to 6–8 MiB.
+
+The spec currently assumes "Accept." Confirm before Phase 2.
 
 ---
 
