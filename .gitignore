@@ -17,6 +17,7 @@ reference/
 result
 .direnv/
 .worktrees
+config.json
 config.signal.json
 
 # IDE configurations

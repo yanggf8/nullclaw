@@ -6628,6 +6628,12 @@ pub fn dbTickAndEnqueue(db_path: [:0]const u8, allocator: std.mem.Allocator, now
 
     try ensureCronTable(db);
 
+    return dbTickAndEnqueueWithDb(db, now);
+}
+
+/// Tick core: scan due jobs, enqueue them, advance next_run_secs.
+/// Caller must ensure the schema exists and pass an open db handle.
+pub fn dbTickAndEnqueueWithDb(db: *c.sqlite3, now: i64) !usize {
     // Enable WAL mode for concurrent access.
     _ = c.sqlite3_exec(db, "PRAGMA journal_mode=WAL", null, null, null);
 

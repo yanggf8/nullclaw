@@ -80,7 +80,7 @@ Defined in `src/root.zig`. Phases mirror deployment dependencies:
 - `src/memory/` - Layered architecture: **engines** (SQLite, Markdown, LRU, Redis, PostgreSQL, LanceDB, Lucid, ClickHouse, API, None) and **retrieval** (hybrid search, RRF, embeddings). Engines conditionally compiled via build flags.
 - `src/security/` - Policy enforcement (`policy.zig`), pairing (`pairing.zig`), encrypted secrets (`secrets.zig`), sandbox backends (`landlock.zig`, `firejail.zig`, `bubblewrap.zig`, `docker.zig`, `detect.zig`).
 - `src/agent/` - Agent loop internals: `dispatcher.zig` (tool call parsing), `compaction.zig` (history trimming), `prompt.zig` (system prompt builder), `memory_loader.zig` (context injection), `commands.zig` (agent-mode commands). Config defaults are `max_tool_iterations = 1000` and `max_history_messages = 100` (see `src/config_types.zig`).
-- `src/cron/` - DB-backed cron subsystem: `types.zig` (shared types: `CronJobSpec`, `DequeueResult`, `SessionTarget`), `db.zig` (SQLite vtable implementation), `root.zig` (CronBackend vtable interface), `factory.zig` (backend selection). The legacy in-memory `CronScheduler` lives in `src/cron.zig` (top-level, ~4500 lines). New work should target the DB backend in `src/cron/`.
+- `src/cron/` - DB-backed cron subsystem: `types.zig` (shared types: `CronJobSpec`, `DequeueResult`, `SessionTarget`), `db.zig` (SQLite vtable implementation with once-only schema init), `root.zig` (CronBackend vtable interface), `factory.zig` (backend selection), `ticker.zig` (periodic tick driver), `memory.zig` (in-memory backend for tests). The legacy in-memory `CronScheduler` lives in `src/cron.zig` (top-level, ~10k lines). New work should target the DB backend in `src/cron/`.
 
 ### Provider Boundary Notes
 

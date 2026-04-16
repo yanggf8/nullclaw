@@ -46,6 +46,7 @@ fn colText(stmt: ?*c.sqlite3_stmt, col: c_int, allocator: std.mem.Allocator) ![]
 pub const DbCronBackend = struct {
     db_path: [:0]u8, // owned, freed in deinit
     allocator: std.mem.Allocator,
+    schema_ensured: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(allocator: std.mem.Allocator, db_path: [:0]const u8) !DbCronBackend {
         return .{
@@ -58,12 +59,15 @@ pub const DbCronBackend = struct {
         self.allocator.free(self.db_path);
     }
 
-    /// Open the DB, ensure the cron schema exists, return handle.
+    /// Open the DB, ensure the cron schema exists (once per backend lifetime), return handle.
     /// Caller must call cron.closeCronDb on the returned handle.
-    fn openDb(self: *const DbCronBackend) !*c.sqlite3 {
+    fn openDb(self: *DbCronBackend) !*c.sqlite3 {
         if (!build_options.enable_sqlite) return error.SqliteDisabled;
         const db = try cron.openCronDbAtPath(self.db_path);
-        try cron.ensureCronTable(db);
+        if (!self.schema_ensured.load(.acquire)) {
+            try cron.ensureCronTable(db);
+            self.schema_ensured.store(true, .release);
+        }
         return db;
     }
 
@@ -76,7 +80,9 @@ pub const DbCronBackend = struct {
 
     fn vtableTick(ptr: *anyopaque, now: i64) anyerror!usize {
         const self: *DbCronBackend = @ptrCast(@alignCast(ptr));
-        return cron.dbTickAndEnqueue(self.db_path, self.allocator, now);
+        const db = try self.openDb();
+        defer cron.closeCronDb(db);
+        return cron.dbTickAndEnqueueWithDb(db, now);
     }
 
     fn vtableAdd(ptr: *anyopaque, allocator: std.mem.Allocator, spec: types.NewJobSpec) anyerror!types.CronJob {
@@ -188,7 +194,7 @@ pub const DbCronBackend = struct {
             _ = c.sqlite3_step(qstmt);
             _ = c.sqlite3_finalize(qstmt);
         }
-        const removed = try dbSetField(db, id, null, null, null);
+        const removed = try dbDeleteJob(db, id);
         if (c.sqlite3_exec(db, "COMMIT", null, null, null) != c.SQLITE_OK) {
             return error.TransactionCommitFailed;
         }
@@ -334,9 +340,63 @@ fn dbExecOneId(db: *c.sqlite3, sql: [*:0]const u8, id: []const u8) !bool {
 
 /// DELETE a job — vtableRemove delegates here.
 /// Returns false if no row was deleted (not found).
-fn dbSetField(db: *c.sqlite3, id: []const u8, _: ?void, _: ?void, _: ?void) !bool {
+fn dbDeleteJob(db: *c.sqlite3, id: []const u8) !bool {
     const sql = "DELETE FROM cron_jobs WHERE id=?1";
     return dbExecOneId(db, sql, id);
+}
+
+fn dbPrepare(db: *c.sqlite3, sql: [*:0]const u8) !?*c.sqlite3_stmt {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    return stmt;
+}
+
+fn dbStepDone(stmt: ?*c.sqlite3_stmt) !void {
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
+}
+
+fn dbExecPatchText(db: *c.sqlite3, sql: [*:0]const u8, value: []const u8, id: []const u8) !void {
+    const stmt = try dbPrepare(db, sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, value.ptr, @intCast(value.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_text(stmt, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
+    try dbStepDone(stmt);
+}
+
+fn dbExecPatchInt(db: *c.sqlite3, sql: [*:0]const u8, value: c_int, id: []const u8) !void {
+    const stmt = try dbPrepare(db, sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_int(stmt, 1, value);
+    _ = c.sqlite3_bind_text(stmt, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
+    try dbStepDone(stmt);
+}
+
+fn dbExecPatchInt64(db: *c.sqlite3, sql: [*:0]const u8, value: i64, id: []const u8) !void {
+    const stmt = try dbPrepare(db, sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_int64(stmt, 1, value);
+    _ = c.sqlite3_bind_text(stmt, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
+    try dbStepDone(stmt);
+}
+
+fn dbExecPatchExpression(db: *c.sqlite3, expression: []const u8, id: []const u8, next_run_secs: i64) !void {
+    const sql = "UPDATE cron_jobs SET expression=?1, next_run_secs=?3 WHERE id=?2";
+    const stmt = try dbPrepare(db, sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, expression.ptr, @intCast(expression.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_text(stmt, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_int64(stmt, 3, next_run_secs);
+    try dbStepDone(stmt);
+}
+
+fn dbExecPatchEnabled(db: *c.sqlite3, enabled: bool, id: []const u8) !void {
+    const sql = "UPDATE cron_jobs SET enabled=?1, paused=?2 WHERE id=?3";
+    const stmt = try dbPrepare(db, sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_int(stmt, 1, if (enabled) 1 else 0);
+    _ = c.sqlite3_bind_int(stmt, 2, if (enabled) 0 else 1);
+    _ = c.sqlite3_bind_text(stmt, 3, id.ptr, @intCast(id.len), SQLITE_STATIC);
+    try dbStepDone(stmt);
 }
 
 /// Fetch delete_after_run for a job (needed by vtableComplete).
@@ -350,220 +410,116 @@ fn dbGetDeleteAfterRun(db: *c.sqlite3, id: []const u8) !bool {
     return c.sqlite3_column_int(stmt, 0) != 0;
 }
 
+fn dbReadJobTzOffset(db: *c.sqlite3, id: []const u8) !i32 {
+    const sql = "SELECT tz_offset_s FROM cron_jobs WHERE id=?1";
+    const stmt = try dbPrepare(db, sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
+    return @intCast(c.sqlite3_column_int(stmt, 0));
+}
+
 /// Apply a CronJobPatch to an existing job row. Skips null fields.
 fn dbApplyPatch(db: *c.sqlite3, id: []const u8, patch: types.CronJobPatch) !void {
+    if (c.sqlite3_exec(db, "BEGIN IMMEDIATE", null, null, null) != c.SQLITE_OK) {
+        return error.TransactionBeginFailed;
+    }
+    var tx_open = true;
+    errdefer {
+        if (tx_open) _ = c.sqlite3_exec(db, "ROLLBACK", null, null, null);
+    }
+
     // Apply tz_offset_s first so subsequent expression recalculation uses the new offset.
     if (patch.tz_offset_s) |tz| {
         const sql = "UPDATE cron_jobs SET tz_offset_s=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_int(s, 1, tz);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchInt(db, sql, tz, id);
     }
     // Read current tz_offset_s from DB for expression recalculation.
-    const tz_offset: i32 = blk: {
-        const tz_sql = "SELECT tz_offset_s FROM cron_jobs WHERE id=?1";
-        var tz_stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, tz_sql, -1, &tz_stmt, null) != c.SQLITE_OK) break :blk 0;
-        defer _ = c.sqlite3_finalize(tz_stmt);
-        _ = c.sqlite3_bind_text(tz_stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
-        if (c.sqlite3_step(tz_stmt) != c.SQLITE_ROW) break :blk 0;
-        break :blk @intCast(c.sqlite3_column_int(tz_stmt, 0));
-    };
+    const tz_offset = try dbReadJobTzOffset(db, id);
     if (patch.expression) |expr| {
         // Update expression AND recalculate next_run_secs so the scheduler
         // uses the new expression immediately (not after one stale firing).
         const now = std.time.timestamp();
         const next_run: i64 = try cron.nextRunForCronExpressionTz(expr, now, tz_offset);
-        const sql = "UPDATE cron_jobs SET expression=?1, next_run_secs=?3 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_text(s, 1, expr.ptr, @intCast(expr.len), SQLITE_STATIC);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_bind_int64(s, 3, next_run);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchExpression(db, expr, id, next_run);
     }
     if (patch.command) |cmd| {
         const sql = "UPDATE cron_jobs SET command=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_text(s, 1, cmd.ptr, @intCast(cmd.len), SQLITE_STATIC);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchText(db, sql, cmd, id);
     }
     if (patch.prompt) |p| {
         const sql = "UPDATE cron_jobs SET prompt=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_text(s, 1, p.ptr, @intCast(p.len), SQLITE_STATIC);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchText(db, sql, p, id);
     }
     if (patch.name) |n| {
         const sql = "UPDATE cron_jobs SET name=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_text(s, 1, n.ptr, @intCast(n.len), SQLITE_STATIC);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchText(db, sql, n, id);
     }
     if (patch.enabled) |en| {
         // Keep paused in sync: enabling clears paused (tick requires enabled=1 AND paused=0);
         // disabling sets paused=1 so list output is consistent with pause/resume semantics.
-        const sql = "UPDATE cron_jobs SET enabled=?1, paused=?2 WHERE id=?3";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_int(s, 1, if (en) 1 else 0);
-            _ = c.sqlite3_bind_int(s, 2, if (en) 0 else 1);
-            _ = c.sqlite3_bind_text(s, 3, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchEnabled(db, en, id);
     }
     if (patch.model) |m| {
         const sql = "UPDATE cron_jobs SET model=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_text(s, 1, m.ptr, @intCast(m.len), SQLITE_STATIC);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchText(db, sql, m, id);
     }
     if (patch.delete_after_run) |d| {
         const sql = "UPDATE cron_jobs SET delete_after_run=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_int(s, 1, if (d) 1 else 0);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchInt(db, sql, if (d) 1 else 0, id);
     }
     if (patch.delivery_channel) |ch| {
         const sql = "UPDATE cron_jobs SET delivery_channel=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_text(s, 1, ch.ptr, @intCast(ch.len), SQLITE_STATIC);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchText(db, sql, ch, id);
     }
     if (patch.delivery_to) |t| {
         const sql = "UPDATE cron_jobs SET delivery_to=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_text(s, 1, t.ptr, @intCast(t.len), SQLITE_STATIC);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchText(db, sql, t, id);
     }
     if (patch.delivery_mode) |dm| {
         const sql = "UPDATE cron_jobs SET delivery_mode=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_text(s, 1, dm.ptr, @intCast(dm.len), SQLITE_STATIC);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchText(db, sql, dm, id);
     }
     if (patch.delivery_account_id) |aid| {
         const sql = "UPDATE cron_jobs SET delivery_account_id=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_text(s, 1, aid.ptr, @intCast(aid.len), SQLITE_STATIC);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchText(db, sql, aid, id);
     }
     if (patch.timeout_secs) |t| {
         const sql = "UPDATE cron_jobs SET timeout_secs=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_int(s, 1, @intCast(t));
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchInt(db, sql, @intCast(t), id);
     }
     if (patch.next_run_secs) |nrs| {
         const sql = "UPDATE cron_jobs SET next_run_secs=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_int64(s, 1, nrs);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchInt64(db, sql, nrs, id);
     }
     if (patch.skill_name) |sn| {
         const sql = "UPDATE cron_jobs SET skill_name=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_text(s, 1, sn.ptr, @intCast(sn.len), SQLITE_STATIC);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchText(db, sql, sn, id);
     }
     if (patch.skill_args) |sa| {
         const sql = "UPDATE cron_jobs SET skill_args=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_text(s, 1, sa.ptr, @intCast(sa.len), SQLITE_STATIC);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchText(db, sql, sa, id);
     }
     if (patch.session_target) |st| {
         const st_str = st.asStr();
         const sql = "UPDATE cron_jobs SET session_target=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_text(s, 1, st_str.ptr, @intCast(st_str.len), SQLITE_STATIC);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchText(db, sql, st_str, id);
     }
     if (patch.verification_mode) |vm| {
         const vm_str = vm.asStr();
         const sql = "UPDATE cron_jobs SET verification_mode=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_text(s, 1, vm_str.ptr, @intCast(vm_str.len), SQLITE_STATIC);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchText(db, sql, vm_str, id);
     }
     if (patch.repair_policy) |rp| {
         const rp_str = rp.asStr();
         const sql = "UPDATE cron_jobs SET repair_policy=?1 WHERE id=?2";
-        var s: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &s, null) == c.SQLITE_OK) {
-            _ = c.sqlite3_bind_text(s, 1, rp_str.ptr, @intCast(rp_str.len), SQLITE_STATIC);
-            _ = c.sqlite3_bind_text(s, 2, id.ptr, @intCast(id.len), SQLITE_STATIC);
-            _ = c.sqlite3_step(s);
-            _ = c.sqlite3_finalize(s);
-        }
+        try dbExecPatchText(db, sql, rp_str, id);
     }
+
+    if (c.sqlite3_exec(db, "COMMIT", null, null, null) != c.SQLITE_OK) {
+        return error.TransactionCommitFailed;
+    }
+    tx_open = false;
 }
 
 /// Load a full CronJob by ID (includes all columns + last_output).
@@ -1273,6 +1229,109 @@ test "DbCronBackend remove clears queued head job" {
     const result = try be.dequeue(arena.allocator());
     try std.testing.expect(result != null);
     try std.testing.expectEqualStrings(second.id, result.?.spec.id);
+}
+
+test "dbApplyPatch rolls back earlier updates when a later field fails" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/patch_rollback.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    const db = try cron.openCronDbAtPath(db_path_z);
+    defer cron.closeCronDb(db);
+
+    const create_sql =
+        "CREATE TABLE cron_jobs (" ++
+        "id TEXT PRIMARY KEY, " ++
+        "expression TEXT NOT NULL, " ++
+        "next_run_secs INTEGER NOT NULL DEFAULT 0, " ++
+        "tz_offset_s INTEGER NOT NULL DEFAULT 0" ++
+        ")";
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_exec(db, create_sql, null, null, null));
+
+    const insert_sql = "INSERT INTO cron_jobs(id, expression, next_run_secs, tz_offset_s) VALUES('job-1', '* * * * *', 123, 0)";
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_exec(db, insert_sql, null, null, null));
+
+    const patch = types.CronJobPatch{
+        .tz_offset_s = 8 * 3600,
+        .expression = "0 22 * * 1-5",
+        .repair_policy = .retry_once,
+    };
+    try std.testing.expectError(error.PrepareFailed, dbApplyPatch(db, "job-1", patch));
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    const select_sql = "SELECT expression, next_run_secs, tz_offset_s FROM cron_jobs WHERE id='job-1'";
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_prepare_v2(db, select_sql, -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(stmt));
+
+    const expr_ptr = c.sqlite3_column_text(stmt, 0).?;
+    const expr_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    try std.testing.expectEqualStrings("* * * * *", expr_ptr[0..expr_len]);
+    try std.testing.expectEqual(@as(i64, 123), c.sqlite3_column_int64(stmt, 1));
+    try std.testing.expectEqual(@as(i32, 0), @as(i32, @intCast(c.sqlite3_column_int(stmt, 2))));
+}
+
+test "DbCronBackend complete deletes delete_after_run job and records run" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/complete_delete_after_run.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    var backend = try DbCronBackend.init(allocator, db_path_z);
+    defer backend.deinit();
+    const be = backend.backend();
+
+    const job = try be.add(allocator, .{
+        .expression = "* * * * *",
+        .command = "echo once",
+        .delete_after_run = true,
+    });
+    defer {
+        allocator.free(job.id);
+        allocator.free(job.expression);
+        allocator.free(job.command);
+    }
+
+    const now = std.time.timestamp();
+    try be.enqueue(job.id, now);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const dequeued = (try be.dequeue(arena.allocator())).?;
+    try be.complete(dequeued.spec.id, dequeued.queue_row_id, now + 1, "ok", "done", false);
+
+    try std.testing.expect((try be.get(allocator, job.id)) == null);
+
+    var arena2 = std.heap.ArenaAllocator.init(allocator);
+    defer arena2.deinit();
+    try std.testing.expect((try be.dequeue(arena2.allocator())) == null);
+
+    const db = try cron.openCronDbAtPath(db_path_z);
+    defer cron.closeCronDb(db);
+    try cron.ensureCronTable(db);
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    const runs_sql = "SELECT COUNT(*) FROM cron_runs WHERE job_id=?1";
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_prepare_v2(db, runs_sql, -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, job.id.ptr, @intCast(job.id.len), SQLITE_STATIC);
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 0));
 }
 
 test "DbCronBackend tick enqueues due jobs" {

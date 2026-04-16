@@ -1,5 +1,11 @@
 //! Pure domain types for the cron subsystem. No storage, no I/O, no SQLite.
 //! These types are shared by CronBackend implementations and all callers.
+//!
+//! TODO: converge with the legacy parallel types in src/cron.zig (CronJob,
+//! DeliveryConfig, SessionTarget, JobType, etc.). The two hierarchies have
+//! identical shapes and are bridged via @enumFromInt/@intFromEnum in db.zig
+//! and memory.zig. Once all callers go through CronBackend, delete the
+//! legacy copies and the conversion helpers.
 const std = @import("std");
 const agent_routing = @import("../agent_routing.zig");
 
@@ -71,6 +77,11 @@ pub const DeliveryMode = enum {
     }
 };
 
+/// TODO: the *_owned booleans are a manual ownership-tracking pattern inherited
+/// from the legacy CronScheduler. They are fragile (a missed flag = leak or
+/// double-free). Once DeliveryConfig lives exclusively behind CronBackend, all
+/// strings should be arena-allocated and freed uniformly — the _owned flags can
+/// then be removed. This is blocked on the type convergence TODO above.
 pub const DeliveryConfig = struct {
     mode: DeliveryMode = .none,
     channel: ?[]const u8 = null,
