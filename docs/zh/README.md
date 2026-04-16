@@ -141,7 +141,7 @@ nullclaw agent -m "你好，nullclaw"
 ## 下一步
 
 - 新用户：按 [安装指南](./installation.md) → [配置指南](./configuration.md) → [使用与运维](./usage.md) 继续。
-- 运维 / 集成：先看 [使用与运维](./usage.md)，cron 任務看 [Cron 排程與運維](./cron.md)，再补 [安全机制](./security.md)、[Gateway API](./gateway-api.md) 与对应运维专题。
+- 運維 / 整合：先看 [使用與運維](./usage.md)，cron 任務看 [Cron 排程與運維](./cron.md)，再補 [安全機制](./security.md)、[Gateway API](./gateway-api.md) 與對應運維專題。
 - 贡献者：先读 [开发指南](./development.md)，需要提交流程时再看 [贡献指南](../../CONTRIBUTING.md)。
 
 ## 相关页面
