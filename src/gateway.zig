@@ -11,6 +11,7 @@
 //! Uses std.http.Server (built-in, no external deps).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const daemon = @import("daemon.zig");
 const health = @import("health.zig");
@@ -6733,6 +6734,24 @@ pub fn sharedDbBackend() ?cron_backend_mod.CronBackend {
     const gs = g_state_ptr orelse return null;
     if (gs.cron_db_backend) |*be| return be.backend();
     return null;
+}
+
+/// Test-only: install a GatewayState pointer so hasDbScheduler() /
+/// sharedDbBackend() observe a caller-owned state. Paired with
+/// clearStatePtrForTest(). The caller owns the state struct and must keep it
+/// alive until clearStatePtrForTest() returns. Only referenced from tests.
+pub fn setStatePtrForTest(gs: *GatewayState) void {
+    comptime std.debug.assert(builtin.is_test);
+    g_state_mutex.lock();
+    defer g_state_mutex.unlock();
+    g_state_ptr = gs;
+}
+
+pub fn clearStatePtrForTest() void {
+    comptime std.debug.assert(builtin.is_test);
+    g_state_mutex.lock();
+    defer g_state_mutex.unlock();
+    g_state_ptr = null;
 }
 
 /// Wake the run queue worker without pushing to the in-memory ArrayList.

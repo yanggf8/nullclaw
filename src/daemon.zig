@@ -582,26 +582,14 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
             const cron_ticker_mod = @import("cron/ticker.zig");
             const backend_opt = gateway_mod.sharedDbBackend();
             if (backend_opt) |backend| {
+                // Run the ticker inline on this thread. The backend is owned by
+                // GatewayState.cron_db_backend, which is torn down in runInProcess's
+                // defer after shutdown_requested fires. Running inline guarantees
+                // we observe shutdown before returning control to the caller, so
+                // the gateway's deinit cannot race with an in-flight tick.
                 var ticker = cron_ticker_mod.CronTicker.init(backend, poll_secs, &shutdown_requested);
-
-                const ticker_thread = std.Thread.spawn(
-                    .{ .stack_size = thread_stacks.DAEMON_SERVICE_STACK_SIZE },
-                    cron_ticker_mod.CronTicker.run,
-                    .{&ticker},
-                ) catch |err| {
-                    log.err("failed to spawn CronTicker thread: {s}", .{@errorName(err)});
-                    return;
-                };
-
-                state.markRunning("scheduler");
-                health.markComponentOk("scheduler");
-                log.info("scheduler: CronTicker thread running (DbCronBackend)", .{});
-
-                while (!isShutdownRequested()) {
-                    std.Thread.sleep(std.time.ns_per_s);
-                }
-
-                ticker_thread.join();
+                log.info("scheduler: CronTicker running inline (DbCronBackend)", .{});
+                ticker.run();
                 return;
             }
             // sharedDbBackend() returned null despite hasDbScheduler() true —
@@ -3187,6 +3175,78 @@ test "channelSupervisorThread respects shutdown" {
     thread.join();
 
     // Channel component should have been marked running before the loop
+    try std.testing.expect(state.components[0].?.running);
+}
+
+test "schedulerThread DB-direct path wires CronTicker and exits on shutdown" {
+    // Start with shutdown=false so schedulerThread enters its while loop and
+    // hits the DB-direct branch (hasDbScheduler() → sharedDbBackend() →
+    // CronTicker.run inline). A short delay then signals shutdown; the ticker's
+    // 1-second sleep slices observe it and return, proving the full daemon
+    // wiring path works end-to-end.
+    shutdown_requested.store(false, .release);
+    defer shutdown_requested.store(false, .release);
+
+    const cron_db_mod = @import("cron/db.zig");
+    const gateway_mod = @import("gateway.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const config_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "config.json" });
+    defer std.testing.allocator.free(config_path);
+    const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "cron.db" });
+    defer std.testing.allocator.free(db_path);
+
+    const config = Config{
+        .workspace_dir = tmp_path,
+        .config_path = config_path,
+        .allocator = std.testing.allocator,
+    };
+
+    var gw_state = gateway_mod.GatewayState.init(std.testing.allocator);
+    gw_state.cron_db_backend = try cron_db_mod.DbCronBackend.init(std.testing.allocator, db_path);
+    defer if (gw_state.cron_db_backend) |*be| be.deinit();
+
+    gateway_mod.setStatePtrForTest(&gw_state);
+    defer gateway_mod.clearStatePtrForTest();
+
+    // Sanity: the accessors observe the installed state.
+    try std.testing.expect(gateway_mod.hasDbScheduler());
+    try std.testing.expect(gateway_mod.sharedDbBackend() != null);
+
+    var state = DaemonState{};
+    state.addComponent("scheduler");
+    var event_bus = bus_mod.Bus.init();
+
+    // Verify the DB file does not exist yet — so its presence after join
+    // proves the DB-direct branch (CronTicker.run → tick → dbTickAndEnqueue →
+    // openCronDbAtPath) actually executed.
+    std.fs.accessAbsolute(db_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {}, // expected — file doesn't exist yet
+        else => return err,
+    };
+
+    const thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.DAEMON_SERVICE_STACK_SIZE }, schedulerThread, .{
+        std.testing.allocator, &config, &state, &event_bus,
+    });
+
+    // Wait long enough for schedulerThread to complete its init sequence
+    // (RuntimeObserver, CronScheduler, loadJobs, setSharedScheduler) and
+    // enter the DB-direct branch where CronTicker.run calls tick() once
+    // before sleeping. 2 seconds is generous for test-machine variance.
+    std.Thread.sleep(2 * std.time.ns_per_s);
+    shutdown_requested.store(true, .release);
+    thread.join();
+
+    // The DB file's existence proves the DB-direct branch ran: only
+    // CronTicker.run → tick → dbTickAndEnqueue → openCronDbAtPath creates it.
+    // The legacy in-memory path and the skip-loop path never touch this file.
+    std.fs.accessAbsolute(db_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.DbDirectBranchDidNotExecute,
+        else => return err,
+    };
     try std.testing.expect(state.components[0].?.running);
 }
 
