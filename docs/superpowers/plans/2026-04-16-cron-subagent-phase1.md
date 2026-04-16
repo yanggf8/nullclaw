@@ -62,7 +62,7 @@ The only user-visible change after Phase 1: `daemon.zig` has fewer lines. Everyt
 - Modify: `src/cron/root.zig` (add re-export)
 - Test: `src/cron/ticker.zig` (in-file test block)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append this to the new `src/cron/ticker.zig` (we are writing the file, so "append" means "include from the start"):
 
@@ -87,13 +87,13 @@ test "CronTicker can be constructed against MemoryCronBackend" {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `zig build test --summary all`
 
 Expected: FAIL with a compile error in `src/cron/ticker.zig` because `CronTicker` has no `backend`, `poll_interval_ns`, or `shutdown` fields.
 
-- [ ] **Step 3: Minimal implementation to pass the test**
+- [x] **Step 3: Minimal implementation to pass the test**
 
 Replace the entire contents of `src/cron/ticker.zig` with:
 
@@ -140,7 +140,7 @@ test "CronTicker can be constructed against MemoryCronBackend" {
 }
 ```
 
-- [ ] **Step 4: Add the re-export in `src/cron/root.zig`**
+- [x] **Step 4: Add the re-export in `src/cron/root.zig`**
 
 Edit `src/cron/root.zig` and add immediately after the existing `pub const RunResult = types.RunResult;` line:
 
@@ -148,13 +148,13 @@ Edit `src/cron/root.zig` and add immediately after the existing `pub const RunRe
 pub const Ticker = @import("ticker.zig").CronTicker;
 ```
 
-- [ ] **Step 5: Run the full test suite**
+- [x] **Step 5: Run the full test suite**
 
 Run: `zig build test --summary all`
 
 Expected: PASS. All 5,300+ existing tests still green, plus the new ticker construction test.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/cron/ticker.zig src/cron/root.zig
@@ -178,7 +178,7 @@ EOF
 - Modify: `src/cron/ticker.zig`
 - Test: `src/cron/ticker.zig` (in-file test block)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add this test block to the end of `src/cron/ticker.zig`:
 
@@ -196,13 +196,13 @@ test "CronTicker.tick forwards to backend and reports count" {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `zig build test --summary all`
 
 Expected: FAIL with "no field or method named `tick` in `CronTicker`".
 
-- [ ] **Step 3: Implement `tick()`**
+- [x] **Step 3: Implement `tick()`**
 
 Inside the `CronTicker` struct body in `src/cron/ticker.zig`, add:
 
@@ -215,13 +215,13 @@ Inside the `CronTicker` struct body in `src/cron/ticker.zig`, add:
     }
 ```
 
-- [ ] **Step 4: Run the full test suite**
+- [x] **Step 4: Run the full test suite**
 
 Run: `zig build test --summary all`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/cron/ticker.zig
@@ -242,7 +242,7 @@ EOF
 - Modify: `src/cron/ticker.zig`
 - Test: `src/cron/ticker.zig` (in-file test block)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `src/cron/ticker.zig`:
 
@@ -268,13 +268,13 @@ test "CronTicker.run exits promptly when shutdown flag is set" {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `zig build test --summary all`
 
 Expected: FAIL with "no field or method named `run` in `CronTicker`".
 
-- [ ] **Step 3: Implement `run()`**
+- [x] **Step 3: Implement `run()`**
 
 Inside the `CronTicker` struct body in `src/cron/ticker.zig`, add:
 
@@ -323,13 +323,13 @@ Inside the `CronTicker` struct body in `src/cron/ticker.zig`, add:
     }
 ```
 
-- [ ] **Step 4: Run the full test suite**
+- [x] **Step 4: Run the full test suite**
 
 Run: `zig build test --summary all`
 
 Expected: PASS. The new shutdown test should complete in well under a second — if it hangs, the shutdown slice loop is wrong.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/cron/ticker.zig
@@ -352,13 +352,13 @@ EOF
 - Modify: `src/daemon.zig:572-595` (DB-direct branch inside `schedulerThread`)
 - Test: `src/daemon.zig:3178` (existing `schedulerThread respects shutdown and destroys runtime observer`)
 
-- [ ] **Step 1: Read the existing test to understand the contract**
+- [x] **Step 1: Read the existing test to understand the contract**
 
 Run: `grep -n "schedulerThread respects shutdown" src/daemon.zig`
 
 Then read ~40 lines starting at that line number. The test spawns `schedulerThread` and expects it to exit cleanly when shutdown is requested, while destroying the heap-allocated `RuntimeObserver`. Phase 1 must preserve this exact contract.
 
-- [ ] **Step 2: Add a CronBackend construction helper inside `schedulerThread`**
+- [x] **Step 2: Add a CronBackend construction helper inside `schedulerThread`**
 
 In `src/daemon.zig`, locate `schedulerThread` (line 512). Between the existing `defer scheduler.deinit();` (~line 547) and `defer gateway_mod.clearSharedScheduler();` (~line 548), do not change anything yet — we will thread a `CronBackend` through only on the DB-direct branch and only when `hasDbScheduler()` is true.
 
@@ -414,7 +414,7 @@ Note the three required helpers we are using from the gateway:
 
 Leave everything from the legacy branch (current lines 597 onward) exactly as-is.
 
-- [ ] **Step 3: Do NOT run tests yet**
+- [x] **Step 3: Do NOT run tests yet**
 
 This commit compiles only after Task 5 adds `gateway_mod.sharedDbBackend()`. Proceed to Task 5 without committing.
 
@@ -425,13 +425,13 @@ This commit compiles only after Task 5 adds `gateway_mod.sharedDbBackend()`. Pro
 **Files:**
 - Modify: `src/gateway.zig` (near the existing `hasDbScheduler` at line 6717)
 
-- [ ] **Step 1: Read the existing `hasDbScheduler`**
+- [x] **Step 1: Read the existing `hasDbScheduler`**
 
 Run: `grep -n "hasDbScheduler\|setSharedScheduler\|clearSharedScheduler\|scheduler_mutex" src/gateway.zig | head`
 
 Identify the mutex and global state that guards the shared scheduler. The new accessor reads the same DbCronBackend pointer the gateway already owns — we are not adding storage, just exposing it.
 
-- [ ] **Step 2: Add the accessor**
+- [x] **Step 2: Add the accessor**
 
 Immediately after the existing `pub fn hasDbScheduler() bool { ... }` (line 6717), add:
 
@@ -452,13 +452,13 @@ pub fn sharedDbBackend() ?@import("cron/root.zig").CronBackend {
 
 If the existing field names differ (`db_cron_backend_initialized`, `db_cron_backend_value`), adjust to match. Locate them by searching the file for `DbCronBackend` assignments in the gateway init path (~line 6818). Use whatever the existing gateway code already stores, do not introduce new storage.
 
-- [ ] **Step 3: Run the full test suite**
+- [x] **Step 3: Run the full test suite**
 
 Run: `zig build test --summary all`
 
 Expected: PASS. The daemon changes from Task 4 now compile because `sharedDbBackend` exists. The existing `schedulerThread respects shutdown and destroys runtime observer` test should still pass — it uses a config where `hasDbScheduler()` returns false, so it falls through to the legacy branch unchanged.
 
-- [ ] **Step 4: Commit Task 4 and Task 5 together**
+- [x] **Step 4: Commit Task 4 and Task 5 together**
 
 ```bash
 git add src/daemon.zig src/gateway.zig
@@ -487,7 +487,7 @@ EOF
 **Files:**
 - Modify: `src/daemon.zig` (add test block near existing `schedulerThread respects shutdown` test around line 3178)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add this test immediately after the existing `schedulerThread respects shutdown and destroys runtime observer` test in `src/daemon.zig`:
 
@@ -536,13 +536,13 @@ test "schedulerThread DB-direct path drives CronTicker and honors shutdown" {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `zig build test --summary all`
 
 Expected: FAIL with unresolved references to `Config.loadInMemoryDefaults`, `gateway_mod.initSharedDbBackendForTest`, `gateway_mod.clearSharedDbBackendForTest`, `requestShutdownForTest`, `clearShutdownForTest`. These test-only helpers may already exist under similar names — if they do, rename the test to use them and skip Step 3. If not, the test is telling us we need them.
 
-- [ ] **Step 3: Resolve missing test helpers**
+- [x] **Step 3: Resolve missing test helpers**
 
 Before adding new test-only API, search for existing equivalents:
 
@@ -552,13 +552,13 @@ If the existing `schedulerThread respects shutdown and destroys runtime observer
 
 If no equivalents exist, stop and raise it as a question before adding helpers. Phase 1 is a refactor; adding new public API breaks the "behavior-preserving" contract.
 
-- [ ] **Step 4: Run the full test suite**
+- [x] **Step 4: Run the full test suite**
 
 Run: `zig build test --summary all`
 
 Expected: PASS. Both the legacy-path shutdown test and the new DB-direct-path shutdown test pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/daemon.zig
@@ -579,31 +579,31 @@ EOF
 
 **Files:** none (validation only)
 
-- [ ] **Step 1: Verify `zig fmt` is clean**
+- [x] **Step 1: Verify `zig fmt` is clean**
 
 Run: `zig fmt --check src/`
 
 Expected: no output (exit 0). If any file is reformatted, re-commit as a separate `style(cron): zig fmt` commit before proceeding.
 
-- [ ] **Step 2: Run the full test suite with leak detection**
+- [x] **Step 2: Run the full test suite with leak detection**
 
 Run: `zig build test --summary all`
 
 Expected: all tests pass, zero leaks reported. The summary line should match the pre-Phase-1 count plus the three new ticker tests and the one new daemon test (four new tests total).
 
-- [ ] **Step 3: Binary size check**
+- [x] **Step 3: Binary size check**
 
 Run: `zig build -Doptimize=ReleaseSmall && ls -l zig-out/bin/nullclaw`
 
 Expected: binary size within `~1 KB` of the pre-Phase-1 size. `CronTicker` is a few hundred bytes of machine code; if the delta is larger than 2 KB, investigate — we likely pulled in an unintended dependency.
 
-- [ ] **Step 4: Inspect the diff against `origin/main` for surprise changes**
+- [x] **Step 4: Inspect the diff against `origin/main` for surprise changes**
 
 Run: `git diff origin/main...HEAD --stat`
 
 Expected: only `src/cron/ticker.zig` (new), `src/cron/root.zig` (one line added), `src/daemon.zig` (smaller of +/- lines — DB-direct branch replaced with a ticker spawn), and `src/gateway.zig` (one new accessor function). Anything else in the stat is a scope creep and should be reverted or lifted into its own task.
 
-- [ ] **Step 5: Write the phase-close entry in the plan doc**
+- [x] **Step 5: Write the phase-close entry in the plan doc**
 
 Edit the very top of this plan file and add a `## Status` section after the header:
 
@@ -613,7 +613,7 @@ Edit the very top of this plan file and add a `## Status` section after the head
 **Phase 1: COMPLETE** (<date of completion>). CronTicker extracted; daemon DB-direct branch delegates to it; full test suite green; binary size delta <2 KB. Legacy in-memory branch preserved for Phase 4 removal. No vtable changes. No worker changes. Ready to start Phase 2 (thread-per-job execution).
 ```
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add docs/superpowers/plans/2026-04-16-cron-subagent-phase1.md
