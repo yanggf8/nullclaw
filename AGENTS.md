@@ -267,13 +267,9 @@ Never use `/skill <name>` or `-m /skill <name>` as a cron prompt. It spawns a su
 
 #### Source of truth
 
-`~/.nullclaw/cron-seed.json` is the canonical job definition. To reload jobs from seed into the live DB:
+`~/.nullclaw/cron.db` is the scheduler authority for a running claw. `~/.nullclaw/cron-seed.json` is a bootstrap/backup artifact, not an ongoing source of truth.
 
-```bash
-curl -s -X POST http://localhost:PORT/cron/load-from-seed
-```
-
-Never edit the live DB directly to apply config changes — update `cron-seed.json` and call `load-from-seed`. Exception: correcting a corrupted `next_run_secs` after a manual trigger may require a direct `UPDATE` followed by a seed backup (`cp ~/.nullclaw/cron.db ~/.nullclaw/cron.db.bak.<timestamp>` then re-export with the Python dump script).
+Routine job changes go through `nullclaw cron add|update|remove|pause|resume`, not seed reloads. `/cron/load-from-seed` is retained only for legacy recovery and is being phased out; prefer `nullclaw cron restore <file>` for recovery. Exception: correcting a corrupted `next_run_secs` after a manual trigger may require a direct `UPDATE` followed by a seed backup (`cp ~/.nullclaw/cron.db ~/.nullclaw/cron.db.bak.<timestamp>` then re-export with the Python dump script).
 
 #### Manual job trigger
 
