@@ -5576,7 +5576,7 @@ pub fn cliShowJob(
         "last_run_secs, last_status, paused, enabled, one_shot, " ++
         "delivery_mode, delivery_channel, delivery_account_id, delivery_to, " ++
         "timeout_secs, session_target, skill_name, skill_args, " ++
-        "verification_mode, repair_policy, created_at_s " ++
+        "verification_mode, repair_policy, tz_offset_s, created_at_s " ++
         "FROM cron_jobs WHERE id=?1";
     var stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(db, spec_sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
@@ -5620,7 +5620,8 @@ pub fn cliShowJob(
     const skill_args = try dbColumnTextOpt(stmt, 18, a);
     const verification_mode = (try dbColumnTextOpt(stmt, 19, a)) orelse "none";
     const repair_policy = (try dbColumnTextOpt(stmt, 20, a)) orelse "none";
-    const created_at = c.sqlite3_column_int64(stmt, 21);
+    const tz_offset_s = c.sqlite3_column_int(stmt, 21);
+    const created_at = c.sqlite3_column_int64(stmt, 22);
 
     const limit = if (runs_limit == 0) @as(usize, 10) else runs_limit;
 
@@ -5642,6 +5643,8 @@ pub fn cliShowJob(
         try buf.appendSlice(allocator, if (one_shot) "true" else "false");
         try buf.appendSlice(allocator, ",\"next_run_secs\":");
         try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{next_run}) catch "0");
+        try buf.appendSlice(allocator, ",\"tz_offset_s\":");
+        try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{tz_offset_s}) catch "0");
         try buf.appendSlice(allocator, ",\"created_at\":");
         try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{created_at}) catch "0");
         try buf.appendSlice(allocator, ",\"last_run_secs\":");
@@ -5698,9 +5701,8 @@ pub fn cliShowJob(
         if (prompt_opt) |pm| log.info("Prompt:       {s}", .{pm});
         if (model_opt) |mm| log.info("Model:        {s}", .{mm});
     }
-    var nr_buf: [64]u8 = undefined;
-    const next_run_fmt = formatUnixTimestamp(next_run, &nr_buf);
-    log.info("Schedule:     {s}    (next: {s})", .{ expr, next_run_fmt });
+    log.info("Schedule:     {s}", .{expr});
+    try logCronShowTimestampLines(allocator, "next", next_run, tz_offset_s);
     log.info("Session:      {s}", .{session_target});
 
     if (has_timeout) log.info("Timeout:      {d}s", .{timeout_secs_raw});
@@ -5714,8 +5716,6 @@ pub fn cliShowJob(
         log.info("Delivery:     {s} channel={s} account={s} to={s}", .{ delivery_mode, ch, ac, to });
     }
     if (has_last_run) {
-        var lr_buf: [64]u8 = undefined;
-        const lr_fmt = formatUnixTimestamp(last_run_secs_raw, &lr_buf);
         const ls = last_status orelse "?";
         // If paused, check if the last repair action was 'paused_job'
         var pause_suffix: []const u8 = "";
@@ -5736,7 +5736,8 @@ pub fn cliShowJob(
                 }
             }
         }
-        log.info("Last run:     {s}   status={s}", .{ lr_fmt, ls });
+        try logCronShowTimestampLines(allocator, "last run", last_run_secs_raw, tz_offset_s);
+        log.info("Last status:  {s}", .{ls});
         log.info("Enabled:      {}   Paused: {}{s}   One-shot: {}", .{ enabled, paused, pause_suffix, one_shot });
     } else {
         log.info("Last run:     (never)", .{});
@@ -6637,6 +6638,67 @@ fn formatUnixTimestamp(secs: i64, buf: []u8) []const u8 {
     }) catch return "format error";
 
     return buf[0..len.len];
+}
+
+fn formatUnixTimestampNoZone(secs: i64, buf: []u8) []const u8 {
+    const formatted = formatUnixTimestamp(secs, buf);
+    if (std.mem.endsWith(u8, formatted, " UTC")) return formatted[0 .. formatted.len - 4];
+    return formatted;
+}
+
+fn formatUtcOffsetLabel(tz_offset_s: i32, buf: []u8) []const u8 {
+    if (tz_offset_s == 0) return "UTC";
+    const sign: u8 = if (tz_offset_s < 0) '-' else '+';
+    const abs_s: i32 = if (tz_offset_s < 0) -tz_offset_s else tz_offset_s;
+    const hours = @divTrunc(abs_s, 3600);
+    const minutes = @divTrunc(@mod(abs_s, 3600), 60);
+    if (minutes == 0) return std.fmt.bufPrint(buf, "UTC{c}{d}", .{ sign, hours }) catch "UTC";
+    return std.fmt.bufPrint(buf, "UTC{c}{d}:{d:0>2}", .{ sign, hours, minutes }) catch "UTC";
+}
+
+fn appendCronShowTimestampLines(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    secs: i64,
+    tz_offset_s: i32,
+) !void {
+    if (tz_offset_s == 0) {
+        var utc_buf: [64]u8 = undefined;
+        try buf.appendSlice(allocator, label);
+        try buf.appendSlice(allocator, " (UTC): ");
+        try buf.appendSlice(allocator, formatUnixTimestampNoZone(secs, &utc_buf));
+        try buf.append(allocator, '\n');
+        return;
+    }
+
+    var tz_buf: [16]u8 = undefined;
+    const tz_label = formatUtcOffsetLabel(tz_offset_s, &tz_buf);
+    var local_buf: [64]u8 = undefined;
+    var utc_buf: [64]u8 = undefined;
+
+    try buf.appendSlice(allocator, label);
+    try buf.appendSlice(allocator, " (local, ");
+    try buf.appendSlice(allocator, tz_label);
+    try buf.appendSlice(allocator, "): ");
+    try buf.appendSlice(allocator, formatUnixTimestampNoZone(secs + tz_offset_s, &local_buf));
+    try buf.append(allocator, '\n');
+    try buf.appendSlice(allocator, label);
+    try buf.appendSlice(allocator, " (UTC):          ");
+    try buf.appendSlice(allocator, formatUnixTimestampNoZone(secs, &utc_buf));
+    try buf.append(allocator, '\n');
+}
+
+fn logCronShowTimestampLines(allocator: std.mem.Allocator, label: []const u8, secs: i64, tz_offset_s: i32) !void {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    try appendCronShowTimestampLines(&buf, allocator, label, secs, tz_offset_s);
+
+    var lines = std.mem.splitScalar(u8, buf.items, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        log.info("{s}", .{line});
+    }
 }
 
 // ── Backwards-compatible type alias ──────────────────────────────────
@@ -7955,6 +8017,38 @@ test "formatUnixTimestamp accepts exact-size buffer" {
 test "formatUnixTimestamp rejects undersized buffer" {
     var buf: [27]u8 = undefined;
     try std.testing.expectEqualStrings("buffer too small", formatUnixTimestamp(0, &buf));
+}
+
+test "cron show timestamp lines include local and UTC for positive timezone" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try appendCronShowTimestampLines(&buf, std.testing.allocator, "next", 1776348000, 8 * 3600);
+    try std.testing.expectEqualStrings(
+        "next (local, UTC+8): Thu Apr 16 2026 22:00:00\n" ++
+            "next (UTC):          Thu Apr 16 2026 14:00:00\n",
+        buf.items,
+    );
+}
+
+test "cron show timestamp lines keep single UTC line for zero timezone" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try appendCronShowTimestampLines(&buf, std.testing.allocator, "next", 1776348000, 0);
+    try std.testing.expectEqualStrings(
+        "next (UTC): Thu Apr 16 2026 14:00:00\n",
+        buf.items,
+    );
+}
+
+test "cron show timestamp lines include local and UTC for negative timezone" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try appendCronShowTimestampLines(&buf, std.testing.allocator, "next", 1776348000, -5 * 3600);
+    try std.testing.expectEqualStrings(
+        "next (local, UTC-5): Thu Apr 16 2026 09:00:00\n" ++
+            "next (UTC):          Thu Apr 16 2026 14:00:00\n",
+        buf.items,
+    );
 }
 
 test "parseDuration seconds" {
