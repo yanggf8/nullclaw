@@ -87,7 +87,7 @@
 
 | 命令 | 說明 |
 |---|---|
-| `nullclaw cron list [--json] [--limit N] [--all]` | 按時間順序顯示本週觸發計畫（人類可讀）或 JSON 陣列；`--all` 不限條數顯示所有任務 |
+| `nullclaw cron list [--json] [--limit N] [--all] [--skill <name>] [--channel <name>] [--to <id>] [--status <ok\|error\|paused>] [--match <substring>]` | 按時間順序顯示本週觸發計畫（人類可讀）或 JSON 陣列；多個 filter 會以 AND 合併，`--all` 不限條數顯示符合條件的任務 |
 | `nullclaw cron schedule [--hours N] [--today] [--all] [--json]` | 查看指定時間窗口內的即將觸發任務 |
 | `nullclaw cron status` | 排程守護進程健康摘要 |
 | `nullclaw cron job-status [--json]` | 各任務最近執行狀態與時間戳記（已設定時包含 `verification_mode` 與 `repair_policy`） |

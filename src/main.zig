@@ -1033,7 +1033,9 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         \\Usage: nullclaw cron <{s}> [--help|-h]
         \\
         \\Commands:
-        \\  list [--limit N] [--all] [--json]  List all scheduled tasks (--all: no limit)
+        \\  list [--limit N] [--all] [--json] [--skill <name>] [--channel <name>] [--to <id>]
+        \\       [--status <ok|error|paused>] [--match <substring>]
+        \\                                List scheduled tasks (--all: no limit)
         \\  status                        Show scheduler daemon status
         \\  job-status [--json]           Last known execution status per job, sorted by most-recently-run
         \\  schedule [--hours N] [--all] [--today] [--json]
@@ -1103,6 +1105,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (std.mem.eql(u8, subcmd, "list")) {
         var list_limit: usize = 0;
         var list_json = false;
+        var list_filter = yc.cron.CronListFilter{};
         {
             var li: usize = 1;
             while (li < sub_args.len) : (li += 1) {
@@ -1113,10 +1116,31 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 } else if (std.mem.eql(u8, sub_args[li], "--limit") and li + 1 < sub_args.len) {
                     li += 1;
                     list_limit = std.fmt.parseInt(usize, sub_args[li], 10) catch 0;
+                } else if (std.mem.eql(u8, sub_args[li], "--skill") and li + 1 < sub_args.len) {
+                    li += 1;
+                    list_filter.skill = sub_args[li];
+                } else if (std.mem.eql(u8, sub_args[li], "--channel") and li + 1 < sub_args.len) {
+                    li += 1;
+                    list_filter.channel = sub_args[li];
+                } else if (std.mem.eql(u8, sub_args[li], "--to") and li + 1 < sub_args.len) {
+                    li += 1;
+                    list_filter.to = sub_args[li];
+                } else if (std.mem.eql(u8, sub_args[li], "--status") and li + 1 < sub_args.len) {
+                    li += 1;
+                    list_filter.status = yc.cron.CronListStatusFilter.parse(sub_args[li]) catch {
+                        std.debug.print("Invalid --status: expected ok|error|paused\n", .{});
+                        std.process.exit(1);
+                    };
+                } else if (std.mem.eql(u8, sub_args[li], "--match") and li + 1 < sub_args.len) {
+                    li += 1;
+                    list_filter.match_text = sub_args[li];
+                } else {
+                    std.debug.print("Usage: nullclaw cron list [--limit N] [--all] [--json] [--skill <name>] [--channel <name>] [--to <id>] [--status <ok|error|paused>] [--match <substring>]\n", .{});
+                    std.process.exit(1);
                 }
             }
         }
-        try yc.cron.cliListJobs(allocator, list_limit, list_json);
+        try yc.cron.cliListJobs(allocator, list_limit, list_json, list_filter);
     } else if (std.mem.eql(u8, subcmd, "status")) {
         try yc.cron.cliStatus(allocator);
     } else if (std.mem.eql(u8, subcmd, "job-status")) {

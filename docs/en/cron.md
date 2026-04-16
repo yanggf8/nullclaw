@@ -116,6 +116,15 @@ nullclaw cron degraded --hours 24
 nullclaw cron degraded --job <id> --hours 168
 ```
 
+To find jobs without piping JSON through `grep`, filter `cron list` directly. Filters are ANDed:
+
+```bash
+nullclaw cron list --skill oilcon
+nullclaw cron list --channel telegram --to 7972814626
+nullclaw cron list --status error
+nullclaw cron list --match oil --json
+```
+
 To inspect one run by trace:
 
 ```bash

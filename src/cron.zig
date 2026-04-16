@@ -3600,6 +3600,73 @@ fn probeSchedulerStatus(config_path: []const u8, daemon_state_path: []const u8, 
     };
 }
 
+pub const CronListStatusFilter = enum {
+    ok,
+    @"error",
+    paused,
+
+    pub fn parse(raw: []const u8) !CronListStatusFilter {
+        if (std.mem.eql(u8, raw, "ok")) return .ok;
+        if (std.mem.eql(u8, raw, "error")) return .@"error";
+        if (std.mem.eql(u8, raw, "paused")) return .paused;
+        return error.InvalidCronListStatus;
+    }
+
+    fn asStr(self: CronListStatusFilter) []const u8 {
+        return switch (self) {
+            .ok => "ok",
+            .@"error" => "error",
+            .paused => "paused",
+        };
+    }
+};
+
+pub const CronListFilter = struct {
+    skill: ?[]const u8 = null,
+    channel: ?[]const u8 = null,
+    to: ?[]const u8 = null,
+    status: ?CronListStatusFilter = null,
+    match_text: ?[]const u8 = null,
+
+    pub fn hasAny(self: CronListFilter) bool {
+        return self.skill != null or
+            self.channel != null or
+            self.to != null or
+            self.status != null or
+            self.match_text != null;
+    }
+};
+
+pub fn cronListFilterSummary(allocator: std.mem.Allocator, filter: CronListFilter) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var first = true;
+
+    const Writer = struct {
+        fn appendPart(
+            out: *std.ArrayListUnmanaged(u8),
+            alloc: std.mem.Allocator,
+            first_part: *bool,
+            key: []const u8,
+            value: []const u8,
+        ) !void {
+            if (!first_part.*) try out.appendSlice(alloc, ", ");
+            first_part.* = false;
+            try out.appendSlice(alloc, key);
+            try out.append(alloc, '=');
+            try out.appendSlice(alloc, value);
+        }
+    };
+
+    if (filter.skill) |v| try Writer.appendPart(&buf, allocator, &first, "skill", v);
+    if (filter.channel) |v| try Writer.appendPart(&buf, allocator, &first, "channel", v);
+    if (filter.to) |v| try Writer.appendPart(&buf, allocator, &first, "to", v);
+    if (filter.status) |v| try Writer.appendPart(&buf, allocator, &first, "status", v.asStr());
+    if (filter.match_text) |v| try Writer.appendPart(&buf, allocator, &first, "match", v);
+
+    return try buf.toOwnedSlice(allocator);
+}
+
 /// CLI: list all cron jobs.
 fn checkSchedulerStatus(allocator: std.mem.Allocator) SchedulerStatus {
     var config_opt = @import("config.zig").Config.load(allocator) catch |err| {
@@ -3714,7 +3781,7 @@ fn printWeeklyTable(allocator: std.mem.Allocator, all_jobs: []const CronJob, now
     }
 }
 
-pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool) !void {
+pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool, filter: CronListFilter) !void {
     // JSON path: always query DB directly (never via gateway — gateway adds log prefix).
     if (json_out) {
         // Default JSON limit to 100 to avoid 30KB+ output when caller omits --limit.
@@ -3726,7 +3793,7 @@ pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool) !
             defer closeCronDb(db);
             var buf: std.ArrayListUnmanaged(u8) = .empty;
             defer buf.deinit(allocator);
-            dbListJobsJson(db, &buf, allocator, json_limit) catch break :db_blk;
+            dbListJobsJsonFiltered(db, &buf, allocator, json_limit, filter) catch break :db_blk;
             const stdout = std.fs.File.stdout();
             stdout.writeAll(buf.items) catch {};
             stdout.writeAll("\n") catch {};
@@ -3763,9 +3830,44 @@ pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool) !
         stdout.writeAll("  nullclaw cron once 30m 'echo reminder'\n") catch {};
         return;
     }
+
+    var jobs_to_print: []CronJob = undefined;
+    var jobs_to_print_owned = false;
+    if (filter.hasAny()) {
+        const db_path_z = getCronDbPathZ(allocator) catch null;
+        defer if (db_path_z) |p| allocator.free(p);
+        if (db_path_z) |dbp| {
+            const db = try openCronDbForReadAtPath(allocator, dbp);
+            defer closeCronDb(db);
+
+            const ids = try dbListFilteredJobIds(db, allocator, filter, limit);
+            defer freeCronListIds(allocator, ids);
+
+            jobs_to_print = try selectCronJobsByIds(allocator, all_jobs, ids);
+            jobs_to_print_owned = true;
+        } else {
+            jobs_to_print = &.{};
+        }
+
+        const summary = try cronListFilterSummary(allocator, filter);
+        defer allocator.free(summary);
+        stdout.writeAll("Filter: ") catch {};
+        stdout.writeAll(summary) catch {};
+        stdout.writeAll("\n") catch {};
+
+        if (jobs_to_print.len == 0) {
+            stdout.writeAll("No jobs match filter.\n") catch {};
+            if (jobs_to_print_owned) allocator.free(jobs_to_print);
+            return;
+        }
+    } else {
+        jobs_to_print = @constCast(all_jobs);
+    }
+    defer if (jobs_to_print_owned) allocator.free(jobs_to_print);
+
     var out_buf: [4096]u8 = undefined;
     var bw = stdout.writer(&out_buf);
-    try printWeeklyTable(allocator, all_jobs, std.time.timestamp(), &bw.interface);
+    try printWeeklyTable(allocator, jobs_to_print, std.time.timestamp(), &bw.interface);
 }
 
 /// CLI: show upcoming schedule within a time window, or all jobs.
@@ -7258,11 +7360,143 @@ fn appendJsonStr(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, s: 
     try buf.append(alloc, '"');
 }
 
+fn cronListStatusNeedsRunJoin(filter: CronListFilter) bool {
+    return if (filter.status) |status| status != .paused else false;
+}
+
+fn appendCronListFromWhereSql(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, filter: CronListFilter) !void {
+    try buf.appendSlice(allocator, " FROM cron_jobs AS j");
+    if (cronListStatusNeedsRunJoin(filter)) {
+        try buf.appendSlice(
+            allocator,
+            " LEFT JOIN cron_runs AS lr ON lr.id = (" ++
+                "SELECT r.id FROM cron_runs AS r WHERE r.job_id = j.id " ++
+                "ORDER BY r.finished_at DESC, r.id DESC LIMIT 1)",
+        );
+    }
+    try buf.appendSlice(allocator, " WHERE 1=1");
+    if (filter.skill != null) {
+        try buf.appendSlice(allocator, " AND j.job_type='skill' AND j.skill_name=?");
+    }
+    if (filter.channel != null) {
+        try buf.appendSlice(allocator, " AND j.delivery_channel=?");
+    }
+    if (filter.to != null) {
+        try buf.appendSlice(allocator, " AND j.delivery_to=?");
+    }
+    if (filter.status) |status| {
+        switch (status) {
+            .paused => try buf.appendSlice(allocator, " AND j.paused=1"),
+            .ok, .@"error" => try buf.appendSlice(allocator, " AND lr.status=?"),
+        }
+    }
+    if (filter.match_text != null) {
+        try buf.appendSlice(
+            allocator,
+            " AND (" ++
+                "LOWER(j.id) LIKE '%' || LOWER(?) || '%' OR " ++
+                "LOWER(j.expression) LIKE '%' || LOWER(?) || '%' OR " ++
+                "LOWER(COALESCE(j.command,'')) LIKE '%' || LOWER(?) || '%' OR " ++
+                "LOWER(COALESCE(j.prompt,'')) LIKE '%' || LOWER(?) || '%' OR " ++
+                "LOWER(COALESCE(j.skill_name,'')) LIKE '%' || LOWER(?) || '%' OR " ++
+                "LOWER(COALESCE(j.skill_args,'')) LIKE '%' || LOWER(?) || '%')",
+        );
+    }
+}
+
+fn bindCronListFilter(stmt: *c.sqlite3_stmt, filter: CronListFilter) c_int {
+    var idx: c_int = 1;
+    if (filter.skill) |value| {
+        _ = c.sqlite3_bind_text(stmt, idx, value.ptr, @intCast(value.len), SQLITE_STATIC);
+        idx += 1;
+    }
+    if (filter.channel) |value| {
+        _ = c.sqlite3_bind_text(stmt, idx, value.ptr, @intCast(value.len), SQLITE_STATIC);
+        idx += 1;
+    }
+    if (filter.to) |value| {
+        _ = c.sqlite3_bind_text(stmt, idx, value.ptr, @intCast(value.len), SQLITE_STATIC);
+        idx += 1;
+    }
+    if (filter.status) |status| switch (status) {
+        .paused => {},
+        .ok, .@"error" => {
+            const value = status.asStr();
+            _ = c.sqlite3_bind_text(stmt, idx, value.ptr, @intCast(value.len), SQLITE_STATIC);
+            idx += 1;
+        },
+    };
+    if (filter.match_text) |value| {
+        var n: u8 = 0;
+        while (n < 6) : (n += 1) {
+            _ = c.sqlite3_bind_text(stmt, idx, value.ptr, @intCast(value.len), SQLITE_STATIC);
+            idx += 1;
+        }
+    }
+    return idx;
+}
+
+fn dbListFilteredJobIds(db: *c.sqlite3, allocator: std.mem.Allocator, filter: CronListFilter, limit: usize) ![][]const u8 {
+    var sql_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer sql_buf.deinit(allocator);
+    try sql_buf.appendSlice(allocator, "SELECT j.id");
+    try appendCronListFromWhereSql(&sql_buf, allocator, filter);
+    try sql_buf.appendSlice(allocator, " ORDER BY j.rowid ASC LIMIT ?");
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql_buf.items.ptr, @intCast(sql_buf.items.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    const limit_idx = bindCronListFilter(stmt.?, filter);
+    _ = c.sqlite3_bind_int64(stmt, limit_idx, if (limit == 0) -1 else @intCast(limit));
+
+    var ids: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (ids.items) |id| allocator.free(id);
+        ids.deinit(allocator);
+    }
+
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        const id_ptr = c.sqlite3_column_text(stmt, 0);
+        const id_len: usize = if (id_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 0)) else 0;
+        try ids.append(allocator, try allocator.dupe(u8, if (id_ptr != null) id_ptr[0..id_len] else ""));
+    }
+    return try ids.toOwnedSlice(allocator);
+}
+
+fn freeCronListIds(allocator: std.mem.Allocator, ids: [][]const u8) void {
+    for (ids) |id| allocator.free(id);
+    allocator.free(ids);
+}
+
+fn selectCronJobsByIds(allocator: std.mem.Allocator, all_jobs: []const CronJob, ids: []const []const u8) ![]CronJob {
+    var selected: std.ArrayListUnmanaged(CronJob) = .empty;
+    errdefer selected.deinit(allocator);
+    for (ids) |id| {
+        for (all_jobs) |job| {
+            if (std.mem.eql(u8, job.id, id)) {
+                try selected.append(allocator, job);
+                break;
+            }
+        }
+    }
+    return try selected.toOwnedSlice(allocator);
+}
+
 /// Query all rows from cron_jobs and write a JSON array into buf.
 /// Column order in the SELECT matches the field order documented in the function body.
 /// Caller owns the buf contents (allocated with allocator).
 /// `limit` 0 means no limit (all rows).
 pub fn dbListJobsJson(db: *c.sqlite3, buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, limit: usize) !void {
+    try dbListJobsJsonFiltered(db, buf, allocator, limit, .{});
+}
+
+pub fn dbListJobsJsonFiltered(
+    db: *c.sqlite3,
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    limit: usize,
+    filter: CronListFilter,
+) !void {
     // SELECT column indices:
     //  0  id
     //  1  expression
@@ -7289,19 +7523,24 @@ pub fn dbListJobsJson(db: *c.sqlite3, buf: *std.ArrayListUnmanaged(u8), allocato
     // 22  skill_args
     // 23  verification_mode
     // 24  repair_policy
-    const sql =
-        "SELECT id, expression, command, next_run_secs, last_run_secs, last_status, " ++
-        "last_output, paused, one_shot, job_type, enabled, delete_after_run, " ++
-        "prompt, model, delivery_mode, delivery_channel, delivery_account_id, " ++
-        "delivery_to, created_at_s, timeout_secs, delivery_best_effort, " ++
-        "skill_name, skill_args, verification_mode, repair_policy " ++
-        "FROM cron_jobs ORDER BY rowid ASC LIMIT ?1";
+    var sql_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer sql_buf.deinit(allocator);
+    try sql_buf.appendSlice(
+        allocator,
+        "SELECT j.id, j.expression, j.command, j.next_run_secs, j.last_run_secs, j.last_status, " ++
+            "j.last_output, j.paused, j.one_shot, j.job_type, j.enabled, j.delete_after_run, " ++
+            "j.prompt, j.model, j.delivery_mode, j.delivery_channel, j.delivery_account_id, " ++
+            "j.delivery_to, j.created_at_s, j.timeout_secs, j.delivery_best_effort, " ++
+            "j.skill_name, j.skill_args, j.verification_mode, j.repair_policy",
+    );
+    try appendCronListFromWhereSql(&sql_buf, allocator, filter);
+    try sql_buf.appendSlice(allocator, " ORDER BY j.rowid ASC LIMIT ?");
 
     var stmt: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    if (c.sqlite3_prepare_v2(db, sql_buf.items.ptr, @intCast(sql_buf.items.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
     defer _ = c.sqlite3_finalize(stmt);
-    // Bind limit: -1 means no limit in SQLite.
-    _ = c.sqlite3_bind_int64(stmt, 1, if (limit == 0) -1 else @intCast(limit));
+    const limit_idx = bindCronListFilter(stmt.?, filter);
+    _ = c.sqlite3_bind_int64(stmt, limit_idx, if (limit == 0) -1 else @intCast(limit));
 
     var int_buf: [32]u8 = undefined;
     var first = true;
@@ -10123,6 +10362,157 @@ test "dbListJobsJson respects limit parameter" {
         count0 += 1;
     };
     try std.testing.expectEqual(@as(usize, 3), count0);
+}
+
+fn seedCronListFilterFixture(db: *c.sqlite3) !void {
+    try ensureCronTable(db);
+    const sql =
+        "INSERT INTO cron_jobs(id, expression, command, prompt, next_run_secs, job_type, paused, enabled, delivery_mode, delivery_channel, delivery_to, skill_name, skill_args) VALUES" ++
+        "('job-oil', '0 8 * * *', NULL, NULL, 10, 'skill', 0, 1, 'always', 'telegram', 'chat-1', 'oilcon', '--market WTI')," ++
+        "('job-dough', '0 9 * * *', NULL, NULL, 20, 'skill', 0, 1, 'always', 'telegram', 'chat-2', 'doughcon', '--region TW')," ++
+        "('job-shell', '*/5 * * * *', 'Echo Mixed Case', NULL, 30, 'shell', 0, 1, 'none', NULL, NULL, NULL, NULL)," ++
+        "('job-agent', '15 * * * *', NULL, 'Prompt about weather', 40, 'agent', 0, 1, 'always', 'slack', 'team-1', NULL, NULL)," ++
+        "('job-paused', '30 * * * *', 'echo paused', NULL, 50, 'shell', 1, 1, 'none', NULL, NULL, NULL, NULL);";
+    if (c.sqlite3_exec(db, sql, null, null, null) != c.SQLITE_OK) return error.InsertFailed;
+
+    const runs_sql =
+        "INSERT INTO cron_runs(job_id, started_at, finished_at, status) VALUES" ++
+        "('job-oil', 1, 1, 'ok')," ++
+        "('job-dough', 1, 2, 'ok')," ++
+        "('job-dough', 2, 3, 'error')," ++
+        "('job-shell', 1, 4, 'ok');";
+    if (c.sqlite3_exec(db, runs_sql, null, null, null) != c.SQLITE_OK) return error.InsertFailed;
+}
+
+fn jsonObjectCount(json: []const u8) usize {
+    var count: usize = 0;
+    for (json) |ch| {
+        if (ch == '{') count += 1;
+    }
+    return count;
+}
+
+fn expectJsonContainsId(json: []const u8, id: []const u8, expected: bool) !void {
+    var needle_buf: [128]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&needle_buf, "\"id\":\"{s}\"", .{id});
+    try std.testing.expectEqual(expected, std.mem.indexOf(u8, json, needle) != null);
+}
+
+fn listJobsJsonForTest(db: *c.sqlite3, filter: CronListFilter, limit: usize) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(std.testing.allocator);
+    try dbListJobsJsonFiltered(db, &buf, std.testing.allocator, limit, filter);
+    return try buf.toOwnedSlice(std.testing.allocator);
+}
+
+test "dbListJobsJsonFiltered applies individual filters" {
+    // Regression: cron list filters should not require shelling through `cron list --json | grep`.
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try seedCronListFilterFixture(db);
+
+    const by_skill = try listJobsJsonForTest(db, .{ .skill = "oilcon" }, 0);
+    defer std.testing.allocator.free(by_skill);
+    try std.testing.expectEqual(@as(usize, 1), jsonObjectCount(by_skill));
+    try expectJsonContainsId(by_skill, "job-oil", true);
+    try expectJsonContainsId(by_skill, "job-dough", false);
+
+    const by_channel = try listJobsJsonForTest(db, .{ .channel = "slack" }, 0);
+    defer std.testing.allocator.free(by_channel);
+    try std.testing.expectEqual(@as(usize, 1), jsonObjectCount(by_channel));
+    try expectJsonContainsId(by_channel, "job-agent", true);
+
+    const by_to = try listJobsJsonForTest(db, .{ .to = "chat-2" }, 0);
+    defer std.testing.allocator.free(by_to);
+    try std.testing.expectEqual(@as(usize, 1), jsonObjectCount(by_to));
+    try expectJsonContainsId(by_to, "job-dough", true);
+}
+
+test "dbListJobsJsonFiltered combines filters with AND semantics" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try seedCronListFilterFixture(db);
+
+    const matched = try listJobsJsonForTest(db, .{ .skill = "oilcon", .channel = "telegram", .to = "chat-1" }, 0);
+    defer std.testing.allocator.free(matched);
+    try std.testing.expectEqual(@as(usize, 1), jsonObjectCount(matched));
+    try expectJsonContainsId(matched, "job-oil", true);
+
+    const empty = try listJobsJsonForTest(db, .{ .skill = "oilcon", .channel = "slack" }, 0);
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqualStrings("[]", empty);
+}
+
+test "dbListJobsJsonFiltered supports empty JSON and human filter summary" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try seedCronListFilterFixture(db);
+
+    const filter = CronListFilter{ .match_text = "missing" };
+    const json = try listJobsJsonForTest(db, filter, 0);
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings("[]", json);
+
+    const ids = try dbListFilteredJobIds(db, std.testing.allocator, filter, 0);
+    defer freeCronListIds(std.testing.allocator, ids);
+    try std.testing.expectEqual(@as(usize, 0), ids.len);
+
+    const summary = try cronListFilterSummary(std.testing.allocator, filter);
+    defer std.testing.allocator.free(summary);
+    try std.testing.expectEqualStrings("match=missing", summary);
+}
+
+test "dbListJobsJsonFiltered match is case insensitive" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try seedCronListFilterFixture(db);
+
+    const json = try listJobsJsonForTest(db, .{ .match_text = "mixed case" }, 0);
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqual(@as(usize, 1), jsonObjectCount(json));
+    try expectJsonContainsId(json, "job-shell", true);
+}
+
+test "dbListJobsJsonFiltered status uses latest run and paused flag" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try seedCronListFilterFixture(db);
+
+    const ok_json = try listJobsJsonForTest(db, .{ .status = .ok }, 0);
+    defer std.testing.allocator.free(ok_json);
+    try expectJsonContainsId(ok_json, "job-oil", true);
+    try expectJsonContainsId(ok_json, "job-shell", true);
+    try expectJsonContainsId(ok_json, "job-dough", false);
+
+    const error_json = try listJobsJsonForTest(db, .{ .status = .@"error" }, 0);
+    defer std.testing.allocator.free(error_json);
+    try std.testing.expectEqual(@as(usize, 1), jsonObjectCount(error_json));
+    try expectJsonContainsId(error_json, "job-dough", true);
+
+    const paused_json = try listJobsJsonForTest(db, .{ .status = .paused }, 0);
+    defer std.testing.allocator.free(paused_json);
+    try std.testing.expectEqual(@as(usize, 1), jsonObjectCount(paused_json));
+    try expectJsonContainsId(paused_json, "job-paused", true);
 }
 
 test "cliSchedule json_out honors show_today flag" {

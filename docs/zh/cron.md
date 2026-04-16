@@ -116,6 +116,15 @@ nullclaw cron degraded --hours 24
 nullclaw cron degraded --job <id> --hours 168
 ```
 
+若要找任務，不需要把 JSON pipe 給 `grep`；可直接 filter `cron list`。多個 filter 會以 AND 合併：
+
+```bash
+nullclaw cron list --skill oilcon
+nullclaw cron list --channel telegram --to 7972814626
+nullclaw cron list --status error
+nullclaw cron list --match oil --json
+```
+
 依 trace 查詢單次執行：
 
 ```bash
