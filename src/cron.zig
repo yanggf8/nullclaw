@@ -5806,6 +5806,241 @@ pub fn cliShowJob(
     if (row_count == 0) log.info("Recent runs:  (none)", .{});
 }
 
+fn cronSchedulerSourceForJobType(job_type: []const u8) []const u8 {
+    if (std.mem.eql(u8, job_type, "skill")) return "cron_scheduler_skill";
+    if (std.mem.eql(u8, job_type, "agent")) return "cron_scheduler_agent";
+    return "cron_scheduler_shell";
+}
+
+fn appendTruncated(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text: []const u8, max_len: usize) !void {
+    const n = @min(text.len, max_len);
+    try buf.appendSlice(allocator, text[0..n]);
+    if (text.len > max_len) try buf.appendSlice(allocator, "...");
+}
+
+fn extractScriptPathFromResolved(resolved: []const u8) []const u8 {
+    const prefix = "python3 ";
+    if (!std.mem.startsWith(u8, resolved, prefix)) return resolved;
+    const rest = resolved[prefix.len..];
+    const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+    return rest[0..end];
+}
+
+fn buildCronExplainJob(
+    allocator: std.mem.Allocator,
+    db: *c.sqlite3,
+    id: []const u8,
+    json_out: bool,
+    skills_dir: []const u8,
+    home: []const u8,
+) ![]const u8 {
+    const sql =
+        "SELECT expression, job_type, command, prompt, model, next_run_secs, " ++
+        "paused, enabled, one_shot, delivery_mode, delivery_channel, delivery_account_id, " ++
+        "delivery_to, delivery_best_effort, timeout_secs, session_target, skill_name, " ++
+        "skill_args, verification_mode, repair_policy, tz_offset_s " ++
+        "FROM cron_jobs WHERE id=?1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_DONE) return error.NotFound;
+    if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const expr = (try dbColumnTextOpt(stmt, 0, a)) orelse "";
+    const job_type = (try dbColumnTextOpt(stmt, 1, a)) orelse "shell";
+    const command = try dbColumnTextOpt(stmt, 2, a);
+    const prompt = try dbColumnTextOpt(stmt, 3, a);
+    const model = try dbColumnTextOpt(stmt, 4, a);
+    const paused = c.sqlite3_column_int(stmt, 6) != 0;
+    const enabled = c.sqlite3_column_int(stmt, 7) != 0;
+    const one_shot = c.sqlite3_column_int(stmt, 8) != 0;
+    const delivery_mode = (try dbColumnTextOpt(stmt, 9, a)) orelse "none";
+    const delivery_channel = try dbColumnTextOpt(stmt, 10, a);
+    const delivery_account = try dbColumnTextOpt(stmt, 11, a);
+    const delivery_to = try dbColumnTextOpt(stmt, 12, a);
+    const delivery_best_effort = c.sqlite3_column_int(stmt, 13) != 0;
+    const timeout_raw = c.sqlite3_column_int(stmt, 14);
+    const has_timeout = c.sqlite3_column_type(stmt, 14) != c.SQLITE_NULL and timeout_raw > 0;
+    const session_target = (try dbColumnTextOpt(stmt, 15, a)) orelse "isolated";
+    const skill_name = try dbColumnTextOpt(stmt, 16, a);
+    const skill_args = try dbColumnTextOpt(stmt, 17, a);
+    const verification_mode = (try dbColumnTextOpt(stmt, 18, a)) orelse "none";
+    const repair_policy = (try dbColumnTextOpt(stmt, 19, a)) orelse "none";
+    const tz_offset_s: i32 = @intCast(c.sqlite3_column_int(stmt, 20));
+    const fresh_next = nextRunForCronExpressionTz(expr, std.time.timestamp(), tz_offset_s) catch c.sqlite3_column_int64(stmt, 5);
+    const source = cronSchedulerSourceForJobType(job_type);
+
+    var resolved_cmd: ?[]const u8 = null;
+    defer if (resolved_cmd) |cmd| allocator.free(cmd);
+    var resolution_error: ?[]const u8 = null;
+    if (std.mem.eql(u8, job_type, "skill")) {
+        resolved_cmd = resolveSkillExecFrom(allocator, skill_name, skill_args, skills_dir, home) catch |err| blk: {
+            resolution_error = @errorName(err);
+            break :blk null;
+        };
+    }
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var int_buf: [32]u8 = undefined;
+
+    if (json_out) {
+        try buf.appendSlice(allocator, "{\"job\":{\"id\":");
+        try appendJsonStr(&buf, allocator, id);
+        try buf.appendSlice(allocator, ",\"type\":");
+        try appendJsonStr(&buf, allocator, job_type);
+        try buf.appendSlice(allocator, ",\"expression\":");
+        try appendJsonStr(&buf, allocator, expr);
+        try buf.appendSlice(allocator, ",\"tz_offset_s\":");
+        try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{tz_offset_s}) catch "0");
+        try buf.appendSlice(allocator, ",\"next_run_secs\":");
+        try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{fresh_next}) catch "0");
+        try buf.appendSlice(allocator, ",\"enabled\":");
+        try buf.appendSlice(allocator, if (enabled) "true" else "false");
+        try buf.appendSlice(allocator, ",\"paused\":");
+        try buf.appendSlice(allocator, if (paused) "true" else "false");
+        try buf.appendSlice(allocator, ",\"one_shot\":");
+        try buf.appendSlice(allocator, if (one_shot) "true" else "false");
+        try buf.appendSlice(allocator, "},\"execution\":{\"source\":");
+        try appendJsonStr(&buf, allocator, source);
+        try buf.appendSlice(allocator, ",\"session_target\":");
+        try appendJsonStr(&buf, allocator, session_target);
+        try buf.appendSlice(allocator, ",\"timeout_secs\":");
+        if (has_timeout) try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{timeout_raw}) catch "0") else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"command\":");
+        if (command) |v| try appendJsonStr(&buf, allocator, v) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"prompt\":");
+        if (prompt) |v| try appendJsonStr(&buf, allocator, v) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"skill_name\":");
+        if (skill_name) |v| try appendJsonStr(&buf, allocator, v) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"skill_args\":");
+        if (skill_args) |v| try appendJsonStr(&buf, allocator, v) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"resolved_command\":");
+        if (resolved_cmd) |v| try appendJsonStr(&buf, allocator, v) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"resolution_error\":");
+        if (resolution_error) |v| try appendJsonStr(&buf, allocator, v) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, "},\"delivery\":{\"mode\":");
+        try appendJsonStr(&buf, allocator, delivery_mode);
+        try buf.appendSlice(allocator, ",\"channel\":");
+        if (delivery_channel) |v| try appendJsonStr(&buf, allocator, v) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"account\":");
+        if (delivery_account) |v| try appendJsonStr(&buf, allocator, v) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"to\":");
+        if (delivery_to) |v| try appendJsonStr(&buf, allocator, v) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"best_effort\":");
+        try buf.appendSlice(allocator, if (delivery_best_effort) "true" else "false");
+        try buf.appendSlice(allocator, "},\"verification\":{\"mode\":");
+        try appendJsonStr(&buf, allocator, verification_mode);
+        try buf.appendSlice(allocator, ",\"repair_policy\":");
+        try appendJsonStr(&buf, allocator, repair_policy);
+        try buf.appendSlice(allocator, "},\"env\":{\"NULLCLAW_EXECUTION_SOURCE\":");
+        try appendJsonStr(&buf, allocator, source);
+        try buf.appendSlice(allocator, ",\"NULLCLAW_JOB_ID\":\"<will be set at runtime>\",\"NULLCLAW_SENSORIUM_STATE\":\"session_only_not_attached\"}}");
+        return try buf.toOwnedSlice(allocator);
+    }
+
+    try buf.appendSlice(allocator, "Job: ");
+    try buf.appendSlice(allocator, id);
+    try buf.appendSlice(allocator, "\nType: ");
+    try buf.appendSlice(allocator, job_type);
+    try buf.appendSlice(allocator, "\nExpression: ");
+    try buf.appendSlice(allocator, expr);
+    if (tz_offset_s != 0) {
+        var tz_buf: [16]u8 = undefined;
+        try buf.appendSlice(allocator, "  (tz: ");
+        try buf.appendSlice(allocator, formatUtcOffsetLabel(tz_offset_s, &tz_buf));
+        try buf.append(allocator, ')');
+    }
+    try buf.append(allocator, '\n');
+    try appendCronShowTimestampLines(&buf, allocator, "Next run", fresh_next, tz_offset_s);
+    try buf.appendSlice(allocator, "Enabled: ");
+    try buf.appendSlice(allocator, if (enabled) "yes" else "no");
+    try buf.appendSlice(allocator, "  Paused: ");
+    try buf.appendSlice(allocator, if (paused) "yes" else "no");
+    try buf.appendSlice(allocator, "  One-shot: ");
+    try buf.appendSlice(allocator, if (one_shot) "yes" else "no");
+    try buf.appendSlice(allocator, "\n\n- Resolved execution -\n");
+    if (skill_name) |v| {
+        try buf.appendSlice(allocator, "Skill:           ");
+        try buf.appendSlice(allocator, v);
+        try buf.append(allocator, '\n');
+    }
+    if (resolved_cmd) |cmd| {
+        try buf.appendSlice(allocator, "Script path:     ");
+        try buf.appendSlice(allocator, extractScriptPathFromResolved(cmd));
+        try buf.appendSlice(allocator, "\nResolved:        ");
+        try buf.appendSlice(allocator, cmd);
+        try buf.append(allocator, '\n');
+    } else if (resolution_error) |err| {
+        try buf.appendSlice(allocator, "Resolution error: ");
+        try buf.appendSlice(allocator, err);
+        try buf.append(allocator, '\n');
+    }
+    if (skill_args) |v| {
+        try buf.appendSlice(allocator, "Args:            ");
+        try buf.appendSlice(allocator, v);
+        try buf.append(allocator, '\n');
+    }
+    if (command) |v| {
+        try buf.appendSlice(allocator, "Command:         ");
+        try buf.appendSlice(allocator, v);
+        try buf.append(allocator, '\n');
+    }
+    if (prompt) |v| {
+        try buf.appendSlice(allocator, "Prompt:          ");
+        try appendTruncated(&buf, allocator, v, 200);
+        try buf.append(allocator, '\n');
+    }
+    _ = model;
+    try buf.appendSlice(allocator, "Timeout:         ");
+    if (has_timeout) try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d} seconds", .{timeout_raw}) catch "default 120s") else try buf.appendSlice(allocator, "default 120s");
+    try buf.appendSlice(allocator, "\nSession target:  ");
+    try buf.appendSlice(allocator, session_target);
+    try buf.appendSlice(allocator, "\n\n- Delivery -\nMode:           ");
+    try buf.appendSlice(allocator, delivery_mode);
+    try buf.appendSlice(allocator, "\nChannel:        ");
+    try buf.appendSlice(allocator, delivery_channel orelse "none");
+    try buf.appendSlice(allocator, "\nAccount:        ");
+    try buf.appendSlice(allocator, delivery_account orelse "none");
+    try buf.appendSlice(allocator, "\nTo:             ");
+    try buf.appendSlice(allocator, delivery_to orelse "none");
+    try buf.appendSlice(allocator, "\nBest-effort:    ");
+    try buf.appendSlice(allocator, if (delivery_best_effort) "yes" else "no");
+    try buf.appendSlice(allocator, "\n\n- Verification & repair -\nVerify mode:   ");
+    try buf.appendSlice(allocator, verification_mode);
+    try buf.appendSlice(allocator, "\nRepair policy: ");
+    try buf.appendSlice(allocator, repair_policy);
+    try buf.appendSlice(allocator, "\n\n- Trace env vars injected at spawn -\nNULLCLAW_EXECUTION_SOURCE=");
+    try buf.appendSlice(allocator, source);
+    try buf.appendSlice(allocator, "\nNULLCLAW_JOB_ID=<will be set at runtime>\nNULLCLAW_SENSORIUM_STATE=session_only_not_attached\n");
+    if (std.mem.eql(u8, job_type, "skill")) try buf.appendSlice(allocator, "NULLCLAW_SKILL_TIMEOUT=<manual skill runs only>\n");
+    return try buf.toOwnedSlice(allocator);
+}
+
+pub fn cliExplainJob(allocator: std.mem.Allocator, id: []const u8, json_out: bool) !void {
+    const db_path_z = getCronDbPathZ(allocator) catch return error.CronDbUnavailable;
+    defer allocator.free(db_path_z);
+    const db = openCronDbForReadAtPath(allocator, db_path_z) catch return error.CronDbUnavailable;
+    defer closeCronDb(db);
+
+    const home = try platform.getHomeDir(allocator);
+    defer allocator.free(home);
+    const skills_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "skills" });
+    defer allocator.free(skills_dir);
+
+    const output = try buildCronExplainJob(allocator, db, id, json_out, skills_dir, home);
+    defer allocator.free(output);
+    const stdout = std.fs.File.stdout();
+    stdout.writeAll(output) catch {};
+    stdout.writeAll("\n") catch {};
+}
+
 /// CLI: list run history for a cron job.
 pub fn cliListRuns(allocator: std.mem.Allocator, id: []const u8, limit: usize, json_out: bool) !void {
     const db_path_z = getCronDbPathZ(allocator) catch null;
@@ -10607,6 +10842,141 @@ test "dbListJobsJsonFiltered status uses latest run and paused flag" {
     defer std.testing.allocator.free(paused_json);
     try std.testing.expectEqual(@as(usize, 1), jsonObjectCount(paused_json));
     try expectJsonContainsId(paused_json, "job-paused", true);
+}
+
+fn makeExplainSkillFixture(tmp: *std.testing.TmpDir, allocator: std.mem.Allocator) !struct { home: []const u8, skills_dir: []const u8 } {
+    try tmp.dir.makePath("skills/oil/scripts");
+    const file = try tmp.dir.createFile("skills/oil/SKILL.md", .{});
+    defer file.close();
+    try file.writeAll(
+        \\# Oil Skill
+        \\
+        \\## Script
+        \\~/skills/oil/scripts/run.py
+        \\
+    );
+    const home = try tmp.dir.realpathAlloc(allocator, ".");
+    errdefer allocator.free(home);
+    const skills_dir = try std.fs.path.join(allocator, &.{ home, "skills" });
+    errdefer allocator.free(skills_dir);
+    return .{ .home = home, .skills_dir = skills_dir };
+}
+
+fn execExplainSql(db: *c.sqlite3, sql: []const u8) !void {
+    const sql_z = try std.testing.allocator.dupeZ(u8, sql);
+    defer std.testing.allocator.free(sql_z);
+    if (c.sqlite3_exec(db, sql_z.ptr, null, null, null) != c.SQLITE_OK) return error.InsertFailed;
+}
+
+test "cron explain skill job shows resolved path and args" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+    try execExplainSql(db, "INSERT INTO cron_jobs(id, expression, job_type, skill_name, skill_args, next_run_secs, enabled, delivery_mode, delivery_channel, delivery_to, timeout_secs, session_target, verification_mode, repair_policy) VALUES('skill-ok','0 8 * * *','skill','oil','--market WTI',1,1,'always','telegram','chat-1',120,'isolated','skill_contract','alert_only')");
+
+    const fx = try makeExplainSkillFixture(&iso.tmp, std.testing.allocator);
+    defer std.testing.allocator.free(fx.home);
+    defer std.testing.allocator.free(fx.skills_dir);
+
+    const out = try buildCronExplainJob(std.testing.allocator, db, "skill-ok", false, fx.skills_dir, fx.home);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Script path:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "/skills/oil/scripts/run.py") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Args:            --market WTI") != null);
+}
+
+test "cron explain skill job reports unsafe args inline" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+    try execExplainSql(db, "INSERT INTO cron_jobs(id, expression, job_type, skill_name, skill_args, next_run_secs, enabled, delivery_mode) VALUES('skill-bad','0 8 * * *','skill','oil','; evil',1,1,'none')");
+
+    const fx = try makeExplainSkillFixture(&iso.tmp, std.testing.allocator);
+    defer std.testing.allocator.free(fx.home);
+    defer std.testing.allocator.free(fx.skills_dir);
+
+    const out = try buildCronExplainJob(std.testing.allocator, db, "skill-bad", false, fx.skills_dir, fx.home);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Resolution error: UnsafeSkillArgs") != null);
+}
+
+test "cron explain agent job truncates prompt" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    const prompt = try std.testing.allocator.alloc(u8, 220);
+    defer std.testing.allocator.free(prompt);
+    @memset(prompt, 'a');
+    const sql = try std.fmt.allocPrint(std.testing.allocator, "INSERT INTO cron_jobs(id, expression, job_type, prompt, next_run_secs, enabled, delivery_mode) VALUES('agent-long','0 8 * * *','agent','{s}',1,1,'none')", .{prompt});
+    defer std.testing.allocator.free(sql);
+    try execExplainSql(db, sql);
+
+    const out = try buildCronExplainJob(std.testing.allocator, db, "agent-long", false, "/tmp/none", "/tmp");
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Prompt:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "...") != null);
+}
+
+test "cron explain shell job shows command without skill section" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+    try execExplainSql(db, "INSERT INTO cron_jobs(id, expression, job_type, command, next_run_secs, enabled, delivery_mode) VALUES('shell-one','0 8 * * *','shell','echo hello',1,1,'none')");
+
+    const out = try buildCronExplainJob(std.testing.allocator, db, "shell-one", false, "/tmp/none", "/tmp");
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Command:         echo hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Skill:") == null);
+}
+
+test "cron explain json is parseable" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+    try execExplainSql(db, "INSERT INTO cron_jobs(id, expression, job_type, command, next_run_secs, enabled, delivery_mode) VALUES('shell-json','0 8 * * *','shell','echo json',1,1,'none')");
+
+    const out = try buildCronExplainJob(std.testing.allocator, db, "shell-json", true, "/tmp/none", "/tmp");
+    defer std.testing.allocator.free(out);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+}
+
+test "cron explain no delivery config shows none" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+    try execExplainSql(db, "INSERT INTO cron_jobs(id, expression, job_type, command, next_run_secs, enabled, delivery_mode) VALUES('shell-none','0 8 * * *','shell','echo none',1,1,'none')");
+
+    const out = try buildCronExplainJob(std.testing.allocator, db, "shell-none", false, "/tmp/none", "/tmp");
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Mode:           none") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Channel:        none") != null);
 }
 
 test "cliSchedule json_out honors show_today flag" {

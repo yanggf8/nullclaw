@@ -131,6 +131,13 @@ nullclaw cron list --match oil --json
 nullclaw cron run-by-trace <trace_id>
 ```
 
+若要在任務執行前診斷它實際會跑什麼：
+
+```bash
+nullclaw cron explain <id>
+nullclaw cron explain <id> --json
+```
+
 Cron 啟動的 subprocess 會收到 trace 環境變數：
 
 | 變數 | 意義 |

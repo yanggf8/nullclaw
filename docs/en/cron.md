@@ -131,6 +131,13 @@ To inspect one run by trace:
 nullclaw cron run-by-trace <trace_id>
 ```
 
+To diagnose what a job will actually execute before it runs:
+
+```bash
+nullclaw cron explain <id>
+nullclaw cron explain <id> --json
+```
+
 Cron-spawned subprocesses receive trace environment variables:
 
 | Variable | Meaning |

@@ -98,6 +98,7 @@
 | `nullclaw cron once-agent <delay> "prompt" --model <model> [--session-target isolated\|main]` | 新增一次性 agent 延遲任務 |
 | `nullclaw cron run <id> [--dry-run]` | 立即執行指定任務，套用完整 verify/repair 流程（寫入 `manual=1` 執行記錄）。`--dry-run` 僅印出解析後的規格，不實際執行 |
 | `nullclaw cron show <id> [--runs N] [--json]` | 顯示單一任務的完整規格、下次觸發時間，以及最近 N 筆執行（預設 10 筆） |
+| `nullclaw cron explain <id> [--json]` | 顯示任務解析後的執行方式、傳送設定、驗證/修復策略與 trace 環境變數 |
 | `nullclaw cron pause <id>` / `resume <id>` | 暫停 / 恢復任務 |
 | `nullclaw cron remove <id>` | 刪除任務 |
 | `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>] [--verify <mode>] [--repair <policy>]` | 更新已有任務；`--enable` 同時清除 paused 標誌，`--disable` 同時設定 |
