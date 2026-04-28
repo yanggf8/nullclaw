@@ -7,11 +7,14 @@
 //!   - Ctrl+C graceful shutdown
 
 const std = @import("std");
+const std_compat = @import("compat");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
 const CronScheduler = @import("cron.zig").CronScheduler;
 const cron = @import("cron.zig");
+const agent_runner = @import("agent_runner.zig");
 const bus_mod = @import("bus.zig");
 const channels_mod = @import("channels/root.zig");
 const dispatch = @import("channels/dispatch.zig");
@@ -40,6 +43,11 @@ const log = std.log.scoped(.daemon);
 
 /// How often the daemon state file is flushed (seconds).
 const STATUS_FLUSH_SECONDS: u64 = 5;
+
+/// Default heartbeat prompt sent to the agent when HEARTBEAT.md has tasks.
+const DEFAULT_HEARTBEAT_PROMPT =
+    "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. " ++
+    "Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.";
 
 /// Daemon heartbeat initializes memory/bootstrap runtime state before it
 /// settles into its periodic loop, so it needs the session-turn budget.
@@ -103,15 +111,15 @@ pub const DaemonState = struct {
 /// Compute the path to daemon_state.json from config.
 pub fn stateFilePath(allocator: std.mem.Allocator, config: *const Config) ![]u8 {
     // Use config directory (parent of config_path)
-    if (std.fs.path.dirname(config.config_path)) |dir| {
-        return std.fs.path.join(allocator, &.{ dir, "daemon_state.json" });
+    if (std_compat.fs.path.dirname(config.config_path)) |dir| {
+        return std_compat.fs.path.join(allocator, &.{ dir, "daemon_state.json" });
     }
     return allocator.dupe(u8, "daemon_state.json");
 }
 
 pub fn outboundDeliveryPath(allocator: std.mem.Allocator, config: *const Config) ![]u8 {
-    if (std.fs.path.dirname(config.config_path)) |dir| {
-        return std.fs.path.join(allocator, &.{ dir, "state", "outbound_delivery.json" });
+    if (std_compat.fs.path.dirname(config.config_path)) |dir| {
+        return std_compat.fs.path.join(allocator, &.{ dir, "state", "outbound_delivery.json" });
     }
     return allocator.dupe(u8, "outbound_delivery.json");
 }
@@ -123,12 +131,12 @@ pub fn writeStateFile(allocator: std.mem.Allocator, path: []const u8, state: *co
 
     try buf.appendSlice(allocator, "{\n");
     try buf.appendSlice(allocator, "  \"status\": \"running\",\n");
-    try std.fmt.format(buf.writer(allocator), "  \"gateway\": \"{s}:{d}\",\n", .{ state.gateway_host, state.gateway_port });
+    try buf.print(allocator, "  \"gateway\": \"{s}:{d}\",\n", .{ state.gateway_host, state.gateway_port });
 
     // Tunnel info
-    try std.fmt.format(buf.writer(allocator), "  \"tunnel_provider\": \"{s}\",\n", .{state.tunnel_provider});
+    try buf.print(allocator, "  \"tunnel_provider\": \"{s}\",\n", .{state.tunnel_provider});
     if (state.tunnel_url) |url| {
-        try std.fmt.format(buf.writer(allocator), "  \"tunnel_url\": \"{s}\",\n", .{url});
+        try buf.print(allocator, "  \"tunnel_url\": \"{s}\",\n", .{url});
     } else {
         try buf.appendSlice(allocator, "  \"tunnel_url\": null,\n");
     }
@@ -140,14 +148,14 @@ pub fn writeStateFile(allocator: std.mem.Allocator, path: []const u8, state: *co
         if (comp_opt) |comp| {
             if (!first) try buf.appendSlice(allocator, ",\n");
             first = false;
-            try std.fmt.format(buf.writer(allocator),
+            try buf.print(allocator,
                 \\    {{"name": "{s}", "running": {}, "restart_count": {d}}}
             , .{ comp.name, comp.running, comp.restart_count });
         }
     }
     try buf.appendSlice(allocator, "\n  ]\n}\n");
 
-    const file = try std.fs.createFileAbsolute(path, .{});
+    const file = try std_compat.fs.createFileAbsolute(path, .{});
     defer file.close();
     try file.writeAll(buf.items);
 }
@@ -180,8 +188,8 @@ pub fn isShutdownRequested() bool {
 
 /// Compute path to daemon.pid from config directory.
 pub fn pidFilePath(allocator: std.mem.Allocator, config: *const Config) ![]u8 {
-    if (std.fs.path.dirname(config.config_path)) |dir| {
-        return std.fs.path.join(allocator, &.{ dir, "daemon.pid" });
+    if (std_compat.fs.path.dirname(config.config_path)) |dir| {
+        return std_compat.fs.path.join(allocator, &.{ dir, "daemon.pid" });
     }
     return allocator.dupe(u8, "daemon.pid");
 }
@@ -190,7 +198,7 @@ pub fn pidFilePath(allocator: std.mem.Allocator, config: *const Config) ![]u8 {
 fn writePidFile(allocator: std.mem.Allocator, config: *const Config) void {
     const path = pidFilePath(allocator, config) catch return;
     defer allocator.free(path);
-    const file = std.fs.createFileAbsolute(path, .{}) catch return;
+    const file = std_compat.fs.createFileAbsolute(path, .{}) catch return;
     defer file.close();
     const pid = getCurrentPid();
     var buf: [20]u8 = undefined;
@@ -202,14 +210,14 @@ fn writePidFile(allocator: std.mem.Allocator, config: *const Config) void {
 fn removePidFile(allocator: std.mem.Allocator, config: *const Config) void {
     const path = pidFilePath(allocator, config) catch return;
     defer allocator.free(path);
-    std.fs.deleteFileAbsolute(path) catch {};
+    std_compat.fs.deleteFileAbsolute(path) catch {};
 }
 
 /// Read PID from daemon.pid. Returns 0 on failure.
 pub fn readPidFile(allocator: std.mem.Allocator, config: *const Config) u32 {
     const path = pidFilePath(allocator, config) catch return 0;
     defer allocator.free(path);
-    const file = std.fs.openFileAbsolute(path, .{}) catch return 0;
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch return 0;
     defer file.close();
     var buf: [20]u8 = undefined;
     const len = file.readAll(&buf) catch return 0;
@@ -218,7 +226,6 @@ pub fn readPidFile(allocator: std.mem.Allocator, config: *const Config) u32 {
 }
 
 fn getCurrentPid() u32 {
-    const builtin = @import("builtin");
     if (builtin.os.tag == .linux) return @intCast(std.os.linux.getpid());
     if (builtin.os.tag == .macos) return @intCast(std.c.getpid());
     return 0;
@@ -228,7 +235,6 @@ fn getCurrentPid() u32 {
 
 /// Install SIGTERM/SIGINT handler so `kill PID` triggers graceful shutdown.
 fn installSignalHandlers() void {
-    const builtin = @import("builtin");
     if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
         const handler: std.posix.Sigaction = .{
             .handler = .{ .handler = signalHandler },
@@ -240,8 +246,39 @@ fn installSignalHandlers() void {
     }
 }
 
-fn signalHandler(_: c_int) callconv(.c) void {
+fn signalHandler(_: std.posix.SIG) callconv(.c) void {
     requestShutdown();
+}
+
+fn heartbeatDeliveryConfig(config: *const Config) ?cron.DeliveryConfig {
+    if (config.heartbeat.delivery_mode == null and
+        config.heartbeat.delivery_channel == null and
+        config.heartbeat.delivery_to == null and
+        config.heartbeat.delivery_account_id == null and
+        config.heartbeat.delivery_peer_kind == null and
+        config.heartbeat.delivery_peer_id == null and
+        config.heartbeat.delivery_thread_id == null and
+        config.heartbeat.delivery_best_effort)
+    {
+        return null;
+    }
+
+    return cron.enrichDeliveryRouting(.{
+        .mode = if (config.heartbeat.delivery_mode) |raw|
+            cron.DeliveryMode.parse(raw)
+        else
+            .none,
+        .channel = config.heartbeat.delivery_channel,
+        .account_id = config.heartbeat.delivery_account_id,
+        .to = config.heartbeat.delivery_to,
+        .peer_kind = if (config.heartbeat.delivery_peer_kind) |raw|
+            channel_adapters.parsePeerKind(raw)
+        else
+            null,
+        .peer_id = config.heartbeat.delivery_peer_id,
+        .thread_id = config.heartbeat.delivery_thread_id,
+        .best_effort = config.heartbeat.delivery_best_effort,
+    });
 }
 
 fn recordGatewayFailure(err: anyerror, state: *DaemonState) void {
@@ -274,7 +311,7 @@ fn gatewayThread(allocator: std.mem.Allocator, config: *const Config, host: []co
 
 /// Heartbeat thread — periodically writes state file, checks health, and
 /// runs HEARTBEAT.md polling ticks on the configured heartbeat interval.
-fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState) void {
+fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     const state_path = stateFilePath(allocator, config) catch return;
     defer allocator.free(state_path);
 
@@ -300,29 +337,53 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
     defer if (heartbeat_engine.bootstrap_provider) |bp| bp.deinit();
 
     const heartbeat_interval_ns: i128 = @as(i128, @intCast(heartbeat_engine.interval_minutes)) * 60 * std.time.ns_per_s;
-    var next_heartbeat_tick_at_ns: i128 = std.time.nanoTimestamp() + heartbeat_interval_ns;
+    var next_heartbeat_tick_at_ns: i128 = std_compat.time.nanoTimestamp() + heartbeat_interval_ns;
 
     while (!isShutdownRequested()) {
         writeStateFile(allocator, state_path, state) catch {};
         health.markComponentOk("heartbeat");
 
-        const now_ns = std.time.nanoTimestamp();
+        const now_ns = std_compat.time.nanoTimestamp();
         if (heartbeat_engine.enabled and now_ns >= next_heartbeat_tick_at_ns) {
             const tick_result = heartbeat_engine.tick(allocator) catch |err| {
                 log.warn("heartbeat tick failed: {s}", .{@errorName(err)});
                 next_heartbeat_tick_at_ns = now_ns + heartbeat_interval_ns;
-                std.Thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
+                std_compat.thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
                 continue;
             };
             switch (tick_result.outcome) {
-                .processed => log.info("heartbeat tick loaded {d} task(s) from HEARTBEAT.md", .{tick_result.task_count}),
+                .processed => {
+                    log.info("heartbeat tick loaded {d} task(s), dispatching agent", .{tick_result.task_count});
+                    if (builtin.is_test) {
+                        log.info("heartbeat: test mode, skipping agent dispatch", .{});
+                    } else {
+                        const delivery = heartbeatDeliveryConfig(config);
+                        const prompt = config.heartbeat.prompt orelse DEFAULT_HEARTBEAT_PROMPT;
+                        const result = agent_runner.run(allocator, config.workspace_dir, prompt, config.heartbeat.model, config.heartbeat.timeout_secs) catch |err| {
+                            log.warn("heartbeat agent dispatch failed: {s}", .{@errorName(err)});
+                            if (delivery) |cfg| {
+                                const failure_output = std.fmt.allocPrint(allocator, "heartbeat agent dispatch failed: {s}", .{@errorName(err)}) catch null;
+                                defer if (failure_output) |msg| allocator.free(msg);
+                                _ = cron.deliverResult(allocator, cfg, failure_output orelse "heartbeat agent dispatch failed", false, event_bus) catch {};
+                            }
+                            next_heartbeat_tick_at_ns = now_ns + heartbeat_interval_ns;
+                            std_compat.thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
+                            continue;
+                        };
+                        defer allocator.free(result.output);
+                        log.info("heartbeat agent completed (success={}, output_len={})", .{ result.success, result.output.len });
+                        if (delivery) |cfg| {
+                            _ = cron.deliverResult(allocator, cfg, result.output, result.success, event_bus) catch {};
+                        }
+                    }
+                },
                 .skipped_empty_file => log.debug("heartbeat tick skipped: HEARTBEAT.md has no actionable content", .{}),
                 .skipped_missing_file => log.debug("heartbeat tick skipped: HEARTBEAT.md is missing", .{}),
             }
             next_heartbeat_tick_at_ns = now_ns + heartbeat_interval_ns;
         }
 
-        std.Thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
+        std_compat.thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
     }
 }
 
@@ -570,7 +631,7 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     // reload/snapshot cadence — no daemon-level counter needed.
 
     while (!isShutdownRequested()) {
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
 
         // DB-direct path: delegate the tick loop to CronTicker on its own
         // thread. hasDbScheduler() may return false at the first few poll
@@ -634,7 +695,7 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
         if (!snapshot_ok) {
             var snapshot_sleep: u64 = 0;
             while (snapshot_sleep < poll_secs and !isShutdownRequested()) : (snapshot_sleep += 1) {
-                std.Thread.sleep(std.time.ns_per_s);
+                std_compat.thread.sleep(std.time.ns_per_s);
             }
             continue;
         }
@@ -654,20 +715,12 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
         }
         allocator.free(due_ids);
 
-        if (!snapshot_ok) {
-            var snapshot_sleep: u64 = 0;
-            while (snapshot_sleep < poll_secs and !isShutdownRequested()) : (snapshot_sleep += 1) {
-                std.Thread.sleep(std.time.ns_per_s);
-            }
-            continue;
-        }
-
         state.markRunning("scheduler");
         health.markComponentOk("scheduler");
 
         var slept: u64 = 0;
         while (slept < poll_secs and !isShutdownRequested()) : (slept += 1) {
-            std.Thread.sleep(std.time.ns_per_s);
+            std_compat.thread.sleep(std.time.ns_per_s);
         }
     }
 }
@@ -1522,7 +1575,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var tunnel = startConfiguredTunnel(allocator, config, host, port, &state);
 
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
     try stdout.print("nullclaw gateway runtime started\n", .{});
     try stdout.print("  Gateway:  http://{s}:{d}\n", .{ state.gateway_host, state.gateway_port });
@@ -1557,7 +1610,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var hb_thread: ?std.Thread = null;
     if (config.heartbeat.enabled) {
         state.markRunning("heartbeat");
-        if (std.Thread.spawn(.{ .stack_size = HEARTBEAT_THREAD_STACK_SIZE }, heartbeatThread, .{ allocator, config, &state })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = HEARTBEAT_THREAD_STACK_SIZE }, heartbeatThread, .{ allocator, config, &state, &event_bus })) |thread| {
             hb_thread = thread;
         } else |err| {
             state.markError("heartbeat", @errorName(err));
@@ -1636,8 +1689,8 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var dispatch_stats = dispatch.DispatchStats{};
     const delivery_path = try outboundDeliveryPath(allocator, config);
     defer allocator.free(delivery_path);
-    if (std.fs.path.dirname(delivery_path)) |delivery_dir| {
-        std.fs.makeDirAbsolute(delivery_dir) catch |err| switch (err) {
+    if (std_compat.fs.path.dirname(delivery_path)) |delivery_dir| {
+        std_compat.fs.makeDirAbsolute(delivery_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -1674,7 +1727,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     // Main thread: wait for shutdown signal (poll-based)
     while (!isShutdownRequested()) {
-        std.Thread.sleep(1 * std.time.ns_per_s);
+        std_compat.thread.sleep(1 * std.time.ns_per_s);
     }
 
     try stdout.print("\nShutting down...\n", .{});
@@ -2934,7 +2987,7 @@ test "stateFilePath derives from config_path" {
     };
     const path = try stateFilePath(std.testing.allocator, &config);
     defer std.testing.allocator.free(path);
-    const expected = try std.fs.path.join(std.testing.allocator, &.{ "/home/user/.nullclaw", "daemon_state.json" });
+    const expected = try std_compat.fs.path.join(std.testing.allocator, &.{ "/home/user/.nullclaw", "daemon_state.json" });
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, path);
 }
@@ -2965,15 +3018,40 @@ test "scheduler backoff progression" {
 
 test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
     if (!build_options.enable_sqlite) return error.SkipZigTest;
-
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
     const allocator = std.testing.allocator;
     const cmd_runtime = "echo merge_runtime_keep_7d1c";
     const cmd_external = "echo merge_external_add_9a42";
+    const env_name = try allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer allocator.free(env_name);
+    const previous_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer {
+        if (previous_home) |value| {
+            defer allocator.free(value);
+            const value_z = allocator.dupeZ(u8, value) catch unreachable;
+            defer allocator.free(value_z);
+            _ = c.setenv(env_name.ptr, value_z.ptr, 1);
+        } else {
+            _ = c.unsetenv(env_name.ptr);
+        }
+    }
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
+    const test_home = try std_compat.fs.path.join(allocator, &.{ base, "nullclaw-home" });
+    defer allocator.free(test_home);
+    const test_home_z = try allocator.dupeZ(u8, test_home);
+    defer allocator.free(test_home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, test_home_z.ptr, 1));
+
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/daemon_merge.db", .{base});
     defer allocator.free(db_path_str);
     const db_path = try allocator.dupeZ(u8, db_path_str);
@@ -3006,7 +3084,7 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
     _ = try external.addJob("*/5 * * * *", cmd_external);
     try cron.saveJobs(&external);
 
-    _ = loaded.tick(std.time.timestamp(), null);
+    _ = loaded.tick(std_compat.time.timestamp(), null);
     try mergeSchedulerTickChangesAndSave(allocator, &loaded, &before_tick);
 
     var merged = CronScheduler.init(allocator, 64, true);
@@ -3028,15 +3106,66 @@ test "daemon heartbeat thread stack matches session turn budget" {
     try std.testing.expectEqual(thread_stacks.SESSION_TURN_STACK_SIZE, HEARTBEAT_THREAD_STACK_SIZE);
 }
 
+test "heartbeatDeliveryConfig enriches routing" {
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .heartbeat = .{
+            .delivery_mode = "always",
+            .delivery_channel = "telegram",
+            .delivery_account_id = "backup",
+            .delivery_to = "-100123:thread:77",
+            .delivery_thread_id = "77",
+            .delivery_best_effort = false,
+        },
+    };
+
+    const delivery = heartbeatDeliveryConfig(&config) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(cron.DeliveryMode.always, delivery.mode);
+    try std.testing.expectEqualStrings("telegram", delivery.channel.?);
+    try std.testing.expectEqualStrings("backup", delivery.account_id.?);
+    try std.testing.expectEqualStrings("-100123:thread:77", delivery.to.?);
+    try std.testing.expectEqual(agent_routing.ChatType.group, delivery.peer_kind.?);
+    try std.testing.expectEqualStrings("-100123", delivery.peer_id.?);
+    try std.testing.expectEqualStrings("77", delivery.thread_id.?);
+    try std.testing.expect(!delivery.best_effort);
+}
+
 test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
     if (!build_options.enable_sqlite) return error.SkipZigTest;
-
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
     const allocator = std.testing.allocator;
+    const env_name = try allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer allocator.free(env_name);
+    const previous_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer {
+        if (previous_home) |value| {
+            defer allocator.free(value);
+            const value_z = allocator.dupeZ(u8, value) catch unreachable;
+            defer allocator.free(value_z);
+            _ = c.setenv(env_name.ptr, value_z.ptr, 1);
+        } else {
+            _ = c.unsetenv(env_name.ptr);
+        }
+    }
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
+    const test_home = try std_compat.fs.path.join(allocator, &.{ base, "nullclaw-home" });
+    defer allocator.free(test_home);
+    const test_home_z = try allocator.dupeZ(u8, test_home);
+    defer allocator.free(test_home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, test_home_z.ptr, 1));
+
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/daemon_agent_merge.db", .{base});
     defer allocator.free(db_path_str);
     const db_path = try allocator.dupeZ(u8, db_path_str);
@@ -3068,7 +3197,7 @@ test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
     defer external.deinit();
     try cron.saveJobs(&external);
 
-    _ = loaded.tick(std.time.timestamp(), null);
+    _ = loaded.tick(std_compat.time.timestamp(), null);
     try mergeSchedulerTickChangesAndSave(allocator, &loaded, &before_tick);
 
     var merged = CronScheduler.init(allocator, 32, true);
@@ -3092,7 +3221,7 @@ test "mergeSchedulerTickChangesAndSave preserves routing fields on existing job 
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/daemon_routing_merge.db", .{base});
     defer allocator.free(db_path_str);
@@ -3128,7 +3257,7 @@ test "mergeSchedulerTickChangesAndSave preserves routing fields on existing job 
     try buildSchedulerSnapshot(allocator, &loaded, &before_tick);
 
     // Job still exists on disk (no concurrent removal), so upsert takes the existing-job path.
-    _ = loaded.tick(std.time.timestamp(), null);
+    _ = loaded.tick(std_compat.time.timestamp(), null);
     try mergeSchedulerTickChangesAndSave(allocator, &loaded, &before_tick);
 
     var merged = CronScheduler.init(allocator, 32, true);
@@ -3192,7 +3321,7 @@ test "schedulerThread DB-direct path wires CronTicker and exits on shutdown" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
     const config_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "config.json" });
     defer std.testing.allocator.free(config_path);
@@ -3223,7 +3352,7 @@ test "schedulerThread DB-direct path wires CronTicker and exits on shutdown" {
     // Verify the DB file does not exist yet — so its presence after join
     // proves the DB-direct branch (CronTicker.run → tick → dbTickAndEnqueue →
     // openCronDbAtPath) actually executed.
-    std.fs.accessAbsolute(db_path, .{}) catch |err| switch (err) {
+    std_compat.fs.accessAbsolute(db_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {}, // expected — file doesn't exist yet
         else => return err,
     };
@@ -3236,14 +3365,14 @@ test "schedulerThread DB-direct path wires CronTicker and exits on shutdown" {
     // (RuntimeObserver, CronScheduler, loadJobs, setSharedScheduler) and
     // enter the DB-direct branch where CronTicker.run calls tick() once
     // before sleeping. 2 seconds is generous for test-machine variance.
-    std.Thread.sleep(2 * std.time.ns_per_s);
+    std_compat.thread.sleep(2 * std.time.ns_per_s);
     shutdown_requested.store(true, .release);
     thread.join();
 
     // The DB file's existence proves the DB-direct branch ran: only
     // CronTicker.run → tick → dbTickAndEnqueue → openCronDbAtPath creates it.
     // The legacy in-memory path and the skip-loop path never touch this file.
-    std.fs.accessAbsolute(db_path, .{}) catch |err| switch (err) {
+    std_compat.fs.accessAbsolute(db_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return error.DbDirectBranchDidNotExecute,
         else => return err,
     };
@@ -3256,7 +3385,7 @@ test "schedulerThread respects shutdown and destroys runtime observer" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
     const config_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "config.json" });
     defer std.testing.allocator.free(config_path);
@@ -3323,15 +3452,15 @@ test "writeStateFile produces valid content" {
     // Write to a temp path
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
+    const path = try std_compat.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
     defer std.testing.allocator.free(path);
 
     try writeStateFile(std.testing.allocator, path, &state);
 
     // Read back and verify
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(std.testing.allocator, 4096);
     defer std.testing.allocator.free(content);
@@ -3354,14 +3483,14 @@ test "writeStateFile includes tunnel fields" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
+    const path = try std_compat.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
     defer std.testing.allocator.free(path);
 
     try writeStateFile(std.testing.allocator, path, &state);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(std.testing.allocator, 4096);
     defer std.testing.allocator.free(content);
@@ -3381,14 +3510,14 @@ test "writeStateFile handles null tunnel_url" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
+    const path = try std_compat.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
     defer std.testing.allocator.free(path);
 
     try writeStateFile(std.testing.allocator, path, &state);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(std.testing.allocator, 4096);
     defer std.testing.allocator.free(content);

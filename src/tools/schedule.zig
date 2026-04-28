@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -123,10 +124,12 @@ pub const ScheduleTool = struct {
                         };
                         const status = row.last_status orelse "pending";
                         const cmd_label: []const u8 = if (row.skill_name) |sn| sn else if (row.name) |n| n else "?";
-                        const wr = ctx.buf.writer(ctx.alloc);
+                        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.alloc, ctx.buf);
+                        const wr = &buf_writer.writer;
                         try wr.print("- {s} | {s} | status={s}{s} | cmd: {s}", .{ row.id, row.expression, status, flags, cmd_label });
                         if (row.skill_args) |sa| try wr.print(" {s}", .{sa});
                         try wr.print("\n", .{});
+                        ctx.buf.* = buf_writer.toArrayList();
                         ctx.count.* += 1;
                     }
                 };
@@ -153,8 +156,7 @@ pub const ScheduleTool = struct {
             // Format job list
             var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(allocator);
-            const w = buf.writer(allocator);
-            try w.print("Scheduled jobs ({d}):\n", .{jobs.len});
+            try buf.print(allocator, "Scheduled jobs ({d}):\n", .{jobs.len});
             for (jobs) |job| {
                 const flags: []const u8 = blk: {
                     if (job.paused and job.one_shot) break :blk " [paused, one-shot]";
@@ -163,7 +165,7 @@ pub const ScheduleTool = struct {
                     break :blk "";
                 };
                 const status = job.last_status orelse "pending";
-                try w.print("- {s} | {s} | status={s}{s} | cmd: {s}\n", .{
+                try buf.print(allocator, "- {s} | {s} | status={s}{s} | cmd: {s}\n", .{
                     job.id,
                     job.expression,
                     status,
@@ -403,7 +405,7 @@ pub const ScheduleTool = struct {
                 var backend = be.backend();
                 var job_arena = std.heap.ArenaAllocator.init(allocator);
                 defer job_arena.deinit();
-                const now = std.time.timestamp();
+                const now = std_compat.time.timestamp();
                 const delay_secs = cron.parseDuration(delay) catch 60;
                 const is_agent_once = prompt != null;
                 const job = backend.add(job_arena.allocator(), .{

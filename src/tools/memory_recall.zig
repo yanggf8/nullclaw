@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -252,7 +253,7 @@ pub const MemoryRecallTool = struct {
     /// Returns null if the timestamp is missing, malformed, or in the future.
     fn ageInDays(timestamp: []const u8) ?i64 {
         const ts = std.fmt.parseInt(i64, std.mem.trim(u8, timestamp, " \t\r\n"), 10) catch return null;
-        const age_secs = std.time.timestamp() - ts;
+        const age_secs = std_compat.time.timestamp() - ts;
         if (age_secs < 0) return null;
         return @divFloor(age_secs, 86400);
     }
@@ -340,7 +341,7 @@ pub const MemoryRecallTool = struct {
             }
             // Freshness warning using created_at (i64 Unix epoch, 0 means unknown)
             if (cand.created_at > 0) {
-                const age_secs = std.time.timestamp() - cand.created_at;
+                const age_secs = std_compat.time.timestamp() - cand.created_at;
                 if (age_secs > 0) {
                     const days = @divFloor(age_secs, 86400);
                     if (days >= 30) {

@@ -13,6 +13,7 @@
 //! - Call backend.deinit() exactly once when done.
 //! - All returned data is allocated into the caller-supplied allocator.
 const std = @import("std");
+const std_compat = @import("compat");
 
 const root = @import("root.zig");
 const types = @import("types.zig");
@@ -30,7 +31,7 @@ const QueueEntry = struct {
 // ── MemoryCronBackend ────────────────────────────────────────────────────────
 
 pub const MemoryCronBackend = struct {
-    mu: std.Thread.Mutex = .{},
+    mu: std_compat.sync.Mutex = .{},
     sched: cron.CronScheduler,
     queue: std.ArrayListUnmanaged(QueueEntry) = .empty,
     next_queue_id: i64 = 1,
@@ -480,7 +481,7 @@ test "MemoryCronBackend enqueue and dequeue" {
         allocator.free(job.command);
     }
 
-    try be.enqueue(job.id, std.time.timestamp());
+    try be.enqueue(job.id, std_compat.time.timestamp());
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -507,7 +508,7 @@ test "MemoryCronBackend tick enqueues due jobs" {
     }
     _ = try be.update(job.id, .{ .next_run_secs = 1 });
 
-    const enqueued = try be.tick(std.time.timestamp());
+    const enqueued = try be.tick(std_compat.time.timestamp());
     try std.testing.expect(enqueued >= 1);
 }
 

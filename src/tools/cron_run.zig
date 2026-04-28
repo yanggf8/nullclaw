@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const platform = @import("../platform.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
@@ -49,7 +50,7 @@ pub const CronRunTool = struct {
         };
 
         // Execute the command
-        const result = std.process.Child.run(.{
+        const result = std_compat.process.Child.run(.{
             .allocator = allocator,
             .argv = &.{ platform.getShell(), platform.getShellFlag(), command },
             .max_output_bytes = 65536,
@@ -57,7 +58,7 @@ pub const CronRunTool = struct {
             // Update last_status to error
             if (scheduler.getMutableJob(job_id)) |job| {
                 job.last_status = "error";
-                job.last_run_secs = std.time.timestamp();
+                job.last_run_secs = std_compat.time.timestamp();
             }
             if (try persistSchedulerOrFail(allocator, &scheduler)) |persist_result| return persist_result;
 
@@ -68,7 +69,7 @@ pub const CronRunTool = struct {
         defer allocator.free(result.stderr);
 
         const exit_code: u8 = switch (result.term) {
-            .Exited => |code| code,
+            .exited => |code| code,
             else => 1,
         };
         const success = exit_code == 0;
@@ -77,7 +78,7 @@ pub const CronRunTool = struct {
         // Update job last_run and last_status
         if (scheduler.getMutableJob(job_id)) |job| {
             job.last_status = status_str;
-            job.last_run_secs = std.time.timestamp();
+            job.last_run_secs = std_compat.time.timestamp();
         }
         if (try persistSchedulerOrFail(allocator, &scheduler)) |persist_result| return persist_result;
 
@@ -133,7 +134,7 @@ test "cron_run_executes_command" {
     // Create a scheduler with an isolated tmp DB, not the real ~/.nullclaw/cron.db.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/test.db", .{base});
     defer std.testing.allocator.free(db_path_str);
@@ -153,7 +154,7 @@ test "cron_run_executes_command" {
     // Now execute the cron_run tool — it calls loadScheduler() which returns an
     // empty in-memory scheduler in test mode. We need to add the job there too.
     // Instead, directly test the execution logic via the scheduler we own.
-    const run_at = std.time.timestamp();
+    const run_at = std_compat.time.timestamp();
     if (scheduler.getMutableJob(job_id)) |j| {
         j.last_status = "ok";
         j.last_run_secs = run_at;

@@ -70,7 +70,7 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 | `nullclaw service restart` | Restart the background service |
 | `nullclaw service status` | Show service status |
 | `nullclaw service uninstall` | Remove the background service |
-| `nullclaw status` | Show overall system status |
+| `nullclaw status [--json]` | Show overall system status or emit the machine-readable runtime snapshot |
 | `nullclaw doctor` | Run diagnostics |
 | `nullclaw update --check` | Check for updates without installing |
 | `nullclaw update --yes` | Install updates without prompting |
@@ -90,10 +90,11 @@ Notes:
 
 | Command | Purpose |
 |---|---|
-| `nullclaw channel list` | List known and configured channels |
+| `nullclaw channel list [--json]` | List known and configured channels |
 | `nullclaw channel start` | Start the default available channel |
 | `nullclaw channel start telegram` | Start a specific channel |
 | `nullclaw channel status` | Show channel health |
+| `nullclaw channel info <type> [--json]` | Show configured accounts for one channel type |
 | `nullclaw channel add <type>` | Print guidance for adding a channel to config |
 | `nullclaw channel remove <name>` | Print guidance for removing a channel from config |
 
@@ -146,6 +147,7 @@ Unrecognized values are rejected with an error listing the allowed values — a 
 |---|---|
 | `nullclaw skills list` | List installed skills |
 | `nullclaw skills install <source>` | Install from a GitHub URL or local path |
+| `nullclaw skills install --name <query>` | Search the skill registry and install the best matching skill |
 | `nullclaw skills remove <name>` | Remove a skill |
 | `nullclaw skills info <name>` | Show skill metadata |
 
@@ -184,8 +186,11 @@ Unrecognized values are rejected with an error listing the allowed values — a 
 | `nullclaw workspace reset-md --include-bootstrap --clear-memory-md` | Reset bundled markdown files and optionally clear extra files |
 | `nullclaw capabilities` | Show a text capability summary |
 | `nullclaw capabilities --json` | Show a JSON capability manifest |
+| `nullclaw config show [--json]` | Print the full on-disk config |
+| `nullclaw config get <path> [--json]` | Read one dotted config value from disk |
 | `nullclaw models list` | List providers and default models |
 | `nullclaw models info <model>` | Show model details |
+| `nullclaw models summary [--json]` | Print the provider/key-safe admin summary used by integrations |
 | `nullclaw models benchmark` | Run model latency benchmark |
 | `nullclaw models refresh` | Refresh the model catalog |
 | `nullclaw migrate openclaw --dry-run` | Preview OpenClaw migration |
@@ -195,6 +200,7 @@ Notes:
 
 - `workspace edit` works only with file-based backends such as `markdown` and `hybrid`.
 - If bootstrap data is stored in the database backend, the CLI will tell you to use the agent's `memory_store` tool instead.
+- The `--json` read-side commands are intended for automation and for NullHub's managed-instance admin API boundary.
 
 ## Hardware and automation-facing entry points
 

@@ -9,6 +9,7 @@
 //! - All returned data (CronJob, CronJobOutput, DequeueResult) is allocated
 //!   into the caller-supplied allocator. Caller frees.
 const std = @import("std");
+const std_compat = @import("compat");
 const build_options = @import("build_options");
 
 const root = @import("root.zig");
@@ -92,7 +93,7 @@ pub const DbCronBackend = struct {
 
         // Generate a random UUID-style hex ID (same format as CronScheduler.allocateJobId).
         var raw_id: [16]u8 = undefined;
-        std.crypto.random.bytes(&raw_id);
+        std_compat.crypto.random.bytes(&raw_id);
         raw_id[6] = (raw_id[6] & 0x0f) | 0x40; // version 4
         raw_id[8] = (raw_id[8] & 0x3f) | 0x80; // variant
         var id_buf: [80]u8 = undefined;
@@ -106,7 +107,7 @@ pub const DbCronBackend = struct {
         const id = try allocator.dupe(u8, id_hex);
         errdefer allocator.free(id);
 
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         const next_run = if (spec.next_run_secs_override != 0)
             spec.next_run_secs_override
         else
@@ -439,7 +440,7 @@ fn dbApplyPatch(db: *c.sqlite3, id: []const u8, patch: types.CronJobPatch) !void
     if (patch.expression) |expr| {
         // Update expression AND recalculate next_run_secs so the scheduler
         // uses the new expression immediately (not after one stale firing).
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         const next_run: i64 = try cron.nextRunForCronExpressionTz(expr, now, tz_offset);
         try dbExecPatchExpression(db, expr, id, next_run);
     }
@@ -756,7 +757,7 @@ fn dbAtomicDequeue(db: *c.sqlite3, allocator: std.mem.Allocator) !?types.Dequeue
     const upd_sql = "UPDATE cron_run_queue SET status='in_progress', started_at=?1 WHERE id=?2";
     var upd: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(db, upd_sql, -1, &upd, null) == c.SQLITE_OK) {
-        _ = c.sqlite3_bind_int64(upd, 1, std.time.timestamp());
+        _ = c.sqlite3_bind_int64(upd, 1, std_compat.time.timestamp());
         _ = c.sqlite3_bind_int64(upd, 2, queue_row_id);
         _ = c.sqlite3_step(upd);
         _ = c.sqlite3_finalize(upd);
@@ -907,7 +908,7 @@ test "DbCronBackend add and get" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/add_get.db", .{base});
     defer allocator.free(db_path_str);
@@ -940,7 +941,7 @@ test "DbCronBackend remove returns false for missing" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/remove.db", .{base});
     defer allocator.free(db_path_str);
@@ -960,7 +961,7 @@ test "DbCronBackend pause and resumeJob" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/pause.db", .{base});
     defer allocator.free(db_path_str);
@@ -1002,7 +1003,7 @@ test "DbCronBackend enqueue and dequeue" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/deq.db", .{base});
     defer allocator.free(db_path_str);
@@ -1020,7 +1021,7 @@ test "DbCronBackend enqueue and dequeue" {
         allocator.free(job.command);
     }
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     try be.enqueue(job.id, now);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -1042,7 +1043,7 @@ test "DbCronBackend dequeue preserves delivery_best_effort and session_target" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/deq_spec.db", .{base});
     defer allocator.free(db_path_str);
@@ -1065,7 +1066,7 @@ test "DbCronBackend dequeue preserves delivery_best_effort and session_target" {
         allocator.free(job.command);
     }
 
-    try be.enqueue(job.id, std.time.timestamp());
+    try be.enqueue(job.id, std_compat.time.timestamp());
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -1080,7 +1081,7 @@ test "DbCronBackend skill job E2E: add → tick → dequeue → complete" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/skill_e2e.db", .{base});
     defer allocator.free(db_path_str);
@@ -1133,8 +1134,8 @@ test "DbCronBackend skill job E2E: add → tick → dequeue → complete" {
     try std.testing.expectEqualStrings("12345", loaded.delivery.to.?);
 
     // ── 3. TICK ─────────────────────────────────────────────────────
-    _ = try be.update(job.id, .{ .next_run_secs = std.time.timestamp() - 60 });
-    try std.testing.expectEqual(@as(usize, 1), try be.tick(std.time.timestamp()));
+    _ = try be.update(job.id, .{ .next_run_secs = std_compat.time.timestamp() - 60 });
+    try std.testing.expectEqual(@as(usize, 1), try be.tick(std_compat.time.timestamp()));
 
     // ── 4. DEQUEUE ──────────────────────────────────────────────────
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -1147,8 +1148,8 @@ test "DbCronBackend skill job E2E: add → tick → dequeue → complete" {
     try std.testing.expectEqual(@as(u32, 120), dr.spec.timeout_secs.?);
 
     // ── 4b. RESOLVE: skill → python3 script ─────────────────────────
-    try tmp.dir.makePath("skills/news");
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news");
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "skills/news/SKILL.md",
         .data = "# news\n\nFetch news.\n\n## Script\n\n~/scripts/news_fetcher.py\n\n## Notes\n\ntest\n",
     });
@@ -1161,7 +1162,7 @@ test "DbCronBackend skill job E2E: add → tick → dequeue → complete" {
     try std.testing.expectEqualStrings(expected_cmd, skill_cmd);
 
     // ── 5. COMPLETE ─────────────────────────────────────────────────
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     try be.complete(dr.spec.id, dr.queue_row_id, now, "ok", "skill output here", false);
 
     // ── 6. VERIFY final state ───────────────────────────────────────
@@ -1195,7 +1196,7 @@ test "DbCronBackend remove clears queued head job" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/remove_queue.db", .{base});
     defer allocator.free(db_path_str);
@@ -1219,7 +1220,7 @@ test "DbCronBackend remove clears queued head job" {
         allocator.free(second.command);
     }
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     try be.enqueue(first.id, now);
     try be.enqueue(second.id, now + 1);
     try std.testing.expect(try be.remove(first.id));
@@ -1237,7 +1238,7 @@ test "dbApplyPatch rolls back earlier updates when a later field fails" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/patch_rollback.db", .{base});
     defer allocator.free(db_path_str);
@@ -1285,7 +1286,7 @@ test "DbCronBackend complete deletes delete_after_run job and records run" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/complete_delete_after_run.db", .{base});
     defer allocator.free(db_path_str);
@@ -1307,7 +1308,7 @@ test "DbCronBackend complete deletes delete_after_run job and records run" {
         allocator.free(job.command);
     }
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     try be.enqueue(job.id, now);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -1339,7 +1340,7 @@ test "DbCronBackend tick enqueues due jobs" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/tick.db", .{base});
     defer allocator.free(db_path_str);
@@ -1360,7 +1361,7 @@ test "DbCronBackend tick enqueues due jobs" {
     // Force next_run_secs = 1 (well in the past).
     _ = try be.update(job.id, .{ .next_run_secs = 1 });
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     const enqueued = try be.tick(now);
     try std.testing.expect(enqueued >= 1);
 }
@@ -1370,7 +1371,7 @@ test "DbCronBackend resetInProgress" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/reset.db", .{base});
     defer allocator.free(db_path_str);
@@ -1390,7 +1391,7 @@ test "DbCronBackend listRows visitor" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/list.db", .{base});
     defer allocator.free(db_path_str);
@@ -1433,7 +1434,7 @@ test "DbCronBackend jobs survive bounce — add, reopen, remove, reopen" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/bounce.db", .{base});
     defer allocator.free(db_path_str);
@@ -1529,7 +1530,7 @@ test "dbManualEnqueueJob advances next_run_secs atomically" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/manual_enqueue.db", .{base});
     defer allocator.free(db_path_str);
@@ -1578,7 +1579,7 @@ test "dbManualEnqueueJob does not re-fire on subsequent tick" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/no_refire.db", .{base});
     defer allocator.free(db_path_str);
@@ -1611,7 +1612,7 @@ test "dbManualEnqueueJob returns JobNotFound for unknown id" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/notfound.db", .{base});
     defer allocator.free(db_path_str);

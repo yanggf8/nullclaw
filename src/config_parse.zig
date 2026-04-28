@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const types = @import("config_types.zig");
 const agent_routing = @import("agent_routing.zig");
 const model_refs = @import("model_refs.zig");
@@ -27,7 +28,7 @@ pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]co
 }
 
 fn decryptSecretField(allocator: std.mem.Allocator, config_path: []const u8, value: []const u8) ![]u8 {
-    const config_dir = std.fs.path.dirname(config_path) orelse ".";
+    const config_dir = std_compat.fs.path.dirname(config_path) orelse ".";
     const store = secrets.SecretStore.init(config_dir, true);
     return try store.decryptSecret(allocator, value);
 }
@@ -262,9 +263,9 @@ fn parseNamedAgentObject(
     if (item.object.get("system_prompt")) |sp| {
         if (sp == .string) {
             const val = sp.string;
-            if (std.fs.path.isAbsolute(val) and std.mem.indexOfScalar(u8, val, '\n') == null) {
+            if (std_compat.fs.path.isAbsolute(val) and std.mem.indexOfScalar(u8, val, '\n') == null) {
                 const file_content = blk: {
-                    const file = std.fs.openFileAbsolute(val, .{}) catch |err| {
+                    const file = std_compat.fs.openFileAbsolute(val, .{}) catch |err| {
                         log.info("system_prompt looks like a file path but failed to open '{s}': {s}", .{ val, @errorName(err) });
                         break :blk null;
                     };
@@ -876,7 +877,40 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             }
                             // Explicit interval_minutes (our internal field)
                             if (hb.object.get("interval_minutes")) |v| {
-                                if (v == .integer) self.heartbeat.interval_minutes = @intCast(v.integer);
+                                if (v == .integer and v.integer >= 0) self.heartbeat.interval_minutes = @intCast(v.integer);
+                            }
+                            if (hb.object.get("prompt")) |v| {
+                                if (v == .string) self.heartbeat.prompt = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("model")) |v| {
+                                if (v == .string) self.heartbeat.model = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("timeout_secs")) |v| {
+                                if (v == .integer and v.integer >= 0) self.heartbeat.timeout_secs = @intCast(v.integer);
+                            }
+                            if (hb.object.get("delivery_mode")) |v| {
+                                if (v == .string) self.heartbeat.delivery_mode = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_channel")) |v| {
+                                if (v == .string) self.heartbeat.delivery_channel = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_to")) |v| {
+                                if (v == .string) self.heartbeat.delivery_to = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_account_id")) |v| {
+                                if (v == .string) self.heartbeat.delivery_account_id = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_peer_kind")) |v| {
+                                if (v == .string) self.heartbeat.delivery_peer_kind = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_peer_id")) |v| {
+                                if (v == .string) self.heartbeat.delivery_peer_id = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_thread_id")) |v| {
+                                if (v == .string) self.heartbeat.delivery_thread_id = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_best_effort")) |v| {
+                                if (v == .bool) self.heartbeat.delivery_best_effort = v.bool;
                             }
                         }
                     }

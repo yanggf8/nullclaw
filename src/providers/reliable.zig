@@ -1,6 +1,9 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const model_refs = @import("../model_refs.zig");
+
+const text_helpers = @import("text_helpers.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
@@ -36,53 +39,12 @@ pub fn isNonRetryable(err_msg: []const u8) bool {
 
 /// Check if an error message indicates context window exhaustion.
 pub fn isContextExhausted(err_msg: []const u8) bool {
-    // Case-insensitive match against common patterns from LLM providers.
-    var lower_buf: [512]u8 = undefined;
-    const check_len = @min(err_msg.len, lower_buf.len);
-    for (err_msg[0..check_len], 0..) |c, idx| {
-        lower_buf[idx] = std.ascii.toLower(c);
-    }
-    const lower = lower_buf[0..check_len];
-
-    const has_context = std.mem.indexOf(u8, lower, "context") != null;
-    const has_token = std.mem.indexOf(u8, lower, "token") != null;
-    if (has_context and (std.mem.indexOf(u8, lower, "length") != null or
-        std.mem.indexOf(u8, lower, "maximum") != null or
-        std.mem.indexOf(u8, lower, "window") != null or
-        std.mem.indexOf(u8, lower, "exceed") != null))
-        return true;
-    if (has_token and (std.mem.indexOf(u8, lower, "limit") != null or
-        std.mem.indexOf(u8, lower, "too many") != null or
-        std.mem.indexOf(u8, lower, "maximum") != null or
-        std.mem.indexOf(u8, lower, "exceed") != null))
-        return true;
-    if (std.mem.indexOf(u8, lower, "413") != null and std.mem.indexOf(u8, lower, "too large") != null) return true;
-    return false;
+    return text_helpers.isContextExhaustedText(err_msg);
 }
 
 /// Check if an error message indicates a rate-limit (429) error.
 pub fn isRateLimited(err_msg: []const u8) bool {
-    var lower_buf: [512]u8 = undefined;
-    const check_len = @min(err_msg.len, lower_buf.len);
-    for (err_msg[0..check_len], 0..) |c, idx| {
-        lower_buf[idx] = std.ascii.toLower(c);
-    }
-    const lower = lower_buf[0..check_len];
-
-    if (std.mem.indexOf(u8, lower, "ratelimited") != null or
-        std.mem.indexOf(u8, lower, "rate limited") != null or
-        std.mem.indexOf(u8, lower, "rate_limit") != null or
-        std.mem.indexOf(u8, lower, "too many requests") != null or
-        std.mem.indexOf(u8, lower, "quota exceeded") != null or
-        std.mem.indexOf(u8, lower, "throttle") != null)
-    {
-        return true;
-    }
-
-    return std.mem.indexOf(u8, lower, "429") != null and
-        (std.mem.indexOf(u8, lower, "rate") != null or
-            std.mem.indexOf(u8, lower, "limit") != null or
-            std.mem.indexOf(u8, lower, "too many") != null);
+    return text_helpers.isRateLimitedText(err_msg);
 }
 
 /// Try to extract a Retry-After value (in milliseconds) from an error message.
@@ -450,7 +412,7 @@ pub const ReliableProvider = struct {
 
                 if (attempt < self.max_retries) {
                     const wait = self.computeBackoff(backoff_ms, err_slice);
-                    std.Thread.sleep(wait * std.time.ns_per_ms);
+                    std_compat.thread.sleep(wait * std.time.ns_per_ms);
                     backoff_ms = @min(backoff_ms *| 2, 10_000);
                 }
             }
@@ -495,7 +457,7 @@ pub const ReliableProvider = struct {
 
                 if (attempt < self.max_retries) {
                     const wait = self.computeBackoff(backoff_ms, err_slice);
-                    std.Thread.sleep(wait * std.time.ns_per_ms);
+                    std_compat.thread.sleep(wait * std.time.ns_per_ms);
                     backoff_ms = @min(backoff_ms *| 2, 10_000);
                 }
             }

@@ -9,6 +9,7 @@
 //! - Caller owns the shutdown atomic — CronTicker holds a pointer, does not free.
 //! - CronTicker is a value type — copy freely, do not free.
 const std = @import("std");
+const std_compat = @import("compat");
 
 const cron = @import("root.zig");
 const memory_backend = @import("memory.zig");
@@ -51,7 +52,7 @@ pub const CronTicker = struct {
         var idle_ticks: u64 = 0;
 
         while (!self.shutdown.load(.acquire)) {
-            const now = std.time.timestamp();
+            const now = std_compat.time.timestamp();
             const enqueued = self.tick(now) catch |err| blk: {
                 log.warn("tick failed: {s}", .{@errorName(err)});
                 break :blk 0;
@@ -71,7 +72,7 @@ pub const CronTicker = struct {
             // Sleep in 1-second slices so shutdown is observed promptly.
             var slept_ns: u64 = 0;
             while (slept_ns < self.poll_interval_ns and !self.shutdown.load(.acquire)) {
-                std.Thread.sleep(std.time.ns_per_s);
+                std_compat.thread.sleep(std.time.ns_per_s);
                 slept_ns += std.time.ns_per_s;
             }
         }
@@ -100,7 +101,7 @@ test "CronTicker.tick forwards to backend and reports count" {
     var shutdown = std.atomic.Value(bool).init(false);
     var ticker = CronTicker.init(mem.backend(), 1, &shutdown);
 
-    const enqueued = try ticker.tick(std.time.timestamp());
+    const enqueued = try ticker.tick(std_compat.time.timestamp());
     try std.testing.expectEqual(@as(usize, 0), enqueued);
 }
 
@@ -116,7 +117,7 @@ test "CronTicker.run exits promptly when shutdown flag is set" {
     const thread = try std.Thread.spawn(.{}, CronTicker.run, .{&ticker});
 
     // Let the ticker enter its sleep loop, then request shutdown.
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    std_compat.thread.sleep(10 * std.time.ns_per_ms);
     shutdown.store(true, .release);
     thread.join();
     // Reaching here without hanging is the assertion.

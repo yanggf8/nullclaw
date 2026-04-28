@@ -9,15 +9,21 @@ Read `AGENTS.md` before any code change. It is the authoritative engineering pro
 ## Build & Test Commands
 
 ```bash
-# Requires exactly Zig 0.15.2 (verify: zig version)
+# Requires exactly Zig 0.16.0 (verify: zig version)
 zig build                           # dev build
 zig build -Doptimize=ReleaseSmall   # release build (target: <1 MB binary)
-zig build test --summary all        # run all 5,300+ tests (must pass with 0 leaks)
+zig build test --summary all        # run all 6,670+ tests (must pass with 0 leaks)
 zig fmt src/                        # format all source files
 zig fmt --check src/                # check formatting (used by pre-commit hook)
 ```
 
 Primary validation command is `zig build test --summary all` (project-wide). Individual files can still be run with `zig test <file>.zig` when needed.
+
+For faster iteration, compile only the subsystems you're working on:
+
+```bash
+zig build test -Dchannels=none -Dengines=base,sqlite --summary all  # skip channels, test core + sqlite only
+```
 
 ### Build Flags
 
@@ -45,7 +51,7 @@ git config core.hooksPath .githooks
 
 ## Project Overview
 
-NullClaw is an autonomous AI assistant runtime written in Zig 0.15.2. Hard constraints: 678 KB binary, ~1 MB peak RSS, <2 ms startup. Every dependency and abstraction has a measurable size/memory cost. Only two external dependencies: vendored SQLite (with build-time SHA256 hash verification) and `websocket.zig` (pinned commit).
+NullClaw is an autonomous AI assistant runtime written in Zig 0.16.0. Hard constraints: 678 KB binary, ~1 MB peak RSS, <2 ms startup. Every dependency and abstraction has a measurable size/memory cost. Only two external dependencies: vendored SQLite (with build-time SHA256 hash verification) and `websocket.zig` (pinned commit). Current scale: ~250 source files, ~354K lines, 6,670+ tests.
 
 ## Architecture
 
@@ -80,7 +86,7 @@ Defined in `src/root.zig`. Phases mirror deployment dependencies:
 - `src/memory/` - Layered architecture: **engines** (SQLite, Markdown, LRU, Redis, PostgreSQL, LanceDB, Lucid, ClickHouse, API, None) and **retrieval** (hybrid search, RRF, embeddings). Engines conditionally compiled via build flags.
 - `src/security/` - Policy enforcement (`policy.zig`), pairing (`pairing.zig`), encrypted secrets (`secrets.zig`), sandbox backends (`landlock.zig`, `firejail.zig`, `bubblewrap.zig`, `docker.zig`, `detect.zig`).
 - `src/agent/` - Agent loop internals: `dispatcher.zig` (tool call parsing), `compaction.zig` (history trimming), `prompt.zig` (system prompt builder), `memory_loader.zig` (context injection), `commands.zig` (agent-mode commands). Config defaults are `max_tool_iterations = 1000` and `max_history_messages = 100` (see `src/config_types.zig`).
-- `src/cron/` - DB-backed cron subsystem: `types.zig` (shared types: `CronJobSpec`, `DequeueResult`, `SessionTarget`), `db.zig` (SQLite vtable implementation with once-only schema init), `root.zig` (CronBackend vtable interface), `factory.zig` (backend selection), `ticker.zig` (periodic tick driver), `memory.zig` (in-memory backend for tests). The legacy in-memory `CronScheduler` lives in `src/cron.zig` (top-level, ~10k lines). New work should target the DB backend in `src/cron/`.
+- `src/cron/` - DB-backed cron subsystem (preferred for new work): `types.zig` (shared types: `CronJobSpec`, `DequeueResult`, `SessionTarget`), `db.zig` (SQLite vtable implementation with once-only schema init), `root.zig` (CronBackend vtable interface), `factory.zig` (backend selection), `ticker.zig` (periodic tick driver), `memory.zig` (in-memory backend for tests). The legacy in-memory `CronScheduler` in `src/cron.zig` (top-level, ~10k lines) is still used by gateway but is being superseded — **new cron work targets `src/cron/`**.
 
 ### Provider Boundary Notes
 
@@ -107,16 +113,31 @@ defer cfg.deinit();
 
 Key config sections: `models.providers` (API keys/endpoints), `agents` (named agent configs), `channels` (per-channel settings), `memory` (backend/search/lifecycle), `gateway` (port/host/pairing), `security` (sandbox/audit/autonomy), `autonomy` (level/limits/allowlists), `runtime` (native/docker/wasm).
 
-## Zig 0.15.2 API Gotchas
+## Zig 0.16.0 API Gotchas
+
+Many `std.*` APIs from 0.15 were moved or renamed in 0.16. The project provides compat shims in `src/compat.zig` and `src/compat/fs.zig` (imported as `const std_compat = @import("compat");`). **Prefer the shim over the raw `std.*` API.**
 
 - `std.io.getStdOut()` does NOT exist. Use `std.fs.File.stdout()`.
-- Buffered stdout writer: `var buf: [N]u8 = undefined; var bw = std.fs.File.stdout().writer(&buf); const w = &bw.interface;` — use `w.print(...)` / `w.writeAll(...)`. `std.io.bufferedWriter` does not exist in 0.15.
+- Buffered stdout writer: `var buf: [N]u8 = undefined; var bw = std.fs.File.stdout().writer(&buf); const w = &bw.interface;` — use `w.print(...)` / `w.writeAll(...)`. `std.io.bufferedWriter` does not exist.
 - HTTP client: `std.http.Client.fetch()` with `std.Io.Writer.Allocating`.
-- Child processes: `std.process.Child.init(argv, allocator)`, `.Pipe` (capitalized).
-- `ArrayListUnmanaged`: init with `.empty`, pass allocator to every method.
+- Child processes: `std.process.Child.init(argv, allocator)`, `.Pipe` (capitalized). Prefer `std_compat.process.Child` for parity.
+- `ArrayList(T)` and `ArrayListUnmanaged(T)`: init with `.empty` (NOT `.{}`), pass allocator to every method.
+- Removed `ArrayList.writer(allocator)`. Replace with: `var aw: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf); const w = &aw.writer;` and `buf = aw.toArrayList();` before `toOwnedSlice`.
+- `std.time.timestamp` / `std.time.nanoTimestamp` / `std.time.milliTimestamp` → `std_compat.time.*`.
+- `std.crypto.random.bytes` → `std_compat.crypto.random.bytes`.
+- `std.fs.openFileAbsolute` / `createFileAbsolute` / `accessAbsolute` / `renameAbsolute` / `cwd` → `std_compat.fs.*`.
+- `std.fs.path.dirname` / `path.join` / `path.isAbsolute` → `std_compat.fs.path.*`.
+- `std.process.getEnvMap` / `getEnvVarOwned` → `std_compat.process.*`.
+- `std.posix.fchmodat` → `std_compat.posix.fchmodat`.
+- `std.Thread.Mutex` → `std_compat.sync.Mutex`. `std.Thread.sleep` → `std_compat.thread.sleep`.
+- `std.testing.tmpDir().dir` is an `std.Io.Dir` in 0.16; methods like `realpathAlloc` / `makePath` moved. Wrap with `@import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(...)` (or `makePath(...)` etc.).
 - `ChaCha20Poly1305.decrypt`: use stack buffer then `allocator.dupe()` (heap buffer segfaults on macOS).
 - `SQLITE_TRANSIENT` in auto-translated C code: use `SQLITE_STATIC` (null) instead.
 - When unsure about API, search `src/` for existing usage rather than guessing.
+
+## Search Zig Source
+
+Run `zig env` to locate Zig source directories. `.std_dir` points to the standard library, `.lib_dir` to the broader lib tree. Read the source directly to verify struct fields, function signatures, and available methods.
 
 ## Testing Conventions
 

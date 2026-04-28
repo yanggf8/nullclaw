@@ -5,6 +5,7 @@
 //! Plus/Pro subscriptions can use this without separate API tokens.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const sse = @import("sse.zig");
 const auth = @import("../auth.zig");
@@ -25,6 +26,8 @@ pub const OAUTH_DEVICE_URL = "https://auth.openai.com/oauth/device/code";
 pub const OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token";
 pub const OAUTH_SCOPE = "openid profile email offline_access";
 pub const CREDENTIAL_KEY = "openai-codex";
+const CODEX_CONNECT_TIMEOUT_SECS = "30";
+const CODEX_STALL_TIMEOUT_SECS: u64 = 90;
 
 // ── Provider ─────────────────────────────────────────────────────────────
 
@@ -117,7 +120,7 @@ pub const OpenAiCodexProvider = struct {
         var auth_hdr_buf: [2048]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{token}) catch return error.CodexApiError;
 
-        return codexRequest(allocator, CODEX_API_URL, body, auth_hdr, &.{});
+        return codexRequest(allocator, CODEX_API_URL, body, auth_hdr, &.{}, 0);
     }
 
     fn chatImpl(
@@ -136,7 +139,7 @@ pub const OpenAiCodexProvider = struct {
         var auth_hdr_buf: [2048]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{token}) catch return error.CodexApiError;
 
-        const content = try codexRequest(allocator, CODEX_API_URL, body, auth_hdr, &.{});
+        const content = try codexRequest(allocator, CODEX_API_URL, body, auth_hdr, &.{}, request.timeout_secs);
 
         return .{
             .content = content,
@@ -162,7 +165,7 @@ pub const OpenAiCodexProvider = struct {
         var auth_hdr_buf: [2048]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{token}) catch return error.CodexApiError;
 
-        return codexStreamRequest(allocator, CODEX_API_URL, body, auth_hdr, &.{}, callback, callback_ctx);
+        return codexStreamRequest(allocator, CODEX_API_URL, body, auth_hdr, &.{}, request.timeout_secs, callback, callback_ctx);
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {
@@ -186,7 +189,7 @@ pub const OpenAiCodexProvider = struct {
         const token = self.access_token orelse return error.CredentialsNotSet;
 
         // Check if token needs refresh
-        if (self.expires_at != 0 and std.time.timestamp() + 300 >= self.expires_at) {
+        if (self.expires_at != 0 and std_compat.time.timestamp() + 300 >= self.expires_at) {
             const rt = self.refresh_token orelse return error.TokenExpired;
             const new_token = try auth.refreshAccessToken(
                 self.allocator,
@@ -334,6 +337,7 @@ fn codexRequest(
     body: []const u8,
     auth_header: []const u8,
     extra_headers: []const []const u8,
+    timeout_secs: u64,
 ) ![]const u8 {
     // Use the streaming path internally and just accumulate
     var accumulated: std.ArrayListUnmanaged(u8) = .empty;
@@ -351,7 +355,7 @@ fn codexRequest(
     };
 
     var ctx = NoopCtx{ .list = &accumulated, .alloc = allocator };
-    _ = codexStreamRequest(allocator, url, body, auth_header, extra_headers, NoopCtx.callback, @ptrCast(&ctx)) catch |err| {
+    _ = codexStreamRequest(allocator, url, body, auth_header, extra_headers, timeout_secs, NoopCtx.callback, @ptrCast(&ctx)) catch |err| {
         return err;
     };
 
@@ -366,11 +370,12 @@ fn codexStreamRequest(
     body: []const u8,
     auth_header: []const u8,
     extra_headers: []const []const u8,
+    timeout_secs: u64,
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !StreamChatResult {
     // Build argv on stack
-    var argv_buf: [32][]const u8 = undefined;
+    var argv_buf: [40][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "curl";
@@ -378,6 +383,10 @@ fn codexStreamRequest(
     argv_buf[argc] = "-s";
     argc += 1;
     argv_buf[argc] = "--no-buffer";
+    argc += 1;
+    argv_buf[argc] = "--connect-timeout";
+    argc += 1;
+    argv_buf[argc] = CODEX_CONNECT_TIMEOUT_SECS;
     argc += 1;
     argv_buf[argc] = "-X";
     argc += 1;
@@ -403,6 +412,28 @@ fn codexStreamRequest(
         argc += 1;
     }
 
+    var timeout_buf: [32]u8 = undefined;
+    if (timeout_secs > 0) {
+        argv_buf[argc] = "--max-time";
+        argc += 1;
+        argv_buf[argc] = try std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs});
+        argc += 1;
+    }
+
+    var speed_time_buf: [32]u8 = undefined;
+    argv_buf[argc] = "--speed-limit";
+    argc += 1;
+    argv_buf[argc] = "1";
+    argc += 1;
+    argv_buf[argc] = "--speed-time";
+    argc += 1;
+    argv_buf[argc] = try std.fmt.bufPrint(&speed_time_buf, "{d}", .{effectiveCodexStallTimeoutSecs(timeout_secs)});
+    argc += 1;
+
+    const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
+    defer if (resolve_entry) |entry| allocator.free(entry);
+    http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
+
     for (extra_headers) |hdr| {
         argv_buf[argc] = "-H";
         argc += 1;
@@ -417,7 +448,7 @@ fn codexStreamRequest(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
@@ -469,6 +500,7 @@ fn codexStreamRequest(
                     .delta => |delta_evt| {
                         defer allocator.free(delta_evt.text);
                         const is_tool_payload = std.mem.indexOf(u8, delta_evt.text, "<tool_call>") != null;
+                        const ends_stream = codexDeltaSourceEndsStream(delta_evt.source);
                         switch (delta_evt.source) {
                             .output_text_delta, .refusal_delta => {
                                 saw_text_delta = true;
@@ -511,6 +543,10 @@ fn codexStreamRequest(
                                 }
                             },
                         }
+                        if (ends_stream) {
+                            saw_terminal = true;
+                            break :outer;
+                        }
                     },
                     .done => {
                         saw_terminal = true;
@@ -528,6 +564,19 @@ fn codexStreamRequest(
         }
     }
 
+    if (saw_terminal) {
+        // Regression: Codex can emit a terminal event before curl exits. Stop the
+        // subprocess here so completed streams do not wait on a stalled socket.
+        // NOTE: No direct unit test covers the child-kill path here. Under the
+        // current Zig/macOS test runner, PATH-based curl interception is not
+        // reliable enough for a deterministic subprocess regression test.
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        if (accumulated.items.len == 0) return error.NoResponseContent;
+        callback(ctx, root.StreamChunk.finalChunk());
+        return finalizeCodexStreamResult(allocator, accumulated.items);
+    }
+
     // Drain remaining stdout
     while (true) {
         const n = file.read(&read_buf) catch break;
@@ -542,12 +591,12 @@ fn codexStreamRequest(
         return error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_terminal)) {
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeCodexStreamResult(allocator, accumulated.items);
             }
-            return error.CurlFailed;
+            return http_util.mapCurlExitCodeToError(code);
         },
         else => {
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_terminal)) {
@@ -572,6 +621,18 @@ fn finalizeCodexStreamResult(allocator: std.mem.Allocator, accumulated: []const 
         .content = content,
         .usage = .{ .completion_tokens = @intCast((accumulated.len + 3) / 4) },
         .model = "",
+    };
+}
+
+fn effectiveCodexStallTimeoutSecs(timeout_secs: u64) u64 {
+    if (timeout_secs == 0) return CODEX_STALL_TIMEOUT_SECS;
+    return @min(timeout_secs, CODEX_STALL_TIMEOUT_SECS);
+}
+
+fn codexDeltaSourceEndsStream(source: CodexDeltaSource) bool {
+    return switch (source) {
+        .response_completed, .response_done => true,
+        else => false,
     };
 }
 
@@ -775,7 +836,7 @@ fn extractCompletedToolCalls(allocator: std.mem.Allocator, root_obj: std.json.Ob
 /// - "response.completed" / "response.done" → done
 /// - "error" / "response.failed" → error
 pub fn parseCodexSseEvent(allocator: std.mem.Allocator, line: []const u8) !CodexSseResult {
-    const trimmed = std.mem.trimRight(u8, line, "\r");
+    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
     if (trimmed.len == 0) return .skip;
     if (trimmed[0] == ':') return .skip;
 
@@ -784,7 +845,7 @@ pub fn parseCodexSseEvent(allocator: std.mem.Allocator, line: []const u8) !Codex
 
     const prefix = "data:";
     if (!std.mem.startsWith(u8, trimmed, prefix)) return .skip;
-    const data = std.mem.trimLeft(u8, trimmed[prefix.len..], " ");
+    const data = std.mem.trimStart(u8, trimmed[prefix.len..], " ");
     if (std.mem.eql(u8, data, "[DONE]")) return .done;
 
     // Parse JSON
@@ -1294,6 +1355,19 @@ test "parseCodexSseEvent response.failed event" {
     const line = "data: {\"type\":\"response.failed\"}";
     const result = try parseCodexSseEvent(std.testing.allocator, line);
     try std.testing.expect(result == .error_msg);
+}
+
+test "effectiveCodexStallTimeoutSecs caps long request timeout" {
+    try std.testing.expectEqual(@as(u64, 90), effectiveCodexStallTimeoutSecs(600));
+    try std.testing.expectEqual(@as(u64, 30), effectiveCodexStallTimeoutSecs(30));
+    try std.testing.expectEqual(@as(u64, 90), effectiveCodexStallTimeoutSecs(0));
+}
+
+test "codexDeltaSourceEndsStream treats completed events as terminal" {
+    try std.testing.expect(codexDeltaSourceEndsStream(.response_completed));
+    try std.testing.expect(codexDeltaSourceEndsStream(.response_done));
+    try std.testing.expect(!codexDeltaSourceEndsStream(.output_text_delta));
+    try std.testing.expect(!codexDeltaSourceEndsStream(.output_item_done));
 }
 
 test "buildCodexBody with explicit reasoning effort" {

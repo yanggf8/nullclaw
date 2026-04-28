@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const config_paths = @import("config_paths.zig");
@@ -7,6 +8,7 @@ const bus = @import("bus.zig");
 const fs_compat = @import("fs_compat.zig");
 const json_util = @import("json_util.zig");
 const observability = @import("observability.zig");
+const admin_output = @import("admin_output.zig");
 const agent_routing = @import("agent_routing.zig");
 const telegram = @import("channels/telegram.zig");
 const signal = @import("channels/signal.zig");
@@ -693,7 +695,7 @@ pub const CronScheduler = struct {
     fn allocateJobId(self: *CronScheduler, prefix: []const u8) ![]const u8 {
         // UUID v4: 16 random bytes formatted as 8-4-4-4-12 hex groups
         var rand_bytes: [16]u8 = undefined;
-        std.crypto.random.bytes(&rand_bytes);
+        std_compat.crypto.random.bytes(&rand_bytes);
         // Set version 4 and variant bits (RFC 4122)
         rand_bytes[6] = (rand_bytes[6] & 0x0f) | 0x40;
         rand_bytes[8] = (rand_bytes[8] & 0x3f) | 0x80;
@@ -723,7 +725,7 @@ pub const CronScheduler = struct {
 
         // Validate expression
         _ = try normalizeExpression(expression);
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         const next_run_secs = try nextRunForCronExpression(expression, now);
 
         const id = try self.allocateJobId("job");
@@ -744,7 +746,7 @@ pub const CronScheduler = struct {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
 
         const delay_secs = try parseDuration(delay);
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
 
         const id = try self.allocateJobId("once");
         errdefer self.allocator.free(id);
@@ -768,7 +770,7 @@ pub const CronScheduler = struct {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
 
         _ = try normalizeExpression(expression);
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         const next_run_secs = try nextRunForCronExpression(expression, now);
 
         const id = try self.allocateJobId("agent");
@@ -807,7 +809,7 @@ pub const CronScheduler = struct {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
 
         _ = try normalizeExpression(expression);
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         const next_run_secs = try nextRunForCronExpression(expression, now);
 
         const id = try self.allocateJobId("skill");
@@ -847,7 +849,7 @@ pub const CronScheduler = struct {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
 
         const delay_secs = try parseDuration(delay);
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
 
         const id = try self.allocateJobId("agent-once");
         errdefer self.allocator.free(id);
@@ -911,7 +913,7 @@ pub const CronScheduler = struct {
         // Apply tz_offset_s before expression so the new offset is used for next_run calculation.
         if (patch.tz_offset_s) |tz| job.tz_offset_s = tz;
         if (patch.expression) |expr| {
-            const next_run_secs = nextRunForCronExpressionTz(expr, std.time.timestamp(), job.tz_offset_s) catch return false;
+            const next_run_secs = nextRunForCronExpressionTz(expr, std_compat.time.timestamp(), job.tz_offset_s) catch return false;
             const new_expr = allocator.dupe(u8, expr) catch return false;
             allocator.free(job.expression);
             job.expression = new_expr;
@@ -1114,9 +1116,9 @@ pub const CronScheduler = struct {
         const poll_ns: u64 = poll_secs * std.time.ns_per_s;
 
         while (true) {
-            const now = std.time.timestamp();
+            const now = std_compat.time.timestamp();
             _ = self.tick(now, out_bus);
-            std.Thread.sleep(poll_ns);
+            std_compat.thread.sleep(poll_ns);
         }
     }
 
@@ -1151,7 +1153,7 @@ pub const CronScheduler = struct {
                         null;
                     defer if (resolved_shell_cmd) |rc| self.allocator.free(rc);
                     const effective_shell_cmd = resolved_shell_cmd orelse job.command;
-                    const result = std.process.Child.run(.{
+                    const result = std_compat.process.Child.run(.{
                         .allocator = self.allocator,
                         .argv = &.{ platform.getShell(), platform.getShellFlag(), effective_shell_cmd },
                         .cwd = self.shell_cwd,
@@ -1169,7 +1171,7 @@ pub const CronScheduler = struct {
                     defer self.allocator.free(result.stderr);
 
                     const success = switch (result.term) {
-                        .Exited => |code| code == 0,
+                        .exited => |code| code == 0,
                         else => false,
                     };
                     job.last_run_secs = now;
@@ -1272,7 +1274,7 @@ pub const CronScheduler = struct {
                         job.last_status = "ok";
                     } else {
                         defer self.allocator.free(skill_cmd.?);
-                        const result = std.process.Child.run(.{
+                        const result = std_compat.process.Child.run(.{
                             .allocator = self.allocator,
                             .argv = &.{ platform.getShell(), platform.getShellFlag(), skill_cmd.? },
                             .cwd = self.shell_cwd,
@@ -1297,7 +1299,7 @@ pub const CronScheduler = struct {
                         defer self.allocator.free(result.stderr);
 
                         const exit_code: u8 = switch (result.term) {
-                            .Exited => |code| code,
+                            .exited => |code| code,
                             else => 1,
                         };
                         job.last_run_secs = now;
@@ -1435,58 +1437,102 @@ fn pathAgentExecutableName() []const u8 {
 fn hasTimeoutExpired(start_ns: i128, timeout_secs: u64) bool {
     if (timeout_secs == 0) return false;
     const timeout_ns = @as(i128, @intCast(timeout_secs)) * std.time.ns_per_s;
-    const now_ns = std.time.nanoTimestamp();
+    const now_ns = std_compat.time.nanoTimestamp();
     return now_ns - start_ns >= timeout_ns;
 }
 
 pub fn collectChildOutputWithTimeout(
-    child: *std.process.Child,
+    child: *std_compat.process.Child,
     allocator: std.mem.Allocator,
     stdout: *std.ArrayList(u8),
     stderr: *std.ArrayList(u8),
     timeout_secs: u64,
     start_ns: i128,
 ) !bool {
-    var poller = std.Io.poll(allocator, enum { stdout, stderr }, .{
-        .stdout = child.stdout.?,
-        .stderr = child.stderr.?,
-    });
-    defer poller.deinit();
-
-    const stdout_r = poller.reader(.stdout);
-    stdout_r.buffer = stdout.allocatedSlice();
-    stdout_r.seek = 0;
-    stdout_r.end = stdout.items.len;
-
-    const stderr_r = poller.reader(.stderr);
-    stderr_r.buffer = stderr.allocatedSlice();
-    stderr_r.seek = 0;
-    stderr_r.end = stderr.items.len;
-
-    defer {
-        stdout.* = .{
-            .items = stdout_r.buffer[0..stdout_r.end],
-            .capacity = stdout_r.buffer.len,
-        };
-        stderr.* = .{
-            .items = stderr_r.buffer[0..stderr_r.end],
-            .capacity = stderr_r.buffer.len,
-        };
-        stdout_r.buffer = &.{};
-        stderr_r.buffer = &.{};
-    }
-
+    const stdout_file = child.stdout.?;
+    const stderr_file = child.stderr.?;
+    var stdout_open = true;
+    var stderr_open = true;
     var timed_out = false;
+    var read_buf: [4096]u8 = undefined;
     while (true) {
-        const keep_polling = if (timeout_secs == 0 or timed_out)
-            try poller.poll()
-        else
-            try poller.pollTimeout(AGENT_POLL_STEP_NS);
+        if (!stdout_open and !stderr_open) break;
 
-        if (stdout_r.bufferedLen() > AGENT_MAX_OUTPUT_BYTES) return error.StdoutStreamTooLong;
-        if (stderr_r.bufferedLen() > AGENT_MAX_OUTPUT_BYTES) return error.StderrStreamTooLong;
+        if (comptime builtin.os.tag == .windows) {
+            if (stdout_open) {
+                const n = stdout_file.read(&read_buf) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => return err,
+                };
+                if (n == 0) {
+                    stdout_open = false;
+                } else {
+                    try stdout.appendSlice(allocator, read_buf[0..n]);
+                    if (stdout.items.len > AGENT_MAX_OUTPUT_BYTES) return error.StdoutStreamTooLong;
+                }
+            }
 
-        if (!keep_polling) break;
+            if (stderr_open) {
+                const n = stderr_file.read(&read_buf) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => return err,
+                };
+                if (n == 0) {
+                    stderr_open = false;
+                } else {
+                    try stderr.appendSlice(allocator, read_buf[0..n]);
+                    if (stderr.items.len > AGENT_MAX_OUTPUT_BYTES) return error.StderrStreamTooLong;
+                }
+            }
+
+            if (stdout_open or stderr_open) {
+                std_compat.thread.sleep(AGENT_POLL_STEP_NS);
+            }
+        } else {
+            const poll_ms: i32 = if (timeout_secs == 0 or timed_out)
+                -1
+            else
+                @intCast(@divTrunc(AGENT_POLL_STEP_NS, std.time.ns_per_ms));
+            var poll_fds = [_]std.posix.pollfd{
+                .{
+                    .fd = if (stdout_open) stdout_file.handle else -1,
+                    .events = if (stdout_open) std.posix.POLL.IN | std.posix.POLL.HUP else 0,
+                    .revents = 0,
+                },
+                .{
+                    .fd = if (stderr_open) stderr_file.handle else -1,
+                    .events = if (stderr_open) std.posix.POLL.IN | std.posix.POLL.HUP else 0,
+                    .revents = 0,
+                },
+            };
+            _ = try std.posix.poll(&poll_fds, poll_ms);
+
+            if (stdout_open and (poll_fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
+                const n = stdout_file.read(&read_buf) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => return err,
+                };
+                if (n == 0) {
+                    stdout_open = false;
+                } else {
+                    try stdout.appendSlice(allocator, read_buf[0..n]);
+                    if (stdout.items.len > AGENT_MAX_OUTPUT_BYTES) return error.StdoutStreamTooLong;
+                }
+            }
+
+            if (stderr_open and (poll_fds[1].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
+                const n = stderr_file.read(&read_buf) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => return err,
+                };
+                if (n == 0) {
+                    stderr_open = false;
+                } else {
+                    try stderr.appendSlice(allocator, read_buf[0..n]);
+                    if (stderr.items.len > AGENT_MAX_OUTPUT_BYTES) return error.StderrStreamTooLong;
+                }
+            }
+        }
 
         if (!timed_out and hasTimeoutExpired(start_ns, timeout_secs)) {
             try terminateAgentChildHard(child);
@@ -1497,20 +1543,8 @@ pub fn collectChildOutputWithTimeout(
     return timed_out;
 }
 
-fn terminateAgentChildHard(child: *std.process.Child) !void {
-    if (comptime builtin.os.tag == .windows) {
-        _ = child.killWindows(1) catch |err| switch (err) {
-            error.AlreadyTerminated => return,
-            else => return err,
-        };
-        return;
-    }
-    if (comptime builtin.os.tag == .wasi) return error.UnsupportedOperation;
-
-    std.posix.kill(child.id, std.posix.SIG.KILL) catch |err| switch (err) {
-        error.ProcessNotFound => return,
-        else => return err,
-    };
+fn terminateAgentChildHard(child: *std_compat.process.Child) !void {
+    _ = try child.kill();
 }
 
 /// Extract the final answer from agent stdout, stripping intermediate tool-call
@@ -1533,8 +1567,8 @@ fn stripToolCallBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const 
     if (std.mem.lastIndexOf(u8, text, close_tag)) |last_close| {
         const after = text[last_close + close_tag.len ..];
         // Eat leading whitespace/newlines after the closing tag
-        const trimmed = std.mem.trimLeft(u8, after, " \t\r\n");
-        const result = std.mem.trimRight(u8, trimmed, " \t\r\n");
+        const trimmed = std_compat.mem.trimLeft(u8, after, " \t\r\n");
+        const result = std_compat.mem.trimRight(u8, trimmed, " \t\r\n");
         if (result.len > 0) return allocator.dupe(u8, result);
     }
 
@@ -1589,7 +1623,6 @@ fn preferAgentExecPath(self_exe_path: []const u8) []const u8 {
     }
     return self_exe_path;
 }
-
 /// If `prompt` starts with "skill:<name>", resolves to the skill's ## Prompt section
 /// from ~/.nullclaw/skills/<name>/SKILL.md. Returns a heap-allocated string that the
 /// caller must free, or null if prompt is not a skill reference or resolution fails.
@@ -1599,11 +1632,12 @@ pub fn resolveSkillPrompt(allocator: std.mem.Allocator, prompt: []const u8) !?[]
     const skill_name = std.mem.trim(u8, prompt[prefix.len..], " \t");
     if (skill_name.len == 0) return null;
 
-    const home = std.posix.getenv("HOME") orelse return null;
+    const home = platform.getEnvOrNull(allocator, "HOME") orelse return null;
+    defer allocator.free(home);
     const skill_md_path = try std.fmt.allocPrint(allocator, "{s}/.nullclaw/skills/{s}/SKILL.md", .{ home, skill_name });
     defer allocator.free(skill_md_path);
 
-    const content = std.fs.cwd().readFileAlloc(allocator, skill_md_path, 256 * 1024) catch return null;
+    const content = std_compat.fs.cwd().readFileAlloc(allocator, skill_md_path, 256 * 1024) catch return null;
     defer allocator.free(content);
 
     // Extract content between "## Prompt\n" and the next "## " heading (or EOF).
@@ -1633,11 +1667,12 @@ pub fn resolveSkillCommand(allocator: std.mem.Allocator, command: []const u8) !?
     const extra_args = if (space) |s| std.mem.trim(u8, rest[s..], " \t") else "";
     if (skill_name.len == 0) return null;
 
-    const home = std.posix.getenv("HOME") orelse return null;
+    const home = platform.getEnvOrNull(allocator, "HOME") orelse return null;
+    defer allocator.free(home);
     const skill_md_path = try std.fmt.allocPrint(allocator, "{s}/.nullclaw/skills/{s}/SKILL.md", .{ home, skill_name });
     defer allocator.free(skill_md_path);
 
-    const content = std.fs.cwd().readFileAlloc(allocator, skill_md_path, 256 * 1024) catch return null;
+    const content = std_compat.fs.cwd().readFileAlloc(allocator, skill_md_path, 256 * 1024) catch return null;
     defer allocator.free(content);
 
     // Extract first non-empty line from ## Script section.
@@ -1677,7 +1712,8 @@ pub fn resolveSkillCommand(allocator: std.mem.Allocator, command: []const u8) !?
 /// Returns heap-allocated "python3 <expanded_path> <args>" or error.
 /// The caller must free the returned slice.
 pub fn resolveSkillExec(allocator: std.mem.Allocator, skill_name: ?[]const u8, skill_args: ?[]const u8) ![]const u8 {
-    const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+    const home = platform.getEnvOrNull(allocator, "HOME") orelse return error.NoHomeDir;
+    defer allocator.free(home);
     const skills_dir = try std.fmt.allocPrint(allocator, "{s}/.nullclaw/skills", .{home});
     defer allocator.free(skills_dir);
     return resolveSkillExecFrom(allocator, skill_name, skill_args, skills_dir, home);
@@ -1736,7 +1772,7 @@ pub fn resolveSkillExecFrom(
     const skill_md_path = try std.fmt.allocPrint(allocator, "{s}/{s}/SKILL.md", .{ skills_dir, name });
     defer allocator.free(skill_md_path);
 
-    const content = std.fs.cwd().readFileAlloc(allocator, skill_md_path, 256 * 1024) catch return error.SkillNotFound;
+    const content = std_compat.fs.cwd().readFileAlloc(allocator, skill_md_path, 256 * 1024) catch return error.SkillNotFound;
     defer allocator.free(content);
 
     // Extract first non-empty, non-``` line from ## Script section.
@@ -1779,7 +1815,7 @@ pub fn runAgentJob(
     timeout_secs: u64,
     exec_ctx: ?AgentExecutionContext,
 ) !AgentRunResult {
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    const exe_path = try std_compat.fs.selfExePathAlloc(allocator);
     defer allocator.free(exe_path);
 
     var exec_path = preferAgentExecPath(exe_path);
@@ -1790,11 +1826,11 @@ pub fn runAgentJob(
 
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(allocator);
-    var env_map = try std.process.getEnvMap(allocator);
+    var env_map = try std_compat.process.getEnvMap(allocator);
     defer env_map.deinit();
     if (exec_ctx) |ctx| try putAgentExecutionEnv(&env_map, ctx);
 
-    var child: std.process.Child = undefined;
+    var child: std_compat.process.Child = undefined;
     spawn_loop: while (true) {
         argv.clearRetainingCapacity();
         try argv.append(allocator, exec_path);
@@ -1806,7 +1842,7 @@ pub fn runAgentJob(
         try argv.append(allocator, "-m");
         try argv.append(allocator, prompt);
 
-        child = std.process.Child.init(argv.items, allocator);
+        child = std_compat.process.Child.init(argv.items, allocator);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
@@ -1856,7 +1892,7 @@ pub fn runAgentJob(
         _ = child.wait() catch {};
     }
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = std_compat.time.nanoTimestamp();
 
     var stdout: std.ArrayList(u8) = .empty;
     defer stdout.deinit(allocator);
@@ -1874,7 +1910,7 @@ pub fn runAgentJob(
 
     const term = try child.wait();
     const exit_code: u8 = switch (term) {
-        .Exited => |code| code,
+        .exited => |code| code,
         else => 1,
     };
     const success = !timed_out and exit_code == 0;
@@ -1886,15 +1922,15 @@ pub fn runAgentJob(
 /// and shell spawn paths so every cron-launched child sees the same context.
 /// Also sets `NULLCLAW_JOB_ID` to the trace id for back-compat with existing
 /// Python skills that read that variable directly.
-pub fn putCronSubprocessEnv(env_map: *std.process.EnvMap, exec_ctx: CronSubprocessContext) !void {
+pub fn putCronSubprocessEnv(env_map: *std_compat.process.EnvMap, exec_ctx: CronSubprocessContext) !void {
     try env_map.put(EXECUTION_SOURCE_ENV, exec_ctx.source);
     try env_map.put(SENSORIUM_STATE_ENV, SENSORIUM_STATE_SESSION_ONLY);
     if (exec_ctx.trace_id) |trace_id| {
         try env_map.put(EXECUTION_TRACE_ENV, trace_id);
         try env_map.put(JOB_ID_ENV, trace_id);
     } else {
-        env_map.remove(EXECUTION_TRACE_ENV);
-        env_map.remove(JOB_ID_ENV);
+        _ = env_map.orderedRemove(EXECUTION_TRACE_ENV);
+        _ = env_map.orderedRemove(JOB_ID_ENV);
     }
 }
 
@@ -1907,8 +1943,8 @@ pub const putAgentExecutionEnv = putCronSubprocessEnv;
 pub fn buildCronChildEnv(
     allocator: std.mem.Allocator,
     exec_ctx: CronSubprocessContext,
-) !std.process.EnvMap {
-    var env_map = try std.process.getEnvMap(allocator);
+) !std_compat.process.EnvMap {
+    var env_map = try std_compat.process.getEnvMap(allocator);
     errdefer env_map.deinit();
     try putCronSubprocessEnv(&env_map, exec_ctx);
     return env_map;
@@ -1918,7 +1954,7 @@ fn buildManualSkillChildEnv(
     allocator: std.mem.Allocator,
     trace_id: []const u8,
     timeout_secs: ?u32,
-) !std.process.EnvMap {
+) !std_compat.process.EnvMap {
     const effective_timeout: u64 = timeout_secs orelse 120;
     var env_map = try buildCronChildEnv(allocator, .{
         .source = "cron_manual_skill",
@@ -1941,7 +1977,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
     const path = try cronJsonPath(scheduler.allocator);
     defer scheduler.allocator.free(path);
 
-    const content = fs_compat.readFileAlloc(std.fs.cwd(), scheduler.allocator, path, 1024 * 1024) catch |err| switch (err) {
+    const content = fs_compat.readFileAlloc(std_compat.fs.cwd(), scheduler.allocator, path, 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return,
         else => switch (policy) {
             .best_effort => return,
@@ -1997,7 +2033,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             if (obj.get("next_run_secs")) |v| {
                 if (v == .integer) break :blk v.integer;
             }
-            break :blk std.time.timestamp() + 60;
+            break :blk std_compat.time.timestamp() + 60;
         };
         const last_run_secs: ?i64 = blk: {
             if (obj.get("last_run_secs")) |v| {
@@ -2946,7 +2982,7 @@ fn migrateJsonToDb(allocator: std.mem.Allocator, db: *c.sqlite3) void {
     defer allocator.free(json_path);
     const migrated_path = std.fmt.allocPrint(allocator, "{s}.migrated", .{json_path}) catch return;
     defer allocator.free(migrated_path);
-    std.fs.renameAbsolute(json_path, migrated_path) catch {};
+    std_compat.fs.renameAbsolute(json_path, migrated_path) catch {};
     log.info("Migrated {d} cron jobs from cron.json to cron.db", .{temp.jobs.items.len});
 }
 
@@ -3109,10 +3145,143 @@ fn cronJsonPath(allocator: std.mem.Allocator) ![]const u8 {
 fn ensureCronDir(allocator: std.mem.Allocator) !void {
     const dir = try config_paths.defaultConfigDir(allocator);
     defer allocator.free(dir);
-    std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
+}
+
+fn printStdoutBytes(text: []const u8) void {
+    admin_output.writeStdoutBytes(text) catch return;
+}
+
+fn appendNullableString(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    value: ?[]const u8,
+) !void {
+    if (value) |text| {
+        try json_util.appendJsonString(buf, allocator, text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn appendNullableInt(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    value: ?i64,
+) !void {
+    if (value) |num| {
+        var int_buf: [24]u8 = undefined;
+        const text = std.fmt.bufPrint(&int_buf, "{d}", .{num}) catch unreachable;
+        try buf.appendSlice(allocator, text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn appendCronJobJson(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    job: CronJob,
+) !void {
+    try buf.appendSlice(allocator, "{");
+
+    try json_util.appendJsonKeyValue(buf, allocator, "id", job.id);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "expression", job.expression);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "command", job.command);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "next_run_secs", job.next_run_secs);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "last_run_secs");
+    try appendNullableInt(buf, allocator, job.last_run_secs);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "last_status");
+    try appendNullableString(buf, allocator, job.last_status);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "paused");
+    try buf.appendSlice(allocator, if (job.paused) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "one_shot");
+    try buf.appendSlice(allocator, if (job.one_shot) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "job_type", job.job_type.asStr());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "prompt");
+    try appendNullableString(buf, allocator, job.prompt);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "model");
+    try appendNullableString(buf, allocator, job.model);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "enabled");
+    try buf.appendSlice(allocator, if (job.enabled) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delete_after_run");
+    try buf.appendSlice(allocator, if (job.delete_after_run) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "session_target", job.session_target.asStr());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_mode");
+    try json_util.appendJsonString(buf, allocator, job.delivery.mode.asStr());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_channel");
+    try appendNullableString(buf, allocator, job.delivery.channel);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_account_id");
+    try appendNullableString(buf, allocator, job.delivery.account_id);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_to");
+    try appendNullableString(buf, allocator, job.delivery.to);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_peer_kind");
+    if (job.delivery.peer_kind) |peer_kind| {
+        try json_util.appendJsonString(buf, allocator, chatTypeAsStr(peer_kind));
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_peer_id");
+    try appendNullableString(buf, allocator, job.delivery.peer_id);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_thread_id");
+    try appendNullableString(buf, allocator, job.delivery.thread_id);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_best_effort");
+    try buf.appendSlice(allocator, if (job.delivery.best_effort) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "timeout_secs");
+    try appendNullableInt(buf, allocator, if (job.timeout_secs) |t| @as(i64, @intCast(t)) else null);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "skill_name");
+    try appendNullableString(buf, allocator, job.skill_name);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "skill_args");
+    try appendNullableString(buf, allocator, job.skill_args);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "tz_offset_s", job.tz_offset_s);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "last_output");
+    try appendNullableString(buf, allocator, job.last_output);
+
+    try buf.appendSlice(allocator, "}");
+}
+
+pub fn buildJobsJson(allocator: std.mem.Allocator, jobs: []const CronJob) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "[\n");
+    for (jobs, 0..) |job, i| {
+        if (i > 0) try buf.appendSlice(allocator, ",\n");
+        try buf.appendSlice(allocator, "  ");
+        try appendCronJobJson(&buf, allocator, job);
+    }
+    try buf.appendSlice(allocator, "\n]\n");
+
+    return try buf.toOwnedSlice(allocator);
 }
 
 /// Save scheduler jobs to the SQLite DB (~/.nullclaw/cron.db).
@@ -3155,155 +3324,10 @@ fn saveJobsToJson(scheduler: *const CronScheduler) !void {
     const path = try cronJsonPath(scheduler.allocator);
     defer scheduler.allocator.free(path);
 
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(scheduler.allocator);
+    const body = try buildJobsJson(scheduler.allocator, scheduler.jobs.items);
+    defer scheduler.allocator.free(body);
 
-    try buf.appendSlice(scheduler.allocator, "[\n");
-    for (scheduler.jobs.items, 0..) |job, i| {
-        if (i > 0) try buf.appendSlice(scheduler.allocator, ",\n");
-        try buf.appendSlice(scheduler.allocator, "  {");
-
-        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "id", job.id);
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "expression", job.expression);
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "command", job.command);
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonInt(&buf, scheduler.allocator, "next_run_secs", job.next_run_secs);
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "last_run_secs");
-        if (job.last_run_secs) |lrs| {
-            var int_buf: [24]u8 = undefined;
-            const text = std.fmt.bufPrint(&int_buf, "{d}", .{lrs}) catch unreachable;
-            try buf.appendSlice(scheduler.allocator, text);
-        } else {
-            try buf.appendSlice(scheduler.allocator, "null");
-        }
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "last_status");
-        if (job.last_status) |ls| {
-            try json_util.appendJsonString(&buf, scheduler.allocator, ls);
-        } else {
-            try buf.appendSlice(scheduler.allocator, "null");
-        }
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "paused");
-        try buf.appendSlice(scheduler.allocator, if (job.paused) "true" else "false");
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "one_shot");
-        try buf.appendSlice(scheduler.allocator, if (job.one_shot) "true" else "false");
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "job_type", job.job_type.asStr());
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "prompt");
-        if (job.prompt) |prompt| {
-            try json_util.appendJsonString(&buf, scheduler.allocator, prompt);
-        } else {
-            try buf.appendSlice(scheduler.allocator, "null");
-        }
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "model");
-        if (job.model) |model| {
-            try json_util.appendJsonString(&buf, scheduler.allocator, model);
-        } else {
-            try buf.appendSlice(scheduler.allocator, "null");
-        }
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "enabled");
-        try buf.appendSlice(scheduler.allocator, if (job.enabled) "true" else "false");
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "delete_after_run");
-        try buf.appendSlice(scheduler.allocator, if (job.delete_after_run) "true" else "false");
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "session_target", job.session_target.asStr());
-
-        // Delivery config for notifications
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_mode");
-        try json_util.appendJsonString(&buf, scheduler.allocator, job.delivery.mode.asStr());
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_channel");
-        if (job.delivery.channel) |channel| {
-            try json_util.appendJsonString(&buf, scheduler.allocator, channel);
-        } else {
-            try buf.appendSlice(scheduler.allocator, "null");
-        }
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_account_id");
-        if (job.delivery.account_id) |account_id| {
-            try json_util.appendJsonString(&buf, scheduler.allocator, account_id);
-        } else {
-            try buf.appendSlice(scheduler.allocator, "null");
-        }
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_to");
-        if (job.delivery.to) |to| {
-            try json_util.appendJsonString(&buf, scheduler.allocator, to);
-        } else {
-            try buf.appendSlice(scheduler.allocator, "null");
-        }
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "timeout_secs");
-        if (job.timeout_secs) |t| {
-            var int_buf: [16]u8 = undefined;
-            const text = std.fmt.bufPrint(&int_buf, "{d}", .{t}) catch unreachable;
-            try buf.appendSlice(scheduler.allocator, text);
-        } else {
-            try buf.appendSlice(scheduler.allocator, "null");
-        }
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_peer_kind");
-        if (job.delivery.peer_kind) |peer_kind| {
-            try json_util.appendJsonString(&buf, scheduler.allocator, chatTypeAsStr(peer_kind));
-        } else {
-            try buf.appendSlice(scheduler.allocator, "null");
-        }
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_peer_id");
-        if (job.delivery.peer_id) |peer_id| {
-            try json_util.appendJsonString(&buf, scheduler.allocator, peer_id);
-        } else {
-            try buf.appendSlice(scheduler.allocator, "null");
-        }
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_thread_id");
-        if (job.delivery.thread_id) |thread_id| {
-            try json_util.appendJsonString(&buf, scheduler.allocator, thread_id);
-        } else {
-            try buf.appendSlice(scheduler.allocator, "null");
-        }
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_best_effort");
-        try buf.appendSlice(scheduler.allocator, if (job.delivery.best_effort) "true" else "false");
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "skill_name");
-        if (job.skill_name) |sn| {
-            try json_util.appendJsonString(&buf, scheduler.allocator, sn);
-        } else {
-            try buf.appendSlice(scheduler.allocator, "null");
-        }
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "skill_args");
-        if (job.skill_args) |sa| {
-            try json_util.appendJsonString(&buf, scheduler.allocator, sa);
-        } else {
-            try buf.appendSlice(scheduler.allocator, "null");
-        }
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonInt(&buf, scheduler.allocator, "tz_offset_s", job.tz_offset_s);
-        try buf.appendSlice(scheduler.allocator, ",");
-        try json_util.appendJsonKey(&buf, scheduler.allocator, "last_output");
-        if (job.last_output) |lo| {
-            try json_util.appendJsonString(&buf, scheduler.allocator, lo);
-        } else {
-            try buf.appendSlice(scheduler.allocator, "null");
-        }
-
-        try buf.appendSlice(scheduler.allocator, "}");
-    }
-    try buf.appendSlice(scheduler.allocator, "\n]\n");
-
-    try writeFileAtomic(scheduler.allocator, path, buf.items);
+    try writeFileAtomic(scheduler.allocator, path, body);
 }
 
 /// Load jobs from the SQLite DB (primary) or cron.json (fallback) into the scheduler.
@@ -3419,14 +3443,14 @@ fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, data: []const
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
 
-    const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+    const tmp_file = try std_compat.fs.createFileAbsolute(tmp_path, .{});
     errdefer tmp_file.close();
     try tmp_file.writeAll(data);
     tmp_file.close();
 
-    std.fs.renameAbsolute(tmp_path, path) catch {
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
-        const file = try std.fs.createFileAbsolute(path, .{});
+    std_compat.fs.renameAbsolute(tmp_path, path) catch {
+        std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
+        const file = try std_compat.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(data);
     };
@@ -3452,7 +3476,7 @@ pub const GatewayRequest = union(enum) {
 };
 
 fn trimOwnedRight(allocator: std.mem.Allocator, raw: []u8) ?[]u8 {
-    const trimmed = std.mem.trimRight(u8, raw, " \t\r\n");
+    const trimmed = std_compat.mem.trimRight(u8, raw, " \t\r\n");
     if (trimmed.len == raw.len) return raw;
 
     const owned = allocator.dupe(u8, trimmed) catch {
@@ -3471,7 +3495,7 @@ fn readGatewayUrl(allocator: std.mem.Allocator) ?[]const u8 {
     const state_path = config_paths.pathFromConfigDir(allocator, dir, "daemon_state.json") catch return null;
     defer allocator.free(state_path);
 
-    const content = fs_compat.readFileAlloc(std.fs.cwd(), allocator, state_path, 64 * 1024) catch return null;
+    const content = fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, state_path, 64 * 1024) catch return null;
     defer allocator.free(content);
 
     // Parse "gateway": "host:port" field
@@ -3496,7 +3520,7 @@ fn readPairedToken(allocator: std.mem.Allocator) ?[]const u8 {
     defer allocator.free(dir);
     const token_path = config_paths.pathFromConfigDir(allocator, dir, "paired_token") catch return null;
     defer allocator.free(token_path);
-    const raw = fs_compat.readFileAlloc(std.fs.cwd(), allocator, token_path, 4096) catch return null;
+    const raw = fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, token_path, 4096) catch return null;
     return trimOwnedRight(allocator, raw);
 }
 
@@ -3544,7 +3568,10 @@ pub fn requestGatewayPost(allocator: std.mem.Allocator, path: []const u8, json_b
     defer allocator.free(url);
 
     const headers: []const []const u8 = if (auth_hdr) |h| &.{h} else &.{};
-    const resp = http_util.curlPostWithStatus(allocator, url, json_body, headers) catch return .unavailable;
+    // Match gateway GET behavior: if the live gateway accepts the TCP connection
+    // but never responds, cron CLI should fall back to local cron.json instead of
+    // hanging the caller indefinitely.
+    const resp = http_util.curlPostWithStatusAndTimeout(allocator, url, json_body, headers, "2") catch return .unavailable;
     if (resp.status_code == 0) {
         allocator.free(resp.body);
         return .unavailable;
@@ -3587,8 +3614,51 @@ const SchedulerStatus = struct {
     config_probe_error: ?[]const u8 = null,
 };
 
+fn schedulerStatusCode(sched_status: SchedulerStatus) []const u8 {
+    if (sched_status.config_probe_error != null) return "error";
+    if (!sched_status.config_exists) return "not_configured";
+    if (!sched_status.scheduler_enabled) return "disabled";
+    if (!sched_status.daemon_state_present) return "waiting_for_daemon";
+    return "ok";
+}
+
+fn buildSchedulerStatusJson(
+    allocator: std.mem.Allocator,
+    sched_status: SchedulerStatus,
+    job_count: usize,
+    active_count: usize,
+    paused_count: usize,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKeyValue(&buf, allocator, "status", schedulerStatusCode(sched_status));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "config_exists");
+    try buf.appendSlice(allocator, if (sched_status.config_exists) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "scheduler_enabled");
+    try buf.appendSlice(allocator, if (sched_status.scheduler_enabled) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "daemon_state_present");
+    try buf.appendSlice(allocator, if (sched_status.daemon_state_present) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "job_count", @intCast(job_count));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "active_jobs", @intCast(active_count));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "paused_jobs", @intCast(paused_count));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "config_probe_error");
+    try appendNullableString(&buf, allocator, sched_status.config_probe_error);
+    try buf.appendSlice(allocator, "}");
+
+    return try buf.toOwnedSlice(allocator);
+}
+
 fn absolutePathExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std_compat.fs.accessAbsolute(path, .{}) catch return false;
     return true;
 }
 
@@ -3794,13 +3864,13 @@ pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool, f
             var buf: std.ArrayListUnmanaged(u8) = .empty;
             defer buf.deinit(allocator);
             dbListJobsJsonFiltered(db, &buf, allocator, json_limit, filter) catch break :db_blk;
-            const stdout = std.fs.File.stdout();
+            const stdout = std_compat.fs.File.stdout();
             stdout.writeAll(buf.items) catch {};
             stdout.writeAll("\n") catch {};
             return;
         }
         // DB unavailable: emit empty array.
-        const stdout = std.fs.File.stdout();
+        const stdout = std_compat.fs.File.stdout();
         stdout.writeAll("[]\n") catch {};
         return;
     }
@@ -3823,7 +3893,7 @@ pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool, f
     }
 
     const all_jobs = scheduler.listJobs();
-    const stdout = std.fs.File.stdout();
+    const stdout = std_compat.fs.File.stdout();
     if (all_jobs.len == 0) {
         stdout.writeAll("No scheduled jobs.\n") catch {};
         stdout.writeAll("  nullclaw cron add '*/10 * * * *' 'echo hello'\n") catch {};
@@ -3867,7 +3937,7 @@ pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool, f
 
     var out_buf: [4096]u8 = undefined;
     var bw = stdout.writer(&out_buf);
-    try printWeeklyTable(allocator, jobs_to_print, std.time.timestamp(), &bw.interface);
+    try printWeeklyTable(allocator, jobs_to_print, std_compat.time.timestamp(), &bw.interface);
 }
 
 /// CLI: show upcoming schedule within a time window, or all jobs.
@@ -3878,7 +3948,7 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, sho
     defer scheduler.deinit();
     try loadJobsForRead(&scheduler);
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     const all_jobs = scheduler.listJobs();
 
     if (json_out) {
@@ -3936,7 +4006,7 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, sho
             try buf.append(allocator, '}');
         }
         try buf.append(allocator, ']');
-        const stdout = std.fs.File.stdout();
+        const stdout = std_compat.fs.File.stdout();
         stdout.writeAll(buf.items) catch {};
         stdout.writeAll("\n") catch {};
         return;
@@ -4020,7 +4090,7 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, sho
 
     if (show_all) {
         var out_buf: [4096]u8 = undefined;
-        var bw = std.fs.File.stdout().writer(&out_buf);
+        var bw = std_compat.fs.File.stdout().writer(&out_buf);
         try printWeeklyTable(allocator, all_jobs, now, &bw.interface);
         return;
     }
@@ -4212,16 +4282,48 @@ fn formatTzLabel(tz_offset_secs: i64) []const u8 {
 }
 
 /// CLI: show scheduler daemon status and diagnostics.
-pub fn cliStatus(allocator: std.mem.Allocator) !void {
+pub fn cliStatus(allocator: std.mem.Allocator, as_json: bool) !void {
     const sched_status = checkSchedulerStatus(allocator);
 
-    log.info("Cron Scheduler Status:", .{});
+    if (sched_status.config_probe_error != null and as_json) {
+        const json = try buildSchedulerStatusJson(allocator, sched_status, 0, 0, 0);
+        defer allocator.free(json);
+        printStdoutBytes(json);
+        printStdoutBytes("\n");
+        return;
+    }
 
     if (sched_status.config_probe_error) |err_name| {
+        if (as_json) unreachable;
+        log.info("Cron Scheduler Status:", .{});
         log.info("  Config probe:      error ({s})", .{err_name});
         return;
     }
 
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+    const jobs = scheduler.listJobs();
+
+    var enabled_count: usize = 0;
+    var paused_count: usize = 0;
+    for (jobs) |job| {
+        if (job.paused) {
+            paused_count += 1;
+        } else {
+            enabled_count += 1;
+        }
+    }
+
+    if (as_json) {
+        const json = try buildSchedulerStatusJson(allocator, sched_status, jobs.len, enabled_count, paused_count);
+        defer allocator.free(json);
+        printStdoutBytes(json);
+        printStdoutBytes("\n");
+        return;
+    }
+
+    log.info("Cron Scheduler Status:", .{});
     log.info("  Config file:       {s}", .{if (sched_status.config_exists) "present" else "missing"});
     log.info("  Scheduler enabled: {s}", .{if (sched_status.scheduler_enabled) "yes" else "no"});
     log.info("  Daemon state file: {s}", .{if (sched_status.daemon_state_present) "present" else "missing"});
@@ -4238,23 +4340,8 @@ pub fn cliStatus(allocator: std.mem.Allocator) !void {
         log.info("  Status: configured; run `nullclaw doctor` for live daemon health", .{});
     }
 
-    // Show job count
-    var scheduler = CronScheduler.init(allocator, 1024, true);
-    defer scheduler.deinit();
-    try loadJobsForRead(&scheduler);
-    const jobs = scheduler.listJobs();
     log.info("  Jobs loaded: {d} total", .{jobs.len});
-
     if (jobs.len > 0) {
-        var enabled_count: usize = 0;
-        var paused_count: usize = 0;
-        for (jobs) |job| {
-            if (job.paused) {
-                paused_count += 1;
-            } else {
-                enabled_count += 1;
-            }
-        }
         log.info("    - {d} active, {d} paused", .{ enabled_count, paused_count });
     }
 }
@@ -4331,7 +4418,7 @@ pub fn cliJobStatus(allocator: std.mem.Allocator, json_out: bool) !void {
                 try buf.append(allocator, '}');
             }
             try buf.append(allocator, ']');
-            const stdout = std.fs.File.stdout();
+            const stdout = std_compat.fs.File.stdout();
             stdout.writeAll(buf.items) catch {};
             stdout.writeAll("\n") catch {};
             return;
@@ -4444,7 +4531,7 @@ pub fn cliAddJob(
         job.verification_mode = verification_mode;
         job.repair_policy = repair_policy;
         if (tz_offset_s != 0) {
-            job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
+            job.next_run_secs = nextRunForCronExpressionTz(expression, std_compat.time.timestamp(), tz_offset_s) catch job.next_run_secs;
         }
         const db = openCronDb(allocator) catch break :db_blk;
         defer _ = c.sqlite3_close(db);
@@ -4471,7 +4558,7 @@ pub fn cliAddJob(
     job.verification_mode = verification_mode;
     job.repair_policy = repair_policy;
     if (tz_offset_s != 0) {
-        job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
+        job.next_run_secs = nextRunForCronExpressionTz(expression, std_compat.time.timestamp(), tz_offset_s) catch job.next_run_secs;
     }
     try saveJobs(&scheduler);
 
@@ -4573,7 +4660,7 @@ pub fn cliAddAgentJob(
         job.verification_mode = verification_mode;
         job.repair_policy = repair_policy;
         if (tz_offset_s != 0) {
-            job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
+            job.next_run_secs = nextRunForCronExpressionTz(expression, std_compat.time.timestamp(), tz_offset_s) catch job.next_run_secs;
         }
         const db = openCronDb(allocator) catch break :db_blk;
         defer _ = c.sqlite3_close(db);
@@ -4600,7 +4687,7 @@ pub fn cliAddAgentJob(
     job.verification_mode = verification_mode;
     job.repair_policy = repair_policy;
     if (tz_offset_s != 0) {
-        job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
+        job.next_run_secs = nextRunForCronExpressionTz(expression, std_compat.time.timestamp(), tz_offset_s) catch job.next_run_secs;
     }
     try saveJobs(&scheduler);
 
@@ -4634,7 +4721,7 @@ pub fn cliAddSkillJob(
         job.verification_mode = verification_mode;
         job.repair_policy = repair_policy;
         if (tz_offset_s != 0) {
-            job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
+            job.next_run_secs = nextRunForCronExpressionTz(expression, std_compat.time.timestamp(), tz_offset_s) catch job.next_run_secs;
         }
         const db = openCronDb(allocator) catch break :db_blk;
         defer _ = c.sqlite3_close(db);
@@ -4660,7 +4747,7 @@ pub fn cliAddSkillJob(
     job.verification_mode = verification_mode;
     job.repair_policy = repair_policy;
     if (tz_offset_s != 0) {
-        job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), tz_offset_s) catch job.next_run_secs;
+        job.next_run_secs = nextRunForCronExpressionTz(expression, std_compat.time.timestamp(), tz_offset_s) catch job.next_run_secs;
     }
     try saveJobs(&scheduler);
 
@@ -4855,10 +4942,10 @@ fn resolveRunnableCwd(cwd_opt: ?[]const u8) ?[]const u8 {
     const cwd = cwd_opt orelse return null;
     if (cwd.len == 0) return null;
 
-    if (std.fs.path.isAbsolute(cwd)) {
-        std.fs.accessAbsolute(cwd, .{}) catch return null;
+    if (std_compat.fs.path.isAbsolute(cwd)) {
+        std_compat.fs.accessAbsolute(cwd, .{}) catch return null;
     } else {
-        std.fs.cwd().access(cwd, .{}) catch return null;
+        fs_compat.accessPath(cwd, .{}) catch return null;
     }
     return cwd;
 }
@@ -4890,10 +4977,9 @@ pub const CronRunExit = struct {
 
 /// Pretty-print a CronJobSpec for `cron run --dry-run`.
 fn dryRunPrint(spec: CronJobSpec) void {
-    const stdout = std.fs.File.stdout();
+    const stdout = std_compat.fs.File.stdout();
     var buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(&buf);
     w.print("[dry-run] job '{s}'\n", .{spec.id}) catch {};
     w.print("  type:        {s}\n", .{@tagName(spec.job_type)}) catch {};
     if (spec.skill_name) |sn| {
@@ -4913,7 +4999,7 @@ fn dryRunPrint(spec: CronJobSpec) void {
     if (spec.delivery.to) |to| w.print(" to={s}", .{to}) catch {};
     w.print("\n", .{}) catch {};
     w.print("[dry-run] no execution performed.\n", .{}) catch {};
-    stdout.writeAll(fbs.getWritten()) catch {};
+    stdout.writeAll(w.buffered()) catch {};
 }
 
 /// Refuse to run if any queue row is currently pending/in-progress for this job.
@@ -4970,13 +5056,13 @@ fn cliRunJobLegacy(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) 
     }
 
     log.info("Running job '{s}': {s}", .{ id, job.command });
-    const run_at = std.time.timestamp();
+    const run_at = std_compat.time.timestamp();
     switch (job.job_type) {
         .shell => {
             const resolved_cli_cmd = resolveSkillCommand(allocator, job.command) catch null;
             defer if (resolved_cli_cmd) |rc| allocator.free(rc);
             const effective_cli_cmd = resolved_cli_cmd orelse job.command;
-            const result = std.process.Child.run(.{
+            const result = std_compat.process.Child.run(.{
                 .allocator = allocator,
                 .argv = &.{ platform.getShell(), platform.getShellFlag(), effective_cli_cmd },
                 .cwd = run_cwd,
@@ -4990,7 +5076,7 @@ fn cliRunJobLegacy(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) 
             defer allocator.free(result.stderr);
             if (result.stdout.len > 0) log.info("{s}", .{result.stdout});
             const exit_code: u8 = switch (result.term) {
-                .Exited => |code| code,
+                .exited => |code| code,
                 else => 1,
             };
             std.process.exit(exit_code);
@@ -5017,7 +5103,7 @@ fn cliRunJobLegacy(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) 
                 std.process.exit(CronRunExit.internal_error);
             };
             defer allocator.free(skill_cmd);
-            const result = std.process.Child.run(.{
+            const result = std_compat.process.Child.run(.{
                 .allocator = allocator,
                 .argv = &.{ platform.getShell(), platform.getShellFlag(), skill_cmd },
                 .cwd = run_cwd,
@@ -5029,7 +5115,7 @@ fn cliRunJobLegacy(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) 
             defer allocator.free(result.stderr);
             if (result.stdout.len > 0) log.info("{s}", .{result.stdout});
             const exit_code: u8 = switch (result.term) {
-                .Exited => |code| code,
+                .exited => |code| code,
                 else => 1,
             };
             std.process.exit(exit_code);
@@ -5043,7 +5129,7 @@ fn cliRunJobLegacy(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) 
 /// Exit codes: see `CronRunExit`.
 pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !void {
     if (!isValidJobId(id)) {
-        const stderr = std.fs.File.stderr();
+        const stderr = std_compat.fs.File.stderr();
         stderr.writeAll("error: invalid job_id (allowed: [a-zA-Z0-9._-], 1-128 chars)\n") catch {};
         std.process.exit(CronRunExit.invalid_id);
     }
@@ -5057,14 +5143,14 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
     }
 
     const db_path_z = getCronDbPathZ(allocator) catch {
-        const stderr = std.fs.File.stderr();
+        const stderr = std_compat.fs.File.stderr();
         stderr.writeAll("error: cron DB unavailable\n") catch {};
         std.process.exit(CronRunExit.internal_error);
     };
     defer allocator.free(db_path_z);
 
     const db = openCronDbAtPath(db_path_z) catch {
-        const stderr = std.fs.File.stderr();
+        const stderr = std_compat.fs.File.stderr();
         stderr.writeAll("error: could not open cron DB\n") catch {};
         std.process.exit(CronRunExit.internal_error);
     };
@@ -5078,13 +5164,13 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
     const spec_alloc = spec_arena.allocator();
 
     const spec = (dbLoadJobSpec(db, spec_alloc, id) catch {
-        const stderr = std.fs.File.stderr();
+        const stderr = std_compat.fs.File.stderr();
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "error: failed to load job '{s}'\n", .{id}) catch "error: failed to load job\n";
         stderr.writeAll(msg) catch {};
         std.process.exit(CronRunExit.internal_error);
     }) orelse {
-        const stderr = std.fs.File.stderr();
+        const stderr = std_compat.fs.File.stderr();
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "error: job not found: '{s}'\n", .{id}) catch "error: job not found\n";
         stderr.writeAll(msg) catch {};
@@ -5098,7 +5184,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
 
     // Concurrency guard: refuse if a scheduler run is in flight for the same job.
     if (jobHasInflightQueue(db, id) catch false) {
-        const stderr = std.fs.File.stderr();
+        const stderr = std_compat.fs.File.stderr();
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "error: job '{s}' already has a run in flight\n", .{id}) catch "error: job already running\n";
         stderr.writeAll(msg) catch {};
@@ -5118,9 +5204,9 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
     };
     const agent_timeout: u64 = if (cfg_opt) |cfg| cfg.scheduler.agent_timeout_secs else 600;
 
-    const start_ts = std.time.timestamp();
+    const start_ts = std_compat.time.timestamp();
     const queue_row_id = insertManualQueueRow(db, id, start_ts) catch {
-        const stderr = std.fs.File.stderr();
+        const stderr = std_compat.fs.File.stderr();
         stderr.writeAll("error: could not insert manual queue row\n") catch {};
         std.process.exit(CronRunExit.internal_error);
     };
@@ -5131,8 +5217,8 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
     // Effective timeout for skills/shells: spec override, else 120s default.
     const skill_timeout: u64 = if (spec.timeout_secs) |t| t else 120;
 
-    const stdout_h = std.fs.File.stdout();
-    const stderr_h = std.fs.File.stderr();
+    const stdout_h = std_compat.fs.File.stdout();
+    const stderr_h = std_compat.fs.File.stderr();
     var msg_buf: [512]u8 = undefined;
     {
         const m = std.fmt.bufPrint(&msg_buf, "[manual run] job='{s}' trace={s}\n", .{ spec.id, run_trace_id }) catch "";
@@ -5144,7 +5230,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             const raw_skill_cmd = resolveSkillExec(spec_alloc, spec.skill_name, spec.skill_args) catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: skill resolution failed: {s}\n", .{@errorName(err)}) catch "error: skill resolution failed\n";
                 stderr_h.writeAll(m) catch {};
-                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_skill") catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_skill") catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
             const skill_cmd = raw_skill_cmd;
@@ -5153,12 +5239,12 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             var skill_env = buildManualSkillChildEnv(spec_alloc, run_trace_id, spec.timeout_secs) catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: env setup failed: {s}\n", .{@errorName(err)}) catch "error: env setup failed\n";
                 stderr_h.writeAll(m) catch {};
-                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_skill") catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_skill") catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
             defer skill_env.deinit();
 
-            var skill_child = std.process.Child.init(
+            var skill_child = std_compat.process.Child.init(
                 &.{ platform.getShell(), platform.getShellFlag(), skill_cmd },
                 spec_alloc,
             );
@@ -5170,7 +5256,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             skill_child.spawn() catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: skill spawn failed: {s}\n", .{@errorName(err)}) catch "error: skill spawn failed\n";
                 stderr_h.writeAll(m) catch {};
-                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_skill") catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_skill") catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
 
@@ -5178,7 +5264,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             defer skill_stdout.deinit(spec_alloc);
             var skill_stderr: std.ArrayList(u8) = .empty;
             defer skill_stderr.deinit(spec_alloc);
-            const skill_start_ns = std.time.nanoTimestamp();
+            const skill_start_ns = std_compat.time.nanoTimestamp();
             const skill_timed_out = collectChildOutputWithTimeout(
                 &skill_child,
                 spec_alloc,
@@ -5187,9 +5273,9 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 skill_timeout,
                 skill_start_ns,
             ) catch false;
-            const skill_term = skill_child.wait() catch std.process.Child.Term{ .Exited = 1 };
+            const skill_term = skill_child.wait() catch std_compat.process.Child.Term{ .exited = 1 };
             const skill_exit: u8 = switch (skill_term) {
-                .Exited => |ec| ec,
+                .exited => |ec| ec,
                 else => 1,
             };
 
@@ -5202,7 +5288,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 defer retry_stdout.deinit(spec_alloc);
                 var retry_stderr: std.ArrayList(u8) = .empty;
                 defer retry_stderr.deinit(spec_alloc);
-                var retry_child = std.process.Child.init(
+                var retry_child = std_compat.process.Child.init(
                     &.{ platform.getShell(), platform.getShellFlag(), skill_cmd },
                     spec_alloc,
                 );
@@ -5212,7 +5298,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 retry_child.cwd = run_cwd;
                 retry_child.env_map = &skill_env;
                 if (retry_child.spawn()) |_| {
-                    const retry_start_ns = std.time.nanoTimestamp();
+                    const retry_start_ns = std_compat.time.nanoTimestamp();
                     const retry_timed_out = collectChildOutputWithTimeout(
                         &retry_child,
                         spec_alloc,
@@ -5221,9 +5307,9 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                         skill_timeout,
                         retry_start_ns,
                     ) catch false;
-                    const retry_term = retry_child.wait() catch std.process.Child.Term{ .Exited = 1 };
+                    const retry_term = retry_child.wait() catch std_compat.process.Child.Term{ .exited = 1 };
                     const retry_exit: u8 = switch (retry_term) {
-                        .Exited => |ec| ec,
+                        .exited => |ec| ec,
                         else => 1,
                     };
                     run_result = classifySkillRun(spec, retry_stdout.items, retry_exit, retry_timed_out, run_trace_id);
@@ -5274,7 +5360,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 db,
                 spec.id,
                 queue_row_id,
-                std.time.timestamp(),
+                std_compat.time.timestamp(),
                 status_str,
                 skill_output,
                 false, // never delete on manual run
@@ -5303,20 +5389,20 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             // matching the scheduler worker's behavior.
             const resolved_cmd = resolveSkillCommand(spec_alloc, spec.command) catch null;
             const effective_cmd: []const u8 = resolved_cmd orelse spec.command;
-            const result = std.process.Child.run(.{
+            const result = std_compat.process.Child.run(.{
                 .allocator = spec_alloc,
                 .argv = &.{ platform.getShell(), platform.getShellFlag(), effective_cmd },
                 .cwd = run_cwd,
             }) catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: shell spawn failed: {s}\n", .{@errorName(err)}) catch "error: shell spawn failed\n";
                 stderr_h.writeAll(m) catch {};
-                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_shell") catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_shell") catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
             var current_stdout = result.stdout;
             var current_stderr = result.stderr;
             var current_exit_code: u8 = switch (result.term) {
-                .Exited => |ec| ec,
+                .exited => |ec| ec,
                 else => 1,
             };
             var run_result = classifyExecRun(current_exit_code, false);
@@ -5325,7 +5411,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 retry_count += 1;
                 const saved_failure_class = run_result.failure_class;
                 stdout_h.writeAll("[manual run] retrying once...\n") catch {};
-                const retry_result = std.process.Child.run(.{
+                const retry_result = std_compat.process.Child.run(.{
                     .allocator = spec_alloc,
                     .argv = &.{ platform.getShell(), platform.getShellFlag(), effective_cmd },
                     .cwd = run_cwd,
@@ -5335,7 +5421,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                     break;
                 };
                 current_exit_code = switch (retry_result.term) {
-                    .Exited => |ec| ec,
+                    .exited => |ec| ec,
                     else => 1,
                 };
                 run_result = classifyExecRun(current_exit_code, false);
@@ -5362,7 +5448,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 db,
                 spec.id,
                 queue_row_id,
-                std.time.timestamp(),
+                std_compat.time.timestamp(),
                 status_str,
                 if (current_stdout.len > 0) current_stdout else null,
                 false,
@@ -5386,7 +5472,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             }) catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: agent run failed: {s}\n", .{@errorName(err)}) catch "error: agent run failed\n";
                 stderr_h.writeAll(m) catch {};
-                dbCompleteJob(db, spec.id, queue_row_id, std.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_agent") catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_agent") catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
             var final_output = result.output;
@@ -5430,7 +5516,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 db,
                 spec.id,
                 queue_row_id,
-                std.time.timestamp(),
+                std_compat.time.timestamp(),
                 status_str,
                 if (final_output.len > 0) final_output else null,
                 false,
@@ -5559,7 +5645,7 @@ pub fn cliShowJob(
     json_out: bool,
 ) !void {
     if (!isValidJobId(id)) {
-        const stderr = std.fs.File.stderr();
+        const stderr = std_compat.fs.File.stderr();
         stderr.writeAll("error: invalid job_id (allowed: [a-zA-Z0-9._-], 1-128 chars)\n") catch {};
         std.process.exit(CronRunExit.invalid_id);
     }
@@ -5585,7 +5671,7 @@ pub fn cliShowJob(
 
     const step_rc = c.sqlite3_step(stmt);
     if (step_rc == c.SQLITE_DONE) {
-        const stderr = std.fs.File.stderr();
+        const stderr = std_compat.fs.File.stderr();
         var buf: [256]u8 = undefined;
         const m = std.fmt.bufPrint(&buf, "error: job not found: '{s}'\n", .{id}) catch "error: job not found\n";
         stderr.writeAll(m) catch {};
@@ -5684,7 +5770,7 @@ pub fn cliShowJob(
         try buf.appendSlice(allocator, "},\"runs\":");
         try dbListRunsJson(db, id, limit, &buf, allocator);
         try buf.append(allocator, '}');
-        const stdout = std.fs.File.stdout();
+        const stdout = std_compat.fs.File.stdout();
         stdout.writeAll(buf.items) catch {};
         stdout.writeAll("\n") catch {};
         return;
@@ -5873,7 +5959,7 @@ fn buildCronExplainJob(
     const verification_mode = (try dbColumnTextOpt(stmt, 18, a)) orelse "none";
     const repair_policy = (try dbColumnTextOpt(stmt, 19, a)) orelse "none";
     const tz_offset_s: i32 = @intCast(c.sqlite3_column_int(stmt, 20));
-    const fresh_next = nextRunForCronExpressionTz(expr, std.time.timestamp(), tz_offset_s) catch c.sqlite3_column_int64(stmt, 5);
+    const fresh_next = nextRunForCronExpressionTz(expr, std_compat.time.timestamp(), tz_offset_s) catch c.sqlite3_column_int64(stmt, 5);
     const source = cronSchedulerSourceForJobType(job_type);
 
     var resolved_cmd: ?[]const u8 = null;
@@ -6036,7 +6122,7 @@ pub fn cliExplainJob(allocator: std.mem.Allocator, id: []const u8, json_out: boo
 
     const output = try buildCronExplainJob(allocator, db, id, json_out, skills_dir, home);
     defer allocator.free(output);
-    const stdout = std.fs.File.stdout();
+    const stdout = std_compat.fs.File.stdout();
     stdout.writeAll(output) catch {};
     stdout.writeAll("\n") catch {};
 }
@@ -6055,7 +6141,7 @@ pub fn cliListRuns(allocator: std.mem.Allocator, id: []const u8, limit: usize, j
             var buf: std.ArrayListUnmanaged(u8) = .empty;
             defer buf.deinit(allocator);
             dbListRunsJson(db, id, limit, &buf, allocator) catch break :db_blk;
-            const stdout = std.fs.File.stdout();
+            const stdout = std_compat.fs.File.stdout();
             stdout.writeAll(buf.items) catch {};
             stdout.writeAll("\n") catch {};
             return;
@@ -6135,7 +6221,7 @@ pub fn cliListRuns(allocator: std.mem.Allocator, id: []const u8, limit: usize, j
         if (json_out) {
             const cmd = job.command;
             const last_status = job.last_status;
-            const stdout = std.fs.File.stdout();
+            const stdout = std_compat.fs.File.stdout();
             var buf: std.ArrayListUnmanaged(u8) = .empty;
             defer buf.deinit(allocator);
             try buf.appendSlice(allocator, "[{\"id\":");
@@ -6187,7 +6273,7 @@ pub fn cliListDegradedRuns(
     const db = openCronDbForReadAtPath(allocator, db_path_z) catch return error.CronDbUnavailable;
     defer closeCronDb(db);
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     const cutoff: i64 = now - @as(i64, @intCast(hours)) * 3600;
 
     const sql_no_filter =
@@ -6268,7 +6354,7 @@ pub fn cliListDegradedRuns(
             try buf.append(allocator, '}');
         }
         try buf.append(allocator, ']');
-        const stdout = std.fs.File.stdout();
+        const stdout = std_compat.fs.File.stdout();
         stdout.writeAll(buf.items) catch {};
         stdout.writeAll("\n") catch {};
         return;
@@ -6427,7 +6513,7 @@ pub fn cliFindRunByTrace(allocator: std.mem.Allocator, trace_id: []const u8, jso
             try buf.append(allocator, '}');
         }
         try buf.append(allocator, ']');
-        const stdout = std.fs.File.stdout();
+        const stdout = std_compat.fs.File.stdout();
         stdout.writeAll(buf.items) catch {};
         stdout.writeAll("\n") catch {};
         if (count == 0) return error.NoRunMatched;
@@ -6485,10 +6571,10 @@ pub fn cliBackup(allocator: std.mem.Allocator) !void {
     const backup_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "backup" });
     defer allocator.free(backup_dir);
 
-    std.fs.cwd().makePath(backup_dir) catch {};
+    std_compat.fs.cwd().makePath(backup_dir) catch {};
 
     // Generate timestamp suffix
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(now) };
     const day = epoch.getEpochDay();
     const yd = day.calculateYearDay();
@@ -6509,7 +6595,7 @@ pub fn cliBackup(allocator: std.mem.Allocator) !void {
     const backup_path = try std.fs.path.join(allocator, &.{ backup_dir, backup_name });
     defer allocator.free(backup_path);
 
-    std.fs.cwd().copyFile(db_path, std.fs.cwd(), backup_path, .{}) catch |err| {
+    std_compat.fs.cwd().copyFile(db_path, std_compat.fs.cwd(), backup_path, .{}) catch |err| {
         log.err("Backup failed: {s}", .{@errorName(err)});
         return err;
     };
@@ -6525,7 +6611,7 @@ pub fn cliRestore(allocator: std.mem.Allocator, file_arg: ?[]const u8) !void {
 
     if (file_arg) |file| {
         // Restore from specified file
-        std.fs.cwd().copyFile(file, std.fs.cwd(), db_path, .{}) catch |err| {
+        std_compat.fs.cwd().copyFile(file, std_compat.fs.cwd(), db_path, .{}) catch |err| {
             log.err("Restore failed: {s}", .{@errorName(err)});
             return err;
         };
@@ -6536,7 +6622,7 @@ pub fn cliRestore(allocator: std.mem.Allocator, file_arg: ?[]const u8) !void {
     // Find latest backup
     const backup_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "backup" });
     defer allocator.free(backup_dir);
-    var dir = std.fs.cwd().openDir(backup_dir, .{ .iterate = true }) catch |err| {
+    var dir = std_compat.fs.cwd().openDir(backup_dir, .{ .iterate = true }) catch |err| {
         log.err("Cannot open backup dir: {s}", .{@errorName(err)});
         return err;
     };
@@ -6557,7 +6643,7 @@ pub fn cliRestore(allocator: std.mem.Allocator, file_arg: ?[]const u8) !void {
     if (latest) |name| {
         const src_path = try std.fs.path.join(allocator, &.{ backup_dir, name });
         defer allocator.free(src_path);
-        std.fs.cwd().copyFile(src_path, std.fs.cwd(), db_path, .{}) catch |err| {
+        std_compat.fs.cwd().copyFile(src_path, std_compat.fs.cwd(), db_path, .{}) catch |err| {
             log.err("Restore failed: {s}", .{@errorName(err)});
             return err;
         };
@@ -6582,7 +6668,8 @@ pub fn cliExportSeed(allocator: std.mem.Allocator) !void {
     // Build JSON array of enabled jobs (seed format: definition only, no runtime state)
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     try w.writeAll("[\n");
     var count: usize = 0;
     for (scheduler.jobs.items) |job| {
@@ -6622,8 +6709,9 @@ pub fn cliExportSeed(allocator: std.mem.Allocator) !void {
         count += 1;
     }
     try w.writeAll("\n]\n");
+    buf = buf_writer.toArrayList();
 
-    const file = try std.fs.cwd().createFile(seed_path, .{});
+    const file = try std_compat.fs.cwd().createFile(seed_path, .{});
     defer file.close();
     try file.writeAll(buf.items);
     log.info("Exported {d} jobs to {s}", .{ count, seed_path });
@@ -6632,10 +6720,10 @@ pub fn cliExportSeed(allocator: std.mem.Allocator) !void {
 const InitSeedConfirmReader = *const fn (ctx: ?*anyopaque, prompt_index: u8) anyerror!bool;
 
 fn stdinInitSeedConfirm(_: ?*anyopaque, _: u8) !bool {
-    const stdin = std.fs.File.stdin();
+    const stdin = std_compat.fs.File.stdin();
     var buf: [64]u8 = undefined;
     const n = stdin.read(&buf) catch 0;
-    const input = std.mem.trimRight(u8, buf[0..n], "\r\n ");
+    const input = std_compat.mem.trimRight(u8, buf[0..n], "\r\n ");
     return std.mem.eql(u8, input, "yes");
 }
 
@@ -6694,7 +6782,7 @@ fn cliInitSeedAtPath(
     const existing_count = dbCountJobs(db);
     if (!try confirmInitSeed(seed_path, existing_count, rebuild, confirm_ctx, confirm_reader)) return;
 
-    const content = std.fs.cwd().readFileAlloc(allocator, seed_path, 1024 * 1024) catch |err| {
+    const content = std_compat.fs.cwd().readFileAlloc(allocator, seed_path, 1024 * 1024) catch |err| {
         log.err("Cannot read {s}: {s}", .{ seed_path, @errorName(err) });
         return err;
     };
@@ -6781,7 +6869,7 @@ fn cliInitSeedAtPath(
         // Restore fields not covered by the add*Job helpers.
         job.tz_offset_s = seed_tz_offset;
         if (seed_tz_offset != 0) {
-            job.next_run_secs = nextRunForCronExpressionTz(expression, std.time.timestamp(), seed_tz_offset) catch job.next_run_secs;
+            job.next_run_secs = nextRunForCronExpressionTz(expression, std_compat.time.timestamp(), seed_tz_offset) catch job.next_run_secs;
         }
         if (obj.get("one_shot")) |v| if (v == .bool) {
             job.one_shot = v.bool;
@@ -7189,7 +7277,7 @@ pub fn dbDequeueNextJob(db: *c.sqlite3, allocator: std.mem.Allocator) !?struct {
     const upd_sql = "UPDATE cron_run_queue SET status='in_progress', started_at=?1 WHERE id=?2";
     var upd_stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(db, upd_sql, -1, &upd_stmt, null) == c.SQLITE_OK) {
-        _ = c.sqlite3_bind_int64(upd_stmt, 1, std.time.timestamp());
+        _ = c.sqlite3_bind_int64(upd_stmt, 1, std_compat.time.timestamp());
         _ = c.sqlite3_bind_int64(upd_stmt, 2, queue_row_id);
         _ = c.sqlite3_step(upd_stmt);
         _ = c.sqlite3_finalize(upd_stmt);
@@ -8474,7 +8562,7 @@ test "CronScheduler getJob found and missing" {
 test "db upsert and load roundtrip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
     const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "cron_test.db" });
     defer std.testing.allocator.free(db_path);
@@ -8525,7 +8613,7 @@ test "load agent job without command field falls back to prompt" {
     // loadJobsStrict must populate command from the prompt field.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
     const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "cron_test.db" });
     defer std.testing.allocator.free(db_path);
@@ -8576,7 +8664,7 @@ test "load agent job without command field falls back to prompt" {
 test "load agent job without prompt field falls back to command" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
     const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "cron_test.db" });
     defer std.testing.allocator.free(db_path);
@@ -8634,7 +8722,7 @@ test "trimOwnedRight duplicates trimmed allocation" {
 test "save and load roundtrip keeps delivery account routing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
     const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "cron_test.db" });
     defer std.testing.allocator.free(db_path);
@@ -8682,7 +8770,7 @@ test "save and load roundtrip keeps delivery account routing" {
 test "cliRunJob persists last status and timestamp" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
     const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "cron_test.db" });
     defer std.testing.allocator.free(db_path);
@@ -8700,7 +8788,7 @@ test "cliRunJob persists last status and timestamp" {
 
     // Simulate completing the run: update status fields and upsert.
     if (scheduler.getMutableJob(job_id)) |mutable| {
-        mutable.last_run_secs = std.time.timestamp();
+        mutable.last_run_secs = std_compat.time.timestamp();
         mutable.last_status = "ok";
         try dbUpsertAndVerify(&scheduler, mutable);
     }
@@ -8731,7 +8819,7 @@ test "resolveRunnableCwd returns null for missing cwd" {
 test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = tmp.dir.realpathAlloc(std.testing.allocator, ".") catch return;
+    const base = @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".") catch return;
     defer std.testing.allocator.free(base);
     const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ base, "reload_recover.db" });
     defer std.testing.allocator.free(db_path);
@@ -8750,7 +8838,7 @@ test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
 
     const path = try cronJsonPath(std.testing.allocator);
     defer std.testing.allocator.free(path);
-    const bad_file = try std.fs.createFileAbsolute(path, .{});
+    const bad_file = try std_compat.fs.createFileAbsolute(path, .{});
     defer bad_file.close();
     try bad_file.writeAll("{bad-json");
 
@@ -8768,7 +8856,7 @@ test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
 test "db upsert and load roundtrip with special command characters" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
     const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "cron_test.db" });
     defer std.testing.allocator.free(db_path);
@@ -8797,7 +8885,7 @@ test "db upsert and load roundtrip with special command characters" {
 test "db upsert and load roundtrip keeps agent fields" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
     const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ tmp_path, "cron_test.db" });
     defer std.testing.allocator.free(db_path);
@@ -9022,7 +9110,7 @@ test "tick removes more than 64 one-shot jobs in one pass" {
         _ = try scheduler.addAgentOnce("1s", "noop prompt", null, .{});
     }
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     _ = scheduler.tick(now + 2, null);
     try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
 }
@@ -9253,7 +9341,7 @@ test "one-shot job deleted after tick execution" {
     scheduler.jobs.items[0].next_run_secs = 0;
 
     // Tick without bus — the shell command "echo oneshot" will actually run
-    _ = scheduler.tick(std.time.timestamp(), null);
+    _ = scheduler.tick(std_compat.time.timestamp(), null);
 
     // One-shot job should have been removed
     try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
@@ -9263,7 +9351,7 @@ test "shell job uses configured cwd for relative output paths" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
@@ -9273,9 +9361,9 @@ test "shell job uses configured cwd for relative output paths" {
     _ = try scheduler.addOnce("1s", "echo cwd_ok > cwd_proof.txt");
     scheduler.jobs.items[0].next_run_secs = 0;
 
-    _ = scheduler.tick(std.time.timestamp(), null);
+    _ = scheduler.tick(std_compat.time.timestamp(), null);
 
-    const proof_file = try tmp.dir.openFile("cwd_proof.txt", .{});
+    const proof_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("cwd_proof.txt", .{});
     proof_file.close();
 }
 
@@ -9298,7 +9386,7 @@ test "shell job delivers stdout via bus" {
     };
     scheduler.jobs.items[0].next_run_secs = 0;
 
-    _ = scheduler.tick(std.time.timestamp(), &test_bus);
+    _ = scheduler.tick(std_compat.time.timestamp(), &test_bus);
 
     // Verify delivery happened
     try std.testing.expect(test_bus.outboundDepth() > 0);
@@ -9325,7 +9413,7 @@ test "agent job delivers result via bus" {
     });
     job.next_run_secs = 0;
 
-    _ = scheduler.tick(std.time.timestamp(), &test_bus);
+    _ = scheduler.tick(std_compat.time.timestamp(), &test_bus);
 
     // Verify delivery
     try std.testing.expect(test_bus.outboundDepth() > 0);
@@ -9334,95 +9422,6 @@ test "agent job delivers result via bus" {
     try std.testing.expectEqualStrings("discord", msg.channel);
     try std.testing.expectEqualStrings("general", msg.chat_id);
     try std.testing.expectEqualStrings("Summarize today's news", msg.content);
-}
-
-test "collectChildOutputWithTimeout disables timeout when set to zero" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    var child = std.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), "echo ready" }, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
-    errdefer {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-    }
-
-    var stdout: std.ArrayList(u8) = .empty;
-    defer stdout.deinit(allocator);
-    var stderr: std.ArrayList(u8) = .empty;
-    defer stderr.deinit(allocator);
-
-    const timed_out = try collectChildOutputWithTimeout(
-        &child,
-        allocator,
-        &stdout,
-        &stderr,
-        0,
-        std.time.nanoTimestamp(),
-    );
-    const term = try child.wait();
-
-    try std.testing.expect(!timed_out);
-    switch (term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
-        else => try std.testing.expect(false),
-    }
-    try std.testing.expect(std.mem.indexOf(u8, stdout.items, "ready") != null);
-}
-
-test "collectChildOutputWithTimeout kills process after deadline" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    var child = std.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), "sleep 2; echo never" }, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
-    errdefer {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-    }
-
-    var stdout: std.ArrayList(u8) = .empty;
-    defer stdout.deinit(allocator);
-    var stderr: std.ArrayList(u8) = .empty;
-    defer stderr.deinit(allocator);
-
-    const timed_out = try collectChildOutputWithTimeout(
-        &child,
-        allocator,
-        &stdout,
-        &stderr,
-        1,
-        std.time.nanoTimestamp(),
-    );
-    const term = try child.wait();
-
-    try std.testing.expect(timed_out);
-    const completed_ok = switch (term) {
-        .Exited => |code| code == 0,
-        else => false,
-    };
-    try std.testing.expect(!completed_ok);
-}
-
-test "preferAgentExecPath keeps regular executable path" {
-    const input = "/home/user/bin/nullclaw";
-    try std.testing.expectEqualStrings(input, preferAgentExecPath(input));
-}
-
-test "preferAgentExecPath uses proc self exe for deleted linux path" {
-    if (comptime builtin.os.tag != .linux) return;
-    try std.testing.expectEqualStrings(LINUX_SELF_EXE_PATH, preferAgentExecPath("/tmp/nullclaw (deleted)"));
-}
-
-test "pathAgentExecutableName returns platform command name" {
-    const expected = if (comptime builtin.os.tag == .windows) "nullclaw.exe" else "nullclaw";
-    try std.testing.expectEqualStrings(expected, pathAgentExecutableName());
 }
 
 test "DeliveryMode parse and asStr" {
@@ -9444,11 +9443,11 @@ test "probeSchedulerStatus reports missing config file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    const config_path = try std_compat.fs.path.join(allocator, &.{ base, "config.json" });
     defer allocator.free(config_path);
-    const daemon_state_path = try std.fs.path.join(allocator, &.{ base, "daemon_state.json" });
+    const daemon_state_path = try std_compat.fs.path.join(allocator, &.{ base, "daemon_state.json" });
     defer allocator.free(daemon_state_path);
 
     const status = probeSchedulerStatus(config_path, daemon_state_path, true);
@@ -9463,15 +9462,15 @@ test "probeSchedulerStatus reports config and daemon state files independently" 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    const config_path = try std_compat.fs.path.join(allocator, &.{ base, "config.json" });
     defer allocator.free(config_path);
-    const daemon_state_path = try std.fs.path.join(allocator, &.{ base, "daemon_state.json" });
+    const daemon_state_path = try std_compat.fs.path.join(allocator, &.{ base, "daemon_state.json" });
     defer allocator.free(daemon_state_path);
 
     {
-        const file = try std.fs.createFileAbsolute(config_path, .{});
+        const file = try std_compat.fs.createFileAbsolute(config_path, .{});
         defer file.close();
         try file.writeAll("{}\n");
     }
@@ -9482,7 +9481,7 @@ test "probeSchedulerStatus reports config and daemon state files independently" 
     try std.testing.expect(!status.daemon_state_present);
 
     {
-        const file = try std.fs.createFileAbsolute(daemon_state_path, .{});
+        const file = try std_compat.fs.createFileAbsolute(daemon_state_path, .{});
         defer file.close();
         try file.writeAll("{\"status\":\"running\"}\n");
     }
@@ -9502,7 +9501,7 @@ test "tick without bus still executes jobs" {
     scheduler.jobs.items[0].next_run_secs = 0;
 
     // Tick with null bus — should not crash
-    _ = scheduler.tick(std.time.timestamp(), null);
+    _ = scheduler.tick(std_compat.time.timestamp(), null);
 
     // Job should have been executed and rescheduled
     try std.testing.expectEqualStrings("ok", scheduler.jobs.items[0].last_status.?);
@@ -9613,7 +9612,7 @@ test "db save and load roundtrip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/cron.db", .{base});
@@ -9655,7 +9654,7 @@ test "db save and load agent job with delivery" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/cron.db", .{base});
@@ -9701,7 +9700,7 @@ test "dbDeleteJob removes a row" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/cron.db", .{base});
@@ -9731,7 +9730,7 @@ test "dbSetJobPaused updates paused flag" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/pause-helper.db", .{base});
@@ -9769,7 +9768,7 @@ test "dbCountJobs returns zero on empty table" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/empty.db", .{base});
@@ -9789,7 +9788,7 @@ test "ensureCronTable is idempotent" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/idem.db", .{base});
@@ -9813,7 +9812,7 @@ test "openCronDbForReadAtPath falls back to immutable read-only when schema migr
     defer tmp.cleanup();
 
     const allocator = std.testing.allocator;
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path = try std.fmt.allocPrint(allocator, "{s}/cron.db", .{base});
     defer allocator.free(db_path);
@@ -9824,10 +9823,10 @@ test "openCronDbForReadAtPath falls back to immutable read-only when schema migr
     try ensureCronTable(db);
     _ = c.sqlite3_exec(db, "INSERT INTO cron_jobs(id, expression, command, next_run_secs) VALUES('job-readonly', '* * * * *', 'echo hi', 1)", null, null, null);
     closeCronDb(db);
-    try std.posix.fchmodat(std.posix.AT.FDCWD, base, 0o555, 0);
-    defer std.posix.fchmodat(std.posix.AT.FDCWD, base, 0o755, 0) catch {};
+    try std_compat.posix.fchmodat(std.posix.AT.FDCWD, base, 0o555, 0);
+    defer std_compat.posix.fchmodat(std.posix.AT.FDCWD, base, 0o755, 0) catch {};
 
-    var file = try std.fs.openFileAbsolute(db_path, .{ .mode = .read_only });
+    var file = try std_compat.fs.openFileAbsolute(db_path, .{ .mode = .read_only });
     defer file.close();
     try file.chmod(0o444);
 
@@ -9849,7 +9848,7 @@ test "loadJobsForRead loads jobs from read-only cron DB" {
     defer tmp.cleanup();
 
     const allocator = std.testing.allocator;
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path = try std.fmt.allocPrint(allocator, "{s}/cron.db", .{base});
     defer allocator.free(db_path);
@@ -9861,10 +9860,10 @@ test "loadJobsForRead loads jobs from read-only cron DB" {
     _ = c.sqlite3_exec(db, "INSERT INTO cron_jobs(id, expression, command, next_run_secs) VALUES('job-cli-read', '* * * * *', 'echo hi', 1)", null, null, null);
     closeCronDb(db);
 
-    try std.posix.fchmodat(std.posix.AT.FDCWD, base, 0o555, 0);
-    defer std.posix.fchmodat(std.posix.AT.FDCWD, base, 0o755, 0) catch {};
+    try std_compat.posix.fchmodat(std.posix.AT.FDCWD, base, 0o555, 0);
+    defer std_compat.posix.fchmodat(std.posix.AT.FDCWD, base, 0o755, 0) catch {};
 
-    var file = try std.fs.openFileAbsolute(db_path, .{ .mode = .read_only });
+    var file = try std_compat.fs.openFileAbsolute(db_path, .{ .mode = .read_only });
     defer file.close();
     try file.chmod(0o444);
 
@@ -9898,7 +9897,7 @@ const IsolatedTestScheduler = struct {
 fn makeIsolatedTestScheduler() !IsolatedTestScheduler {
     var tmp = std.testing.tmpDir(.{});
     errdefer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/cron_test.db", .{base});
     defer std.testing.allocator.free(db_path_str);
@@ -9925,7 +9924,7 @@ fn fakeInitSeedConfirm(ctx: ?*anyopaque, _: u8) !bool {
 fn writeInitSeedFixture(allocator: std.mem.Allocator, dir: []const u8) ![]const u8 {
     const seed_path = try std.fs.path.join(allocator, &.{ dir, "cron-seed.json" });
     errdefer allocator.free(seed_path);
-    const file = try std.fs.createFileAbsolute(seed_path, .{});
+    const file = try std_compat.fs.createFileAbsolute(seed_path, .{});
     defer file.close();
     try file.writeAll(
         \\[{"expression":"*/5 * * * *","job_type":"shell","command":"echo seeded"}]
@@ -10171,7 +10170,7 @@ test "dbTickAndEnqueue enqueues due jobs and updates next_run_secs" {
     if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1; // far in the past
     try dbUpsertAndVerify(sched, sched.getJob(jid).?);
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     const count = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
     try std.testing.expectEqual(@as(usize, 1), count);
 
@@ -10199,7 +10198,7 @@ test "dbDequeueNextJob returns and marks in_progress" {
     if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
     try dbUpsertAndVerify(sched, sched.getJob(jid).?);
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
 
     const db = try openCronDbAtPath(iso.db_path_buf);
@@ -10255,7 +10254,7 @@ test "dbCompleteJob writes result and removes queue row" {
     if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
     try dbUpsertAndVerify(sched, sched.getJob(jid).?);
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
 
     const db = try openCronDbAtPath(iso.db_path_buf);
@@ -10288,7 +10287,7 @@ test "dbResetInProgressJobs resets stale rows" {
     if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
     try dbUpsertAndVerify(sched, sched.getJob(jid).?);
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
 
     const db = try openCronDbAtPath(iso.db_path_buf);
@@ -10378,7 +10377,7 @@ test "resolveSkillExecFrom rejects unsafe skill_name" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
 
     try std.testing.expectError(
@@ -10395,12 +10394,12 @@ test "resolveSkillExecFrom rejects shell-injectable skill_args" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const skills_dir = try std.fmt.allocPrint(allocator, "{s}/skills", .{base});
     defer allocator.free(skills_dir);
-    try tmp.dir.makePath("skills/news");
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news");
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "skills/news/SKILL.md",
         .data = "# news\n\n## Script\n\n~/scripts/run.py\n",
     });
@@ -10432,7 +10431,7 @@ test "dbCompleteJob inserts cron_runs history row" {
     if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
     try dbUpsertAndVerify(sched, sched.getJob(jid).?);
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
 
     const db = try openCronDbAtPath(iso.db_path_buf);
@@ -10466,7 +10465,7 @@ test "dbListRunsJson returns JSON array of runs" {
     if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
     try dbUpsertAndVerify(sched, sched.getJob(jid).?);
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
 
     const db = try openCronDbAtPath(iso.db_path_buf);
@@ -10588,7 +10587,7 @@ test "cron_runs pruning removes rows older than 30 days" {
     try ensureCronTable(db);
 
     // Insert a stale run (61 days ago) directly.
-    const old_ts = std.time.timestamp() - (61 * 86400);
+    const old_ts = std_compat.time.timestamp() - (61 * 86400);
     const ins_sql = "INSERT INTO cron_runs(job_id, started_at, finished_at, status) VALUES(?1,?2,?2,'ok')";
     var ist: ?*c.sqlite3_stmt = null;
     _ = c.sqlite3_prepare_v2(db, ins_sql, -1, &ist, null);
@@ -10598,7 +10597,7 @@ test "cron_runs pruning removes rows older than 30 days" {
     _ = c.sqlite3_finalize(ist);
 
     // Now complete a fresh run — this should prune the old row.
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
     const dequeued = (try dbDequeueNextJob(db, std.testing.allocator)).?;
     defer std.testing.allocator.free(dequeued.job_id);
@@ -10627,7 +10626,7 @@ test "cron_runs started_at differs from finished_at when worker delays" {
     if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
     try dbUpsertAndVerify(sched, sched.getJob(jid).?);
 
-    const dequeue_time = std.time.timestamp();
+    const dequeue_time = std_compat.time.timestamp();
     _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, dequeue_time);
 
     const db = try openCronDbAtPath(iso.db_path_buf);
@@ -10845,8 +10844,8 @@ test "dbListJobsJsonFiltered status uses latest run and paused flag" {
 }
 
 fn makeExplainSkillFixture(tmp: *std.testing.TmpDir, allocator: std.mem.Allocator) !struct { home: []const u8, skills_dir: []const u8 } {
-    try tmp.dir.makePath("skills/oil/scripts");
-    const file = try tmp.dir.createFile("skills/oil/SKILL.md", .{});
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/oil/scripts");
+    const file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/oil/SKILL.md", .{});
     defer file.close();
     try file.writeAll(
         \\# Oil Skill
@@ -10855,7 +10854,7 @@ fn makeExplainSkillFixture(tmp: *std.testing.TmpDir, allocator: std.mem.Allocato
         \\~/skills/oil/scripts/run.py
         \\
     );
-    const home = try tmp.dir.realpathAlloc(allocator, ".");
+    const home = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     errdefer allocator.free(home);
     const skills_dir = try std.fs.path.join(allocator, &.{ home, "skills" });
     errdefer allocator.free(skills_dir);
@@ -10988,7 +10987,7 @@ test "cliSchedule json_out honors show_today flag" {
     var scheduler = CronScheduler.init(allocator, 64, true);
     defer scheduler.deinit();
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     // Add a job due in 5 seconds (within any reasonable window).
     const j = try scheduler.addJob("* * * * *", "echo today-test");
     if (scheduler.getMutableJob(j.id)) |mj| {
@@ -11018,7 +11017,7 @@ test "resolveConfigDir falls back to HOME/.nullclaw when NULLCLAW_HOME unset" {
     const dir = try config_paths.defaultConfigDirFromInputs(allocator, null, "test-home");
     defer allocator.free(dir);
 
-    const expected = try std.fs.path.join(allocator, &.{ "test-home", ".nullclaw" });
+    const expected = try std_compat.fs.path.join(allocator, &.{ "test-home", ".nullclaw" });
     defer allocator.free(expected);
 
     try std.testing.expectEqualStrings(expected, dir);
@@ -11030,7 +11029,7 @@ test "cronJsonPath appends cron.json to resolved config dir" {
     const path = try cronJsonPathFromDir(allocator, "test-nullclaw-data");
     defer allocator.free(path);
 
-    const expected = try std.fs.path.join(allocator, &.{ "test-nullclaw-data", "cron.json" });
+    const expected = try std_compat.fs.path.join(allocator, &.{ "test-nullclaw-data", "cron.json" });
     defer allocator.free(expected);
 
     try std.testing.expectEqualStrings(expected, path);
@@ -11053,7 +11052,7 @@ test "dbCompleteJob shell run with status=error writes verified=0 and is matched
     if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
     try dbUpsertAndVerify(sched, sched.getJob(jid).?);
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
 
     const db = try openCronDbAtPath(iso.db_path_buf);
@@ -11103,7 +11102,7 @@ test "dbCompleteJob persists trace_id when run_result is null" {
     if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
     try dbUpsertAndVerify(sched, sched.getJob(jid).?);
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
 
     const db = try openCronDbAtPath(iso.db_path_buf);
@@ -11161,7 +11160,7 @@ test "dbCompleteJob persists run_result classification fields for exec errors" {
     if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
     try dbUpsertAndVerify(sched, sched.getJob(jid).?);
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
 
     const db = try openCronDbAtPath(iso.db_path_buf);
@@ -11227,7 +11226,7 @@ test "dbCompleteJob persists source column" {
     if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
     try dbUpsertAndVerify(sched, sched.getJob(jid).?);
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
 
     const db = try openCronDbAtPath(iso.db_path_buf);
@@ -11272,7 +11271,7 @@ test "makeRunTraceId formats job id and run id" {
 }
 
 test "putCronSubprocessEnv sets cron subprocess markers" {
-    var env_map = std.process.EnvMap.init(std.testing.allocator);
+    var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
     defer env_map.deinit();
 
     try putCronSubprocessEnv(&env_map, .{
@@ -11287,7 +11286,7 @@ test "putCronSubprocessEnv sets cron subprocess markers" {
 }
 
 test "putCronSubprocessEnv clears trace and job id when trace_id null" {
-    var env_map = std.process.EnvMap.init(std.testing.allocator);
+    var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
     defer env_map.deinit();
 
     try env_map.put(EXECUTION_TRACE_ENV, "stale-trace");
@@ -11321,4 +11320,40 @@ test "buildManualSkillChildEnv defaults timeout to 120 seconds" {
     defer env_map.deinit();
 
     try std.testing.expectEqualStrings("120", env_map.get(SKILL_TIMEOUT_ENV).?);
+}
+
+test "buildJobsJson serializes cron jobs for CLI read-side" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/5 * * * *", "echo hello");
+    _ = scheduler.pauseJob(job.id);
+
+    const json = try buildJobsJson(std.testing.allocator, scheduler.listJobs());
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"echo hello\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"paused\":true") != null);
+}
+
+test "buildSchedulerStatusJson reports scheduler summary" {
+    const json = try buildSchedulerStatusJson(
+        std.testing.allocator,
+        .{
+            .config_exists = true,
+            .scheduler_enabled = true,
+            .daemon_state_present = false,
+            .config_probe_error = null,
+        },
+        3,
+        2,
+        1,
+    );
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"waiting_for_daemon\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"job_count\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"active_jobs\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"paused_jobs\":1") != null);
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const observability = @import("observability.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const BootstrapProvider = bootstrap_mod.BootstrapProvider;
@@ -35,7 +36,7 @@ fn parseTasksInternal(
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (!std.mem.startsWith(u8, trimmed, "- ")) continue;
 
-        const task = std.mem.trimLeft(u8, trimmed[2..], " \t");
+        const task = std.mem.trimStart(u8, trimmed[2..], " \t");
         if (task.len == 0) continue;
 
         try list.append(allocator, try allocator.dupe(u8, task));
@@ -81,7 +82,7 @@ pub const HeartbeatEngine = struct {
     pub fn init(enabled: bool, interval_minutes: u32, workspace_dir: []const u8, observer: ?observability.Observer) HeartbeatEngine {
         return .{
             .enabled = enabled,
-            .interval_minutes = if (interval_minutes < 5) 5 else interval_minutes,
+            .interval_minutes = @max(interval_minutes, 1),
             .workspace_dir = workspace_dir,
             .observer = observer,
         };
@@ -96,7 +97,10 @@ pub const HeartbeatEngine = struct {
     pub fn collectTasks(self: *const HeartbeatEngine, allocator: std.mem.Allocator) ![][]const u8 {
         // Try bootstrap provider first when available.
         if (self.bootstrap_provider) |bp| {
-            const bp_content = bp.load_excerpt(allocator, "HEARTBEAT.md", MAX_HEARTBEAT_FILE_BYTES) catch null;
+            const bp_content = bp.load_excerpt(allocator, "HEARTBEAT.md", MAX_HEARTBEAT_FILE_BYTES) catch |err| {
+                log.warn("bootstrap provider failed to load HEARTBEAT.md: {s}", .{@errorName(err)});
+                return &.{};
+            };
             if (bp_content) |content| {
                 defer allocator.free(content);
                 if (isContentEffectivelyEmpty(content)) return &.{};
@@ -106,10 +110,10 @@ pub const HeartbeatEngine = struct {
         }
 
         // Fallback: direct file read.
-        const heartbeat_path = try std.fs.path.join(allocator, &.{ self.workspace_dir, "HEARTBEAT.md" });
+        const heartbeat_path = try std_compat.fs.path.join(allocator, &.{ self.workspace_dir, "HEARTBEAT.md" });
         defer allocator.free(heartbeat_path);
 
-        const file = std.fs.openFileAbsolute(heartbeat_path, .{}) catch |err| switch (err) {
+        const file = std_compat.fs.openFileAbsolute(heartbeat_path, .{}) catch |err| switch (err) {
             error.FileNotFound => return &.{},
             else => return err,
         };
@@ -154,10 +158,10 @@ pub const HeartbeatEngine = struct {
         }
 
         // Fallback: direct file read.
-        const heartbeat_path = try std.fs.path.join(allocator, &.{ self.workspace_dir, "HEARTBEAT.md" });
+        const heartbeat_path = try std_compat.fs.path.join(allocator, &.{ self.workspace_dir, "HEARTBEAT.md" });
         defer allocator.free(heartbeat_path);
 
-        const file = std.fs.openFileAbsolute(heartbeat_path, .{}) catch |err| switch (err) {
+        const file = std_compat.fs.openFileAbsolute(heartbeat_path, .{}) catch |err| switch (err) {
             error.FileNotFound => {
                 log.debug("heartbeat tick: workspace HEARTBEAT.md is missing before task scan", .{});
                 return .{ .outcome = .skipped_missing_file, .task_count = 0 };
@@ -173,11 +177,11 @@ pub const HeartbeatEngine = struct {
 
     /// Create a default HEARTBEAT.md if it doesn't exist.
     pub fn ensureHeartbeatFile(workspace_dir: []const u8, allocator: std.mem.Allocator) !void {
-        const path = try std.fs.path.join(allocator, &.{ workspace_dir, "HEARTBEAT.md" });
+        const path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, "HEARTBEAT.md" });
         defer allocator.free(path);
 
         // Try to open to check existence
-        if (std.fs.openFileAbsolute(path, .{})) |file| {
+        if (std_compat.fs.openFileAbsolute(path, .{})) |file| {
             file.close();
             return; // Already exists
         } else |err| switch (err) {
@@ -197,7 +201,7 @@ pub const HeartbeatEngine = struct {
             \\# - Check the weather forecast
         ;
 
-        const file = try std.fs.createFileAbsolute(path, .{});
+        const file = try std_compat.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(default_content);
     }
@@ -218,14 +222,14 @@ fn isMarkdownHeader(line: []const u8) bool {
 fn isEmptyMarkdownBullet(line: []const u8) bool {
     if (line.len == 0 or !isMarkdownBulletPrefix(line[0])) return false;
 
-    const rest = std.mem.trimLeft(u8, line[1..], " \t");
+    const rest = std.mem.trimStart(u8, line[1..], " \t");
     if (rest.len == 0) return true;
 
     if (std.mem.startsWith(u8, rest, "[ ]") or
         std.mem.startsWith(u8, rest, "[x]") or
         std.mem.startsWith(u8, rest, "[X]"))
     {
-        const after_checkbox = std.mem.trimLeft(u8, rest[3..], " \t");
+        const after_checkbox = std.mem.trimStart(u8, rest[3..], " \t");
         return after_checkbox.len == 0;
     }
 
@@ -336,9 +340,14 @@ test "parseTasksInternal tracks actionable line numbers" {
     try std.testing.expectEqualSlices(usize, &[_]usize{ 3, 5, 7 }, task_line_numbers.items);
 }
 
-test "HeartbeatEngine init clamps interval" {
-    const engine = HeartbeatEngine.init(true, 2, "/tmp", null);
-    try std.testing.expectEqual(@as(u32, 5), engine.interval_minutes);
+test "HeartbeatEngine init clamps zero interval to one minute" {
+    const engine = HeartbeatEngine.init(true, 0, "/tmp", null);
+    try std.testing.expectEqual(@as(u32, 1), engine.interval_minutes);
+}
+
+test "HeartbeatEngine init preserves low interval" {
+    const engine = HeartbeatEngine.init(true, 1, "/tmp", null);
+    try std.testing.expectEqual(@as(u32, 1), engine.interval_minutes);
 }
 
 test "HeartbeatEngine init preserves valid interval" {
@@ -359,10 +368,10 @@ test "HeartbeatEngine tick processes workspace tasks" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace_dir);
 
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "HEARTBEAT.md",
         .data =
         \\# Periodic Tasks
@@ -383,10 +392,10 @@ test "HeartbeatEngine tick processes bootstrap-provider tasks" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace_dir);
 
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "HEARTBEAT.md",
         .data =
         \\# Periodic Tasks
@@ -410,7 +419,7 @@ test "HeartbeatEngine tick skips missing heartbeat file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace_dir);
 
     const engine = HeartbeatEngine.init(true, 30, workspace_dir, null);
@@ -425,10 +434,10 @@ test "HeartbeatEngine tick skips comment-only heartbeat file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace_dir);
 
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "HEARTBEAT.md",
         .data =
         \\# Periodic Tasks

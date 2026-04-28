@@ -1,4 +1,5 @@
 const std = @import("std");
+const text_helpers = @import("text_helpers.zig");
 
 pub const ApiErrorKind = enum {
     rate_limited,
@@ -16,25 +17,6 @@ pub fn kindToError(kind: ApiErrorKind) anyerror {
     };
 }
 
-fn sliceEqlAsciiFold(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
-    }
-    return true;
-}
-
-fn containsAsciiFold(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (sliceEqlAsciiFold(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
-
 fn lookupMessageField(obj: anytype) ?[]const u8 {
     if (obj.get("message")) |value| {
         if (value == .string) return value.string;
@@ -43,82 +25,6 @@ fn lookupMessageField(obj: anytype) ?[]const u8 {
         if (value == .string) return value.string;
     }
     return null;
-}
-
-pub fn isRateLimitedText(text: []const u8) bool {
-    if (text.len == 0) return false;
-
-    if (containsAsciiFold(text, "ratelimited") or
-        containsAsciiFold(text, "rate limited") or
-        containsAsciiFold(text, "rate_limit") or
-        containsAsciiFold(text, "too many requests") or
-        containsAsciiFold(text, "throttle") or
-        containsAsciiFold(text, "quota exceeded"))
-    {
-        return true;
-    }
-
-    return containsAsciiFold(text, "429") and
-        (containsAsciiFold(text, "rate") or
-            containsAsciiFold(text, "limit") or
-            containsAsciiFold(text, "too many"));
-}
-
-pub fn isContextExhaustedText(text: []const u8) bool {
-    if (text.len == 0) return false;
-
-    if (containsAsciiFold(text, "context length exceeded") or
-        containsAsciiFold(text, "contextlengthexceeded") or
-        containsAsciiFold(text, "maximum context length") or
-        containsAsciiFold(text, "context window") or
-        containsAsciiFold(text, "prompt is too long") or
-        containsAsciiFold(text, "input is too long"))
-    {
-        return true;
-    }
-
-    const has_context = containsAsciiFold(text, "context");
-    const has_token = containsAsciiFold(text, "token");
-
-    if (has_context and (containsAsciiFold(text, "length") or
-        containsAsciiFold(text, "maximum") or
-        containsAsciiFold(text, "window") or
-        containsAsciiFold(text, "exceed")))
-    {
-        return true;
-    }
-    if (has_token and (containsAsciiFold(text, "limit") or
-        containsAsciiFold(text, "maximum") or
-        containsAsciiFold(text, "too many") or
-        containsAsciiFold(text, "exceed")))
-    {
-        return true;
-    }
-
-    return containsAsciiFold(text, "413") and containsAsciiFold(text, "too large");
-}
-
-pub fn isVisionUnsupportedText(text: []const u8) bool {
-    if (text.len == 0) return false;
-
-    if (containsAsciiFold(text, "does not support image") or
-        containsAsciiFold(text, "doesn't support image") or
-        containsAsciiFold(text, "image input not supported") or
-        containsAsciiFold(text, "no endpoints found that support image input") or
-        containsAsciiFold(text, "vision not supported") or
-        containsAsciiFold(text, "multimodal not supported") or
-        containsAsciiFold(text, "not a multimodal model"))
-    {
-        return true;
-    }
-
-    // infini-ai reports unsupported vision inputs as:
-    // "message type 'image_url' is not supported for model 'glm-5'"
-    if (containsAsciiFold(text, "image_url") and containsAsciiFold(text, "not supported")) {
-        return true;
-    }
-
-    return false;
 }
 
 fn parseStatusCode(value: std.json.Value) ?u16 {
@@ -201,7 +107,7 @@ fn extractErrorFields(root_obj: anytype) ?struct {
         if (root_obj.get("type")) |v| {
             if (v == .string) {
                 type_name = v.string;
-                if (containsAsciiFold(v.string, "error")) has_error_signal = true;
+                if (text_helpers.containsAsciiFold(v.string, "error")) has_error_signal = true;
             }
         }
     }
@@ -287,19 +193,19 @@ fn classifyFromFields(
     }
 
     if (message) |msg| {
-        if (isRateLimitedText(msg)) return .rate_limited;
-        if (isContextExhaustedText(msg)) return .context_exhausted;
-        if (isVisionUnsupportedText(msg)) return .vision_unsupported;
+        if (text_helpers.isRateLimitedText(msg)) return .rate_limited;
+        if (text_helpers.isContextExhaustedText(msg)) return .context_exhausted;
+        if (text_helpers.isVisionUnsupportedText(msg)) return .vision_unsupported;
     }
     if (type_name) |typ| {
-        if (isRateLimitedText(typ)) return .rate_limited;
-        if (isContextExhaustedText(typ)) return .context_exhausted;
-        if (isVisionUnsupportedText(typ)) return .vision_unsupported;
+        if (text_helpers.isRateLimitedText(typ)) return .rate_limited;
+        if (text_helpers.isContextExhaustedText(typ)) return .context_exhausted;
+        if (text_helpers.isVisionUnsupportedText(typ)) return .vision_unsupported;
     }
     if (code) |raw_code| {
-        if (isRateLimitedText(raw_code)) return .rate_limited;
-        if (isContextExhaustedText(raw_code)) return .context_exhausted;
-        if (isVisionUnsupportedText(raw_code)) return .vision_unsupported;
+        if (text_helpers.isRateLimitedText(raw_code)) return .rate_limited;
+        if (text_helpers.isContextExhaustedText(raw_code)) return .context_exhausted;
+        if (text_helpers.isVisionUnsupportedText(raw_code)) return .vision_unsupported;
     }
 
     return .other;
@@ -309,6 +215,7 @@ fn classifyFromFields(
 /// Anthropic, and Gemini APIs.
 pub fn classifyErrorObject(root_obj: anytype) ?ApiErrorKind {
     const err_value = root_obj.get("error") orelse return null;
+    if (err_value == .null) return null;
     if (err_value == .string) {
         return classifyFromFields(null, null, null, err_value.string);
     }
@@ -370,7 +277,7 @@ fn classifyTopLevelError(root_obj: anytype) ?ApiErrorKind {
     if (root_obj.get("type")) |v| {
         if (v == .string) {
             type_name = v.string;
-            if (containsAsciiFold(v.string, "error")) has_error_signal = true;
+            if (text_helpers.containsAsciiFold(v.string, "error")) has_error_signal = true;
         }
     }
 
@@ -414,6 +321,14 @@ test "classifyKnownApiError detects vision unsupported payloads" {
 
 test "classifyKnownApiError returns null for non-error payload" {
     const body = "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(classifyKnownApiError(parsed.value.object) == null);
+}
+
+test "classifyKnownApiError returns null for error:null" {
+    const body = "{\"error\":null,\"output\":[{\"role\":\"assistant\",\"content\":[{\"text\":\"ok\"}]}]}";
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
 
@@ -471,13 +386,13 @@ test "classifyKnownApiError detects vision-unsupported via nested error msg fiel
 
 test "isVisionUnsupportedText matches infini-ai phrasing" {
     const text = "Bad Request: [message type 'image_url' is not supported for model 'glm-5']";
-    try std.testing.expect(isVisionUnsupportedText(text));
+    try std.testing.expect(text_helpers.isVisionUnsupportedText(text));
 }
 
 test "isVisionUnsupportedText does not false-positive on unrelated image mention" {
     // "image" alone without "not supported" should not trigger
     const text = "Please provide an image description";
-    try std.testing.expect(!isVisionUnsupportedText(text));
+    try std.testing.expect(!text_helpers.isVisionUnsupportedText(text));
 }
 
 // Regression: generic image validation failures must not disable vision support.

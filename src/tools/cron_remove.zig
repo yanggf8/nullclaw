@@ -96,7 +96,7 @@ test "cron_remove_success" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/remove.db", .{base});
     defer allocator.free(db_path_str);

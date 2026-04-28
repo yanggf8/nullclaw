@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const Tool = root.Tool;
@@ -64,7 +65,7 @@ pub const CronAddTool = struct {
             var backend = be.backend();
 
             const expr_str = expression orelse "@once";
-            const now = std.time.timestamp();
+            const now = std_compat.time.timestamp();
             const next_override: i64 = if (delay) |d|
                 now + (cron.parseDuration(d) catch 60)
             else

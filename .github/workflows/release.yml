@@ -4,12 +4,15 @@ env:
   ANDROID_API_LEVEL: 24
   ANDROID_NDK_VERSION: 29.0.14206865
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  ZIG_VERSION: "0.15.2"
+  ZIG_VERSION: "0.16.0"
 
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -83,9 +86,9 @@ jobs:
             ext: ".exe"
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Install Zig 0.15.2
+      - name: Install Zig 0.16.0
         run: bash .github/scripts/install-zig.sh "${ZIG_VERSION}"
 
       - name: Resolve build version
@@ -99,14 +102,14 @@ jobs:
 
       - name: Set up JDK 17
         if: startsWith(matrix.target, 'android-')
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Set up Android SDK
         if: startsWith(matrix.target, 'android-')
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
         with:
           packages: ''
 
@@ -152,7 +155,7 @@ jobs:
           zig build "${zig_args[@]}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nullclaw-${{ matrix.target }}
           path: zig-out/bin/nullclaw${{ matrix.ext }}
@@ -165,7 +168,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
 
       - name: Rename binaries
         run: |
@@ -182,8 +185,34 @@ jobs:
           mv nullclaw-windows-x86_64/nullclaw.exe nullclaw-windows-x86_64.exe
           mv nullclaw-windows-aarch64/nullclaw.exe nullclaw-windows-aarch64.exe
 
+      - name: Package Windows archives
+        run: |
+          mkdir -p release-zips/windows-x86_64 release-zips/windows-aarch64
+          cp nullclaw-windows-x86_64.exe release-zips/windows-x86_64/nullclaw.exe
+          cp nullclaw-windows-aarch64.exe release-zips/windows-aarch64/nullclaw.exe
+          (
+            cd release-zips/windows-x86_64
+            zip -9 ../../nullclaw-windows-x86_64.zip nullclaw.exe
+          )
+          (
+            cd release-zips/windows-aarch64
+            zip -9 ../../nullclaw-windows-aarch64.zip nullclaw.exe
+          )
+
+      - name: Check whether release already exists
+        id: release_exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        if: steps.release_exists.outputs.value != 'true'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             nullclaw-linux-x86_64.bin
@@ -200,6 +229,26 @@ jobs:
             nullclaw-windows-aarch64.exe
           generate_release_notes: true
 
+      - name: Update existing release assets
+        if: steps.release_exists.outputs.value == 'true'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            nullclaw-linux-x86_64.bin
+            nullclaw-linux-aarch64.bin
+            nullclaw-linux-arm32-gnu.bin
+            nullclaw-linux-arm32-musl.bin
+            nullclaw-linux-riscv64.bin
+            nullclaw-android-aarch64.bin
+            nullclaw-android-armv7.bin
+            nullclaw-android-x86_64.bin
+            nullclaw-macos-aarch64.bin
+            nullclaw-macos-x86_64.bin
+            nullclaw-windows-x86_64.exe
+            nullclaw-windows-aarch64.exe
+            nullclaw-windows-x86_64.zip
+            nullclaw-windows-aarch64.zip
+
   docker:
     needs: release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -209,16 +258,16 @@ jobs:
       packages: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@v4
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -226,7 +275,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
@@ -238,13 +287,14 @@ jobs:
         run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
             VERSION=${{ steps.docker_version.outputs.value }}
+            ZIG_VERSION=${{ env.ZIG_VERSION }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

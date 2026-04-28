@@ -77,11 +77,13 @@ pub const CronUpdateTool = struct {
             }
             var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(allocator);
-            const w = buf.writer(allocator);
+            var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+            const w = &buf_writer.writer;
             try w.print("Updated job {s}", .{job_id});
             if (expression) |expr| try w.print(" | expression={s}", .{expr});
             if (command) |cmd| try w.print(" | command={s}", .{cmd});
             if (enabled) |ena| try w.print(" | enabled={s}", .{if (ena) "true" else "false"});
+            buf = buf_writer.toArrayList();
             return ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
         }
 
@@ -119,7 +121,8 @@ pub const CronUpdateTool = struct {
         // Build summary of what changed
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
-        const w = buf.writer(allocator);
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+        const w = &buf_writer.writer;
         try w.print("Updated job {s}", .{job_id});
         if (expression) |expr| try w.print(" | expression={s}", .{expr});
         if (command) |cmd| try w.print(" | command={s}", .{cmd});
@@ -128,6 +131,7 @@ pub const CronUpdateTool = struct {
         if (session_target) |value| try w.print(" | session_target={s}", .{value.asStr()});
         if (enabled) |ena| try w.print(" | enabled={s}", .{if (ena) "true" else "false"});
 
+        buf = buf_writer.toArrayList();
         return ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
     }
 };
@@ -172,7 +176,7 @@ test "cron_update_expression" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/update_expr.db", .{base});
     defer allocator.free(db_path_str);
@@ -207,7 +211,7 @@ test "cron_update_disable" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const db_path_str = try std.fmt.allocPrint(allocator, "{s}/update_disable.db", .{base});
     defer allocator.free(db_path_str);
