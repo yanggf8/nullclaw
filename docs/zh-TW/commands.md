@@ -56,7 +56,7 @@
 | `nullclaw service restart` | 重新啟動背景服務 |
 | `nullclaw service status` | 查看背景服務狀態 |
 | `nullclaw service uninstall` | 卸載背景服務 |
-| `nullclaw status` | 查看全域狀態總覽 |
+| `nullclaw status [--json]` | 查看全域狀態總覽，或輸出機器可讀的 runtime snapshot |
 | `nullclaw doctor` | 執行系統診斷 |
 | `nullclaw update --check` | 僅檢查是否有更新 |
 | `nullclaw update --yes` | 自動確認並安裝更新 |
@@ -80,6 +80,7 @@
 | `nullclaw channel start` | 啟動預設可用頻道 |
 | `nullclaw channel start telegram` | 啟動指定頻道 |
 | `nullclaw channel status` | 查看頻道健康狀態 |
+| `nullclaw channel info <type> [--json]` | 查看某類頻道的已設定帳號 |
 | `nullclaw channel add <type>` | 提示如何往設定裡新增某類頻道 |
 | `nullclaw channel remove <name>` | 提示如何從設定裡移除頻道 |
 
@@ -131,6 +132,7 @@
 |---|---|
 | `nullclaw skills list` | 列出已安裝 skill |
 | `nullclaw skills install <source>` | 從 GitHub URL 或本地路徑安裝 skill |
+| `nullclaw skills install --name <query>` | 在 skill registry 中搜尋並安裝最相符的 skill |
 | `nullclaw skills remove <name>` | 移除 skill |
 | `nullclaw skills info <name>` | 查看 skill 中繼資訊 |
 
@@ -169,8 +171,11 @@
 | `nullclaw workspace reset-md --include-bootstrap --clear-memory-md` | 重置 bundled markdown，並可附帶清理 bootstrap / memory 檔案 |
 | `nullclaw capabilities` | 輸出執行時能力摘要 |
 | `nullclaw capabilities --json` | 輸出 JSON manifest |
+| `nullclaw config show [--json]` | 輸出磁碟上的完整設定 |
+| `nullclaw config get <path> [--json]` | 讀取單一 dotted config 設定值 |
 | `nullclaw models list` | 列出 provider 與預設模型 |
 | `nullclaw models info <model>` | 查看模型說明 |
+| `nullclaw models summary [--json]` | 輸出供整合端使用的 provider/key-safe 管理摘要 |
 | `nullclaw models benchmark` | 執行模型延遲基準 |
 | `nullclaw models refresh` | 重新整理模型目錄 |
 | `nullclaw migrate openclaw --dry-run` | 預演遷移 OpenClaw |
@@ -180,6 +185,7 @@
 
 - `workspace edit` 只適用於 file-based backend（如 `markdown`、`hybrid`）。
 - 如果目前 memory backend 把 bootstrap 資料放在資料庫裡，CLI 會提示改用 agent 的 `memory_store` 工具，或切回 file-based backend。
+- 這些帶有 `--json` 的 read-side 命令主要用於自動化整合，以及 NullHub 對受管理執行個體的 admin API 邊界。
 
 ## 硬體與自動化整合
 
