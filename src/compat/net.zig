@@ -6,6 +6,67 @@ const IoNet = std.Io.net;
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 
+// Win32 DNS resolution types and externs.
+// These declarations live at file scope so Zig's extern-fn mechanism works
+// correctly.  They are referenced only inside the `if (builtin.os.tag == .windows)`
+// branch of getAddressList; the linker drops them on non-Windows targets.
+const ws2_32 = std.os.windows.ws2_32;
+
+// addrinfoW layout (ws2def.h / ws2tcpip.h).
+const addrinfoW = extern struct {
+    ai_flags: c_int,
+    ai_family: c_int,
+    ai_socktype: c_int,
+    ai_protocol: c_int,
+    ai_addrlen: usize,
+    ai_canonname: ?[*:0]u16,
+    ai_addr: ?*ws2_32.sockaddr,
+    ai_next: ?*addrinfoW,
+};
+
+// Minimal WSADATA output buffer; only needed as a writable scratch area.
+const WSADATA = extern struct {
+    wVersion: u16,
+    wHighVersion: u16,
+    iMaxSockets: u16,
+    iMaxUdpDg: u16,
+    lpVendorInfo: ?[*]u8,
+    szDescription: [257]u8,
+    szSystemStatus: [129]u8,
+};
+
+extern "ws2_32" fn WSAStartup(
+    wVersionRequested: u16,
+    lpWSAData: *WSADATA,
+) callconv(.winapi) c_int;
+
+extern "ws2_32" fn GetAddrInfoW(
+    pNodeName: [*:0]const u16,
+    pServiceName: [*:0]const u16,
+    pHints: *const addrinfoW,
+    ppResult: *?*addrinfoW,
+) callconv(.winapi) c_int;
+
+extern "ws2_32" fn FreeAddrInfoW(pAddrInfo: *addrinfoW) callconv(.winapi) void;
+
+// WSA error codes returned by GetAddrInfoW.
+const WSAHOST_NOT_FOUND: c_int = 11001;
+const WSATRY_AGAIN: c_int = 11002;
+const WSANO_RECOVERY: c_int = 11003;
+const WSANO_DATA: c_int = 11004;
+
+// Idempotent WSAStartup guard.  The first getAddressList call on the Windows
+// path initialises Winsock; subsequent calls skip.  WSACleanup is never called
+// because nullclaw is a long-running daemon process.
+var wsa_done: std.atomic.Value(bool) = .init(false);
+
+fn ensureWsaStartup() void {
+    if (wsa_done.load(.acquire)) return;
+    var data: WSADATA = undefined;
+    _ = WSAStartup(0x0202, &data); // MAKEWORD(2,2)
+    wsa_done.store(true, .release);
+}
+
 pub fn invalidHandle(comptime T: type) T {
     return switch (@typeInfo(T)) {
         .int => std.math.maxInt(T),
@@ -403,17 +464,89 @@ pub fn getAddressList(gpa: Allocator, name: []const u8, port: u16) GetAddressLis
     } else |_| {}
 
     if (builtin.os.tag == .windows) {
-        const fallback_name = if (std.ascii.eqlIgnoreCase(name, "localhost")) "127.0.0.1" else return error.UnknownHostName;
-        const fallback_addr = Address.parseIp(fallback_name, port) catch unreachable;
+        // Localhost fast-path: avoid a syscall for the common loopback case.
+        if (std.ascii.eqlIgnoreCase(name, "localhost")) {
+            const fallback_addr = Address.parseIp("127.0.0.1", port) catch unreachable;
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            errdefer arena.deinit();
+            const list = try arena.allocator().create(AddressList);
+            list.* = .{
+                .arena = arena,
+                .addrs = try arena.allocator().dupe(Address, &.{fallback_addr}),
+                .canon_name = null,
+            };
+            return list;
+        }
+
+        // Win32 DNS resolution via GetAddrInfoW (ws2_32.dll).
+        // Winsock must be initialised once per process before any ws2 call.
+        ensureWsaStartup();
+
+        // Convert hostname to null-terminated UTF-16LE.
+        var name_w_buf: [IoNet.HostName.max_len + 1]u16 = undefined;
+        const name_w_len = std.unicode.utf8ToUtf16Le(name_w_buf[0..IoNet.HostName.max_len], name) catch
+            return error.UnknownHostName; // malformed UTF-8 hostname is unresolvable
+        name_w_buf[name_w_len] = 0;
+        const name_w: [*:0]const u16 = @ptrCast(&name_w_buf);
+
+        // Convert port number to null-terminated UTF-16LE decimal string.
+        var port_u8_buf: [8]u8 = undefined;
+        const port_str = std.fmt.bufPrint(&port_u8_buf, "{d}", .{port}) catch unreachable;
+        var port_w_buf: [8]u16 = undefined;
+        const port_w_len = std.unicode.utf8ToUtf16Le(port_w_buf[0..7], port_str) catch unreachable;
+        port_w_buf[port_w_len] = 0;
+        const port_w: [*:0]const u16 = @ptrCast(&port_w_buf);
+
+        const hints: addrinfoW = .{
+            .ai_flags = 0,
+            .ai_family = ws2_32.AF.UNSPEC,
+            .ai_socktype = ws2_32.SOCK.STREAM,
+            .ai_protocol = ws2_32.IPPROTO.TCP,
+            .ai_addrlen = 0,
+            .ai_canonname = null,
+            .ai_addr = null,
+            .ai_next = null,
+        };
+        var res: ?*addrinfoW = null;
+        const rc = GetAddrInfoW(name_w, port_w, &hints, &res);
+        defer if (res) |some| FreeAddrInfoW(some);
+        switch (rc) {
+            0 => {},
+            WSAHOST_NOT_FOUND, WSANO_DATA => return error.UnknownHostName,
+            WSATRY_AGAIN => return error.TemporaryNameServerFailure,
+            WSANO_RECOVERY => return error.NameServerFailure,
+            else => return error.Unexpected,
+        }
 
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
+        const arena_alloc = arena.allocator();
 
-        const list = try arena.allocator().create(AddressList);
+        const list = try arena_alloc.create(AddressList);
+
+        var addrs: std.ArrayList(Address) = .empty;
+        defer addrs.deinit(arena_alloc);
+
+        var it: ?*addrinfoW = res;
+        while (it) |info| : (it = info.ai_next) {
+            const sa = info.ai_addr orelse continue;
+            switch (sa.family) {
+                ws2_32.AF.INET => try addrs.append(arena_alloc, .{
+                    .in = .{ .sa = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(sa))).* },
+                }),
+                ws2_32.AF.INET6 => try addrs.append(arena_alloc, .{
+                    .in6 = .{ .sa = @as(*const posix.sockaddr.in6, @ptrCast(@alignCast(sa))).* },
+                }),
+                else => {},
+            }
+        }
+
+        if (addrs.items.len == 0) return error.UnknownHostName;
+
         list.* = .{
             .arena = arena,
-            .addrs = try arena.allocator().dupe(Address, &.{fallback_addr}),
-            .canon_name = try arena.allocator().dupe(u8, fallback_name),
+            .addrs = try addrs.toOwnedSlice(arena_alloc),
+            .canon_name = null,
         };
         return list;
     }
@@ -635,4 +768,33 @@ fn socketIsNonblocking(handle: IoNet.Socket.Handle) bool {
     const flags: usize = @intCast(rc);
     const nonblocking_flag = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
     return (flags & nonblocking_flag) != 0;
+}
+
+// Regression: nullclaw/nullclaw#890 -- Windows getAddressList was a localhost-only stub
+// returning error.UnknownHostName for any non-loopback hostname. GetAddrInfoW path
+// must resolve numeric addresses without falling back to the stub.
+test "compat net getAddressList resolves loopback address via GetAddrInfoW on windows" {
+    if (builtin.os.tag != .windows) return;
+    // Use a numeric IP to exercise the GetAddrInfoW code path without live DNS.
+    const list = try getAddressList(std.testing.allocator, "127.0.0.1", 443);
+    defer list.deinit();
+    try std.testing.expect(list.addrs.len > 0);
+}
+
+// Regression: nullclaw/nullclaw#890 -- Windows getAddressList was a localhost-only stub.
+// This test guards the localhost string fast-path (bypasses GetAddrInfoW entirely).
+test "compat net getAddressList localhost fast-path on windows" {
+    if (builtin.os.tag != .windows) return;
+    const list = try getAddressList(std.testing.allocator, "localhost", 80);
+    defer list.deinit();
+    try std.testing.expect(list.addrs.len == 1);
+    try std.testing.expect(list.addrs[0].any.family == posix.AF.INET);
+}
+
+// Regression: nullclaw/nullclaw#890 -- ensure GetAddrInfoW error codes are mapped to
+// error.UnknownHostName and do not surface as Unexpected or silent success.
+test "compat net getAddressList returns UnknownHostName for unresolvable hostname on windows" {
+    if (builtin.os.tag != .windows) return;
+    const result = getAddressList(std.testing.allocator, "this.hostname.does.not.exist.invalid", 80);
+    try std.testing.expectError(error.UnknownHostName, result);
 }
