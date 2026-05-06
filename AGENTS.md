@@ -235,7 +235,9 @@ Manual `cron run` skill jobs also receive `NULLCLAW_SKILL_TIMEOUT=<seconds>` via
 
 #### First-class `skill` job type
 
-Set `job_type: "skill"`, `skill_name: "<name>"`, and optionally `skill_args: "<args>"`. The gateway calls `resolveSkillExec()` (or the testable `resolveSkillExecFrom()`) in `src/cron.zig` to read `## Script` from `~/.claude/skills/<name>/SKILL.md`, expand `~/`, and build `python3 <path> [args]`. The subprocess receives the execution-context env vars described above — scripts can read `NULLCLAW_JOB_ID` to embed the trace ID in their output, and manual `cron run` executions also receive `NULLCLAW_SKILL_TIMEOUT`.
+Set `job_type: "skill"`, `skill_name: "<name>"`, and optionally `skill_args: "<args>"`. The gateway calls `resolveSkillExec()` (or the testable `resolveSkillExecFrom()`) in `src/cron.zig` to read `## Script` from `~/.nullclaw/skills/<name>/SKILL.md`, expand `~/`, and build `python3 <path> [args]`. The subprocess receives the execution-context env vars described above — scripts can read `NULLCLAW_JOB_ID` to embed the trace ID in their output, and manual `cron run` executions also receive `NULLCLAW_SKILL_TIMEOUT`.
+
+Runtime skill resolution uses `~/.nullclaw/skills` as the only source of truth. On the current deployment, most entries under that directory are symlinks into the editable source mirror `~/a/claw-skills/<name>` (for example `~/.nullclaw/skills/news -> ~/a/claw-skills/news`). Edit and commit the mirror repository when changing skill scripts; keep `~/.claude/skills` only as an interactive/legacy copy unless explicitly syncing it.
 
 Both execution paths (DB-direct via `DbCronBackend` and legacy via `CronScheduler`) support skill jobs. The `vtableAdd` in `src/cron/db.zig` heap-dupes all delivery fields (`channel`, `account_id`, `to`, `best_effort`) for ownership consistency.
 
@@ -243,14 +245,14 @@ Both execution paths (DB-direct via `DbCronBackend` and legacy via `CronSchedule
 
 The `skill:` prefix in `command` or `prompt` is resolved at execution time by `resolveSkillCommand()` / `resolveSkillPrompt()` in `src/cron.zig`. It is **not** the same as the CLI `/skill <name>` command (which spawns a background subagent and returns immediately — unusable in cron).
 
-- **Shell job**: set `command = "skill:<name> <extra-args>"`. `resolveSkillCommand` reads `## Script` from `~/.claude/skills/<name>/SKILL.md`, expands `~/`, builds `python3 <path> <extra-args>`.
-- **Agent job**: set `prompt = "skill:<name>"`. `resolveSkillPrompt` reads `## Prompt` from `~/.claude/skills/<name>/SKILL.md` and inlines the full prompt text. The agent runs it directly — no subagent spawn.
+- **Shell job**: set `command = "skill:<name> <extra-args>"`. `resolveSkillCommand` reads `## Script` from `~/.nullclaw/skills/<name>/SKILL.md`, expands `~/`, builds `python3 <path> <extra-args>`.
+- **Agent job**: set `prompt = "skill:<name>"`. `resolveSkillPrompt` reads `## Prompt` from `~/.nullclaw/skills/<name>/SKILL.md` and inlines the full prompt text. The agent runs it directly — no subagent spawn.
 
 Never use `/skill <name>` or `-m /skill <name>` as a cron prompt. It spawns a subagent and the output is lost.
 
 #### Delivery contract
 
-- **Skill jobs** (`job_type: skill`) must accept `--deliver-to CHAT_ID` and call the Python telegram helper directly (`~/.claude/skills/lib/telegram.py`). Scripts can read `NULLCLAW_JOB_ID` from the environment to append the job instance ID.
+- **Skill jobs** (`job_type: skill`) must accept `--deliver-to CHAT_ID` and call the Python telegram helper directly (`~/.nullclaw/skills/lib/telegram.py`). Scripts can read `NULLCLAW_JOB_ID` from the environment to append the job instance ID.
 - **Shell skills** (legacy `skill:` prefix) follow the same contract as skill jobs.
 - **Agent skills** set `delivery_mode: always`. The agent's stdout is captured and sent by the cron runner. No `--deliver-to` needed.
 - The `## Script` section in `SKILL.md` must contain the script path as its first non-empty, non-backtick line, prefixed with `~/`.

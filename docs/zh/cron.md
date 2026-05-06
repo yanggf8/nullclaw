@@ -33,7 +33,7 @@ NullClaw cron 有三種任務類型。請依照「誰負責執行」與「誰負
 | `agent` | 你要讓 NullClaw agent 用指定模型處理 prompt。 | cron 會捕捉 agent 輸出；設定 `delivery_mode=always` 或其他 delivery mode 時，由 cron 傳送結果。 | prompt 會存成任務輸入。使用 `--model` 與 `--session-target isolated|main` 控制執行方式。 |
 | `skill` | 你要直接執行已安裝 skill 的腳本，並讓 skill 自己處理傳送。 | skill 應接受 `--deliver-to <chat_id>`，並透過 channel helper 自行傳送。 | 使用 `--skill-args "..."` 或 `-- <skill-args...>` 把參數轉交給 skill。`--deliver-to` 與 `--account` 也會轉交給腳本。 |
 
-對 skill 任務而言，排程器會讀取該 skill 的 `SKILL.md`，解析 `## Script` 路徑，並以 `python3 <script> <args>` 執行，同時注入執行脈絡環境變數。不要把互動式 `/skill <name>` prompt 當作 cron 任務；cron 需要腳本路徑或一般 agent prompt，而不是背景 subagent 指令。
+對 skill 任務而言，排程器會讀取 `~/.nullclaw/skills/<name>/SKILL.md`，解析 `## Script` 路徑，並以 `python3 <script> <args>` 執行，同時注入執行脈絡環境變數。在正式部署中，`~/.nullclaw/skills/<name>` 通常是指向可編輯 skills mirror `~/a/claw-skills/<name>` 的 symlink；修改腳本時請在該 mirror repository 內提交。不要把互動式 `/skill <name>` prompt 當作 cron 任務；cron 需要腳本路徑或一般 agent prompt，而不是背景 subagent 指令。
 
 常見 skill 任務：
 

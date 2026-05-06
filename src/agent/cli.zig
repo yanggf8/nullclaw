@@ -58,6 +58,7 @@ const CliProviderContext = struct {
 const EXECUTION_SOURCE_ENV = "NULLCLAW_EXECUTION_SOURCE";
 const EXECUTION_TRACE_ENV = "NULLCLAW_EXECUTION_TRACE_ID";
 const SENSORIUM_STATE_ENV = "NULLCLAW_SENSORIUM_STATE";
+const AGENT_TIMING_ENV = "NULLCLAW_AGENT_TIMING_TRACE";
 
 const CliExecutionContext = struct {
     source: ?[]const u8 = null,
@@ -82,6 +83,26 @@ fn readCliExecutionContext(allocator: std.mem.Allocator) CliExecutionContext {
         .trace_id = platform.getEnvOrNull(allocator, EXECUTION_TRACE_ENV),
         .sensorium_state = platform.getEnvOrNull(allocator, SENSORIUM_STATE_ENV),
     };
+}
+
+fn envValueIsTruthy(value: []const u8) bool {
+    return value.len > 0 and
+        !std.mem.eql(u8, value, "0") and
+        !std.ascii.eqlIgnoreCase(value, "false") and
+        !std.ascii.eqlIgnoreCase(value, "off") and
+        !std.ascii.eqlIgnoreCase(value, "no");
+}
+
+fn readAgentTimingEnabled(allocator: std.mem.Allocator) bool {
+    const value = platform.getEnvOrNull(allocator, AGENT_TIMING_ENV) orelse return false;
+    defer allocator.free(value);
+    return envValueIsTruthy(std.mem.trim(u8, value, " \t\r\n"));
+}
+
+fn logCliTiming(enabled: bool, start_ms: i64, stage: []const u8) void {
+    if (!enabled) return;
+    const elapsed_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - start_ms)));
+    log.info("timing cli stage={s} elapsed_ms={d}", .{ stage, elapsed_ms });
 }
 
 fn formatCliExecutionContextMessage(
@@ -331,11 +352,15 @@ fn activeCliProvider(
 /// Run the agent in single-message or interactive REPL mode.
 /// This is the main entry point called by `nullclaw agent`.
 pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+    const cli_start_ms = std_compat.time.milliTimestamp();
     var cfg = Config.load(allocator) catch {
         log.err("No config found. Run `nullclaw onboard` first.", .{});
         return;
     };
     defer cfg.deinit();
+
+    const timing_enabled = readAgentTimingEnabled(allocator);
+    logCliTiming(timing_enabled, cli_start_ms, "config_loaded");
 
     const parsed_args = switch (parseAgentArgs(args)) {
         .ok => |parsed| parsed,
@@ -403,6 +428,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         Config.printValidationError(err);
         return;
     };
+    logCliTiming(timing_enabled, cli_start_ms, "config_validated");
 
     http_util.setProxyOverride(cfg.http_request.proxy) catch |err| {
         log.err("Invalid http_request.proxy override: {s}", .{@errorName(err)});
@@ -433,6 +459,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     );
     defer runtime_observer.destroy();
     const obs = runtime_observer.observer();
+    logCliTiming(timing_enabled, cli_start_ms, "observer_ready");
 
     // Record agent start
     const start_event = ObserverEvent{ .agent_start = .{
@@ -468,6 +495,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     } else {
         runtime_provider = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &cfg);
     }
+    logCliTiming(timing_enabled, cli_start_ms, "provider_ready");
 
     const resolved_api_key = if (provider_ctx) |ctx|
         (ctx.owned_api_key orelse selected_profile_storage.?.api_key)
@@ -483,6 +511,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var mem_rt = memory_mod.initRuntime(allocator, &cfg.memory, cfg.workspace_dir);
     defer if (mem_rt) |*rt| rt.deinit();
     const mem_opt: ?Memory = if (mem_rt) |rt| rt.memory else null;
+    logCliTiming(timing_enabled, cli_start_ms, "memory_ready");
 
     const bootstrap_provider: ?bootstrap_mod.BootstrapProvider = bootstrap_mod.createProvider(
         allocator,
@@ -500,6 +529,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         &onboard.ProjectContext{},
         bootstrap_provider,
     );
+    logCliTiming(timing_enabled, cli_start_ms, "workspace_scaffolded");
 
     // Create tools (with agents config for delegate depth enforcement)
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
@@ -526,6 +556,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .sandbox_enabled = cfg.sandboxEnabled(),
     });
     defer tools_mod.deinitTools(allocator, tools);
+    logCliTiming(timing_enabled, cli_start_ms, "tools_ready");
 
     // Bind memory backend once for this tool set before creating agents.
     tools_mod.bindMemoryTools(tools, mem_opt);
@@ -556,8 +587,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         defer exec_ctx.deinit(allocator);
         const effective_message = try formatCliExecutionContextMessage(allocator, message, exec_ctx);
         defer allocator.free(effective_message);
+        logCliTiming(timing_enabled, cli_start_ms, "message_ready");
 
         var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_i, tools, mem_opt, obs, selected_profile_storage);
+        agent.timing_trace = timing_enabled;
+        agent.timing_trace_start_ms = cli_start_ms;
         agent.policy = &policy;
         agent.session_store = if (mem_rt) |rt| rt.session_store else null;
         agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
@@ -587,6 +621,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
 
         stream_ctx.emitted_text = false;
+        logCliTiming(timing_enabled, cli_start_ms, "turn_start");
         const response = agent.turn(effective_message) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
@@ -608,8 +643,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             return err;
         };
         defer allocator.free(response);
+        logCliTiming(timing_enabled, cli_start_ms, "turn_done");
 
         persistCliTurn(&agent, message, response);
+        logCliTiming(timing_enabled, cli_start_ms, "turn_persisted");
 
         if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
             try w.print("{s}\n", .{response});
@@ -1158,4 +1195,14 @@ test "formatCliExecutionContextMessage returns original message when no context 
     const rendered = try formatCliExecutionContextMessage(std.testing.allocator, "hello", .{});
     defer std.testing.allocator.free(rendered);
     try std.testing.expectEqualStrings("hello", rendered);
+}
+
+test "envValueIsTruthy parses disabled values" {
+    try std.testing.expect(envValueIsTruthy("1"));
+    try std.testing.expect(envValueIsTruthy("true"));
+    try std.testing.expect(!envValueIsTruthy(""));
+    try std.testing.expect(!envValueIsTruthy("0"));
+    try std.testing.expect(!envValueIsTruthy("false"));
+    try std.testing.expect(!envValueIsTruthy("off"));
+    try std.testing.expect(!envValueIsTruthy("no"));
 }

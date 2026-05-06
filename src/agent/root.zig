@@ -318,6 +318,8 @@ pub const Agent = struct {
     message_timeout_secs: u64 = 0,
     log_tool_calls: bool = false,
     log_llm_io: bool = false,
+    timing_trace: bool = false,
+    timing_trace_start_ms: i64 = 0,
     compaction_keep_recent: u32 = compaction.DEFAULT_COMPACTION_KEEP_RECENT,
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     compaction_max_source_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
@@ -1627,9 +1629,17 @@ pub const Agent = struct {
         return result.toOwnedSlice(arena);
     }
 
+    fn traceTiming(self: *const Agent, stage: []const u8) void {
+        if (!self.timing_trace) return;
+        const start_ms = if (self.timing_trace_start_ms != 0) self.timing_trace_start_ms else std_compat.time.milliTimestamp();
+        const elapsed_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - start_ms)));
+        log.info("timing turn stage={s} elapsed_ms={d}", .{ stage, elapsed_ms });
+    }
+
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
+        self.traceTiming("entered");
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
 
@@ -1646,6 +1656,7 @@ pub const Agent = struct {
             }
             break :blk turn_input.llm_user_message orelse user_message;
         };
+        self.traceTiming("input_planned");
 
         const turn_route_selection = self.routeSelectionForTurn(effective_user_message);
         if (turn_route_selection) |selection| {
@@ -1661,6 +1672,7 @@ pub const Agent = struct {
         var cfg_for_prompt_opt: ?Config = Config.load(self.allocator) catch null;
         defer if (cfg_for_prompt_opt) |*cfg_loaded| cfg_loaded.deinit();
         const cfg_for_prompt_ptr: ?*const Config = if (cfg_for_prompt_opt) |*cfg_loaded| cfg_loaded else null;
+        self.traceTiming("prompt_config_loaded");
 
         // Inject system prompt on first turn (or when tracked workspace files changed).
         const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(
@@ -1772,6 +1784,9 @@ pub const Agent = struct {
             self.workspace_prompt_fingerprint = workspace_fp;
             if (self.system_prompt_model_name) |cached_model| self.allocator.free(cached_model);
             self.system_prompt_model_name = try self.allocator.dupe(u8, turn_model_name);
+            self.traceTiming("system_prompt_ready");
+        } else {
+            self.traceTiming("system_prompt_cached");
         }
 
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
@@ -1790,6 +1805,7 @@ pub const Agent = struct {
                 }
             }
         }
+        self.traceTiming("user_autosave_done");
 
         // Prepend sensorium self-state prefix when enabled (per-turn, must not go in cached system prompt)
         const sensorium_message = if (self.sensorium_enabled) blk: {
@@ -1819,6 +1835,7 @@ pub const Agent = struct {
             try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, pre_enrich_message, self.memory_session_id)
         else
             try self.allocator.dupe(u8, pre_enrich_message);
+        self.traceTiming("memory_enrich_done");
 
         // Stash top recalled key for success attribution after a successful turn.
         if (self.last_recalled_top_key) |old_key| self.allocator.free(old_key);
@@ -1829,6 +1846,7 @@ pub const Agent = struct {
 
         // Keep the user message retained even if provider/tool steps fail.
         try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
+        self.traceTiming("history_user_appended");
 
         // ── Response cache check ──
         if (self.response_cache) |rc| {
@@ -1875,6 +1893,7 @@ pub const Agent = struct {
 
             // Build messages slice for provider (arena-owned; freed at end of iteration)
             const messages = try self.buildProviderMessages(arena, turn_model_name);
+            self.traceTiming("provider_messages_ready");
 
             const timer_start = std_compat.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
@@ -1889,6 +1908,7 @@ pub const Agent = struct {
                 turn_token_limit,
                 turn_max_tokens,
             );
+            self.traceTiming("provider_request_ready");
 
             // Call provider: streaming (no retries, no native tools) or blocking with retry
             var response: ChatResponse = undefined;
@@ -1897,6 +1917,7 @@ pub const Agent = struct {
             if (is_streaming) {
                 self.recordLlmRequestEvent(turn_model_name, messages);
                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
+                self.traceTiming("provider_stream_start");
                 const stream_result = self.provider.streamChat(
                     self.allocator,
                     .{
@@ -1962,6 +1983,7 @@ pub const Agent = struct {
                     self.emitUsageFailure(turn_model_name);
                     return err;
                 };
+                self.traceTiming("provider_stream_done");
                 response = ChatResponse{
                     .content = stream_result.content,
                     .reasoning_content = stream_result.reasoning_content,
@@ -1972,6 +1994,7 @@ pub const Agent = struct {
             } else {
                 self.recordLlmRequestEvent(turn_model_name, messages);
                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, false);
+                self.traceTiming("provider_chat_start");
                 response = self.provider.chat(
                     self.allocator,
                     .{
@@ -2136,6 +2159,7 @@ pub const Agent = struct {
                         return retry_err;
                     };
                 };
+                self.traceTiming("provider_chat_done");
             }
             self.logLlmResponse(iteration + 1, response_attempt, &response);
 
@@ -2166,6 +2190,7 @@ pub const Agent = struct {
             self.recordLlmResponseEvent(turn_model_name, duration_ms, &response);
             self.emitUsageRecord(&response, true);
             const use_native = response.hasToolCalls();
+            self.traceTiming("provider_response_recorded");
 
             // Determine tool calls: structured (native) first, then XML fallback.
             // Keep the same loop semantics used by the reference runtime.
@@ -2226,6 +2251,7 @@ pub const Agent = struct {
                 assistant_history_content = try dispatcher.stripToolResultMarkup(self.allocator, response_text);
                 free_assistant_history = true;
             }
+            self.traceTiming("tool_parse_done");
 
             // Determine display text.
             // When tool calls are present, only show parsed plain text (if any).
@@ -2287,6 +2313,7 @@ pub const Agent = struct {
                 // Auto-compaction before hard trimming to preserve context
                 self.last_turn_compacted = self.autoCompactHistory() catch false;
                 self.trimHistory();
+                self.traceTiming("history_trimmed");
 
                 // Auto-save assistant response
                 if (self.auto_save) {
@@ -2310,11 +2337,13 @@ pub const Agent = struct {
                         }
                     }
                 }
+                self.traceTiming("assistant_autosave_done");
 
                 // Drain durable outbox after turn completion (best-effort)
                 if (self.mem_rt) |rt| {
                     _ = rt.drainOutbox(self.allocator);
                 }
+                self.traceTiming("outbox_drained");
 
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
@@ -2335,6 +2364,7 @@ pub const Agent = struct {
                     const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
                     rc.put(self.allocator, store_key_hex, turn_model_name, final_text, token_count) catch {};
                 }
+                self.traceTiming("final_response_ready");
 
                 // Record memory success attribution when at least one tool iteration ran
                 if (iteration > 0) {

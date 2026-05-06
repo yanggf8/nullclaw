@@ -33,7 +33,7 @@ NullClaw cron has three job types. Pick the type based on who should do the work
 | `agent` | You want the NullClaw agent to reason over a prompt with a selected model. | Cron captures the agent output and delivers it when `delivery_mode=always` or another delivery mode is configured. | The prompt is stored as the job input. Use `--model` and `--session-target isolated|main` to control execution. |
 | `skill` | You want to run an installed skill script directly and keep delivery inside the skill. | The skill should accept `--deliver-to <chat_id>` and deliver through the channel helper itself. | Use `--skill-args "..."` or `-- <skill-args...>` to forward arguments to the skill. `--deliver-to` and `--account` are also forwarded so the script can use them. |
 
-For skill jobs, the scheduler reads the skill's `SKILL.md`, resolves the `## Script` path, runs it as `python3 <script> <args>`, and injects execution context environment variables. Do not use an interactive `/skill <name>` prompt as a cron job; cron needs the script path or a normal agent prompt, not a background subagent command.
+For skill jobs, the scheduler reads `~/.nullclaw/skills/<name>/SKILL.md`, resolves the `## Script` path, runs it as `python3 <script> <args>`, and injects execution context environment variables. In the production layout, `~/.nullclaw/skills/<name>` is usually a symlink into the editable skills mirror under `~/a/claw-skills/<name>`, so commit script changes in that mirror repository. Do not use an interactive `/skill <name>` prompt as a cron job; cron needs the script path or a normal agent prompt, not a background subagent command.
 
 Typical skill job:
 
