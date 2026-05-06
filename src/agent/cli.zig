@@ -242,6 +242,7 @@ const ParsedAgentArgs = struct {
     temperature_override: ?f64 = null,
     agent_name: ?[]const u8 = null,
     verbose: bool = false,
+    isolated: bool = false,
 };
 
 const AgentArgParseResult = union(enum) {
@@ -282,9 +283,27 @@ fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
             parsed.agent_name = args[i];
         } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             parsed.verbose = true;
+        } else if (std.mem.eql(u8, arg, "--isolated") or std.mem.eql(u8, arg, "--no-history")) {
+            parsed.isolated = true;
         }
     }
     return .{ .ok = parsed };
+}
+
+fn agentArgConflict(parsed: ParsedAgentArgs) ?[]const u8 {
+    if (parsed.isolated and parsed.session_id != null) {
+        return "--isolated cannot be combined with --session";
+    }
+    return null;
+}
+
+fn applyCliIsolation(agent: *Agent) void {
+    agent.mem = null;
+    agent.mem_rt = null;
+    agent.session_store = null;
+    agent.response_cache = null;
+    agent.memory_session_id = null;
+    agent.auto_save = false;
 }
 
 fn findNamedAgentProfile(agents: []const config_types.NamedAgentConfig, requested_name: []const u8) ?config_types.NamedAgentConfig {
@@ -373,6 +392,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             return;
         },
     };
+    if (agentArgConflict(parsed_args)) |message| {
+        log.err("{s}", .{message});
+        return;
+    }
     if (parsed_args.provider_override) |provider| {
         if (parsed_args.agent_name == null) {
             cfg.default_provider = provider;
@@ -511,12 +534,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var mem_rt = memory_mod.initRuntime(allocator, &cfg.memory, cfg.workspace_dir);
     defer if (mem_rt) |*rt| rt.deinit();
     const mem_opt: ?Memory = if (mem_rt) |rt| rt.memory else null;
+    const cli_mem_opt: ?Memory = if (parsed_args.isolated) null else mem_opt;
     logCliTiming(timing_enabled, cli_start_ms, "memory_ready");
 
     const bootstrap_provider: ?bootstrap_mod.BootstrapProvider = bootstrap_mod.createProvider(
         allocator,
         cfg.memory.backend,
-        mem_opt,
+        cli_mem_opt,
         cfg.workspace_dir,
     ) catch null;
     defer if (bootstrap_provider) |bp| bp.deinit();
@@ -559,11 +583,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     logCliTiming(timing_enabled, cli_start_ms, "tools_ready");
 
     // Bind memory backend once for this tool set before creating agents.
-    tools_mod.bindMemoryTools(tools, mem_opt);
+    tools_mod.bindMemoryTools(tools, cli_mem_opt);
 
     // Bind MemoryRuntime to memory tools for hybrid search and vector sync.
-    if (mem_rt) |*rt| {
-        tools_mod.bindMemoryRuntime(tools, rt);
+    if (!parsed_args.isolated) {
+        if (mem_rt) |*rt| {
+            tools_mod.bindMemoryRuntime(tools, rt);
+        }
     }
 
     const provider_i = activeCliProvider(
@@ -589,20 +615,26 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         defer allocator.free(effective_message);
         logCliTiming(timing_enabled, cli_start_ms, "message_ready");
 
-        var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_i, tools, mem_opt, obs, selected_profile_storage);
+        var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_i, tools, cli_mem_opt, obs, selected_profile_storage);
         agent.timing_trace = timing_enabled;
         agent.timing_trace_start_ms = cli_start_ms;
         agent.policy = &policy;
-        agent.session_store = if (mem_rt) |rt| rt.session_store else null;
-        agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
-        agent.mem_rt = if (mem_rt) |*rt| rt else null;
+        if (parsed_args.isolated) {
+            applyCliIsolation(&agent);
+        } else {
+            agent.session_store = if (mem_rt) |rt| rt.session_store else null;
+            agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
+            agent.mem_rt = if (mem_rt) |*rt| rt else null;
+        }
         if (parsed_args.provider_override != null or parsed_args.model_override != null) {
             agent.model_pinned_by_user = true;
         }
-        if (session_id) |sid| {
-            agent.memory_session_id = sid;
-        } else if (agent_memory_session_id) |memory_session_id| {
-            agent.memory_session_id = memory_session_id;
+        if (!parsed_args.isolated) {
+            if (session_id) |sid| {
+                agent.memory_session_id = sid;
+            } else if (agent_memory_session_id) |memory_session_id| {
+                agent.memory_session_id = memory_session_id;
+            }
         }
         defer agent.deinit();
 
@@ -705,18 +737,24 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         try w.flush();
     }
 
-    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_i, tools, mem_opt, obs, selected_profile_storage);
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_i, tools, cli_mem_opt, obs, selected_profile_storage);
     agent.policy = &policy;
-    agent.session_store = if (mem_rt) |rt| rt.session_store else null;
-    agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
-    agent.mem_rt = if (mem_rt) |*rt| rt else null;
+    if (parsed_args.isolated) {
+        applyCliIsolation(&agent);
+    } else {
+        agent.session_store = if (mem_rt) |rt| rt.session_store else null;
+        agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
+        agent.mem_rt = if (mem_rt) |*rt| rt else null;
+    }
     if (parsed_args.provider_override != null or parsed_args.model_override != null) {
         agent.model_pinned_by_user = true;
     }
-    if (session_id) |sid| {
-        agent.memory_session_id = sid;
-    } else if (agent_memory_session_id) |memory_session_id| {
-        agent.memory_session_id = memory_session_id;
+    if (!parsed_args.isolated) {
+        if (session_id) |sid| {
+            agent.memory_session_id = sid;
+        } else if (agent_memory_session_id) |memory_session_id| {
+            agent.memory_session_id = memory_session_id;
+        }
     }
     defer agent.deinit();
 
@@ -1037,6 +1075,46 @@ test "parseAgentArgs parses provider and model overrides" {
     try std.testing.expectEqualStrings("ollama", parsed.provider_override.?);
     try std.testing.expectEqualStrings("llama3.2:latest", parsed.model_override.?);
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), parsed.temperature_override.?, 0.000001);
+}
+
+test "parseAgentArgs parses isolated aliases" {
+    const isolated_args = [_][]const u8{ "--isolated", "-m", "hi" };
+    const isolated = switch (parseAgentArgs(&isolated_args)) {
+        .ok => |value| value,
+        else => unreachable,
+    };
+    try std.testing.expect(isolated.isolated);
+    try std.testing.expectEqualStrings("hi", isolated.message_arg.?);
+
+    const no_history_args = [_][]const u8{"--no-history"};
+    const no_history = switch (parseAgentArgs(&no_history_args)) {
+        .ok => |value| value,
+        else => unreachable,
+    };
+    try std.testing.expect(no_history.isolated);
+}
+
+test "agentArgConflict rejects isolated session" {
+    const args = [_][]const u8{ "--isolated", "--session", "daily-news" };
+    const parsed = switch (parseAgentArgs(&args)) {
+        .ok => |value| value,
+        else => unreachable,
+    };
+    try std.testing.expectEqualStrings("--isolated cannot be combined with --session", agentArgConflict(parsed).?);
+}
+
+test "applyCliIsolation disables CLI memory surfaces" {
+    var agent: Agent = undefined;
+
+    // Regression: batch subprocess turns must not read or write shared memory/history.
+    applyCliIsolation(&agent);
+
+    try std.testing.expect(!agent.auto_save);
+    try std.testing.expect(agent.mem == null);
+    try std.testing.expect(agent.mem_rt == null);
+    try std.testing.expect(agent.session_store == null);
+    try std.testing.expect(agent.response_cache == null);
+    try std.testing.expect(agent.memory_session_id == null);
 }
 
 test "activeCliProvider uses returned holder storage for named agents" {
