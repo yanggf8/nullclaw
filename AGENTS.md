@@ -293,6 +293,23 @@ Never call `dbEnqueueJob` for manual triggers — it is a raw queue insert that 
 
 If any of these are omitted, a concurrent on-disk write (e.g. `load-from-seed` or a gateway API call) can silently strip the routing config from the persisted job. The regression test `mergeSchedulerTickChangesAndSave preserves routing fields on existing job update` in `src/daemon.zig` covers this path.
 
+#### Gateway diagnose
+
+`nullclaw gateway diagnose` is a deep, read-only liveness probe written for the wedge class: process active, port bound, but HTTP unresponsive. `gateway status` cannot detect that state because it only reads the daemon state file, which the wedged process keeps stamping. `diagnose` makes the inconsistency loud.
+
+Checks performed (in order):
+
+1. Gateway PID present (`findGatewayPid`).
+2. `/proc/<pid>/exe` does not have the ` (deleted)` suffix — catches running-against-stale-binary, the symptom that triggered the 2026-05-06 investigation.
+3. Port consistency: the configured port is bound, and bound by the gateway PID (not a stranger).
+4. HTTP `GET /health` with a 5s curl timeout — the canonical "is the HTTP loop wedged" check. A wedged gateway will accept the connection but never reply; curl returns exit 28.
+5. HTTP `GET /ready` and a substring scan for `"healthy":false` — surfaces per-component breakage (scheduler, channels, dispatchers, telegram, etc.). JSON parsing is intentionally avoided to keep this path tiny.
+6. `~/.nullclaw/cron.db` mtime — a stalled scheduler stops writing, so a multi-hour age is a tell.
+
+Exit codes: `0` if all checks pass, `2` on any problem. Use `gateway diagnose` from monitoring scripts; the human-readable output also includes a `Hint:` line per problem.
+
+Implementation: `gatewayDiagnose()` in `src/main.zig`. It uses `yc.http_util.curlGet` (subprocess curl, not `std.http.Client`) so the probe is independent of any compat-layer reader bug — the very class of bug it was written to catch. Adding `std.http.Client` here would re-couple the diagnostic to the failure mode it must observe from the outside.
+
 #### Scheduler watchdog
 
 `src/cron/ticker.zig` includes a self-watchdog that guards against the failure mode observed on 2026-05-06: the gateway HTTP path wedged on a short-read bug in `std.Io.net.Stream.Reader`, which also stalled the inline scheduler ticker for ~21 hours with no log output and no crash.

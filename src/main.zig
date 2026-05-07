@@ -353,6 +353,7 @@ fn printGatewayUsage() void {
         \\  stop                   Stop a running gateway
         \\  restart                Restart a running gateway
         \\  status                 Show gateway status (PID, port, uptime)
+        \\  diagnose               Deep liveness probe (HTTP /health, deleted exe, scheduler)
         \\
         \\OPTIONS:
         \\  --port PORT, -p PORT   Override gateway listen port
@@ -785,6 +786,9 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         if (std.mem.eql(u8, sub_args[0], "status")) {
             return gatewayStatus(allocator);
         }
+        if (std.mem.eql(u8, sub_args[0], "diagnose")) {
+            return gatewayDiagnose(allocator);
+        }
     }
 
     var cfg = yc.config.Config.load(allocator) catch {
@@ -1189,6 +1193,141 @@ fn gatewayStatus(allocator: std.mem.Allocator) void {
         std.debug.print("  Agent TZ:    UTC (default -- consider setting agents.defaults.timezone)\n", .{});
     } else {
         std.debug.print("  Agent TZ:    {s}\n", .{tz});
+    }
+}
+
+/// Deep liveness probe for the gateway. Built to detect the wedge class
+/// observed on 2026-05-06: process active, port bound, but HTTP unresponsive
+/// for ~21 hours with no crash. `gateway status` could not distinguish that
+/// state from healthy. This probe makes the inconsistency loud.
+fn gatewayDiagnose(allocator: std.mem.Allocator) void {
+    var cfg = yc.config.Config.load(allocator) catch {
+        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+        std.process.exit(1);
+    };
+    defer cfg.deinit();
+
+    const pid = findGatewayPid(allocator, &cfg);
+    const port_holder = findPidOnPort(allocator, cfg.gateway.port);
+
+    std.debug.print("Gateway Diagnose\n", .{});
+    std.debug.print("  Endpoint:    http://{s}:{d}\n", .{ cfg.gateway.host, cfg.gateway.port });
+
+    var problems: u32 = 0;
+
+    // 1. Process state.
+    if (pid == 0) {
+        std.debug.print("  [error] no gateway process detected\n", .{});
+        std.debug.print("  Hint: nullclaw service start (or `nullclaw gateway`)\n", .{});
+        std.process.exit(2);
+    }
+    std.debug.print("  [ok] process running (PID {d})\n", .{pid});
+
+    // 2. Deleted-exe check (Linux). The 2026-05-06 wedge ran a binary that
+    // had been replaced on disk; readlink shows " (deleted)" in that case.
+    if (builtin.os.tag == .linux) {
+        var path_buf: [64]u8 = undefined;
+        const exe_path_z = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/exe", .{pid}) catch null;
+        if (exe_path_z) |p| {
+            var target_buf: [4096]u8 = undefined;
+            const rc = std.posix.system.readlink(p.ptr, &target_buf, target_buf.len);
+            if (rc > 0) {
+                const target = target_buf[0..@intCast(rc)];
+                if (std.mem.endsWith(u8, target, " (deleted)")) {
+                    std.debug.print("  [warn] running binary has been deleted/replaced\n", .{});
+                    std.debug.print("         exe -> {s}\n", .{target});
+                    std.debug.print("         Hint: restart to load the rebuilt binary\n", .{});
+                    problems += 1;
+                } else {
+                    std.debug.print("  [ok] binary on disk: {s}\n", .{target});
+                }
+            } else {
+                std.debug.print("  [info] could not read /proc/{d}/exe (permission)\n", .{pid});
+            }
+        }
+    }
+
+    // 3. Port consistency.
+    if (port_holder == 0) {
+        std.debug.print("  [error] port {d} not bound by anyone\n", .{cfg.gateway.port});
+        problems += 1;
+    } else if (port_holder != pid) {
+        std.debug.print("  [error] port {d} held by PID {d}, not gateway PID {d}\n", .{ cfg.gateway.port, port_holder, pid });
+        problems += 1;
+    } else {
+        std.debug.print("  [ok] port {d} bound by gateway\n", .{cfg.gateway.port});
+    }
+
+    // 4. The killer feature: HTTP /health with a real timeout. A wedged
+    // gateway accepts the connection but never replies; curl returns
+    // exit 28 (timeout) after the deadline.
+    var url_buf: [256]u8 = undefined;
+    const health_url = std.fmt.bufPrint(&url_buf, "http://{s}:{d}/health", .{ cfg.gateway.host, cfg.gateway.port }) catch {
+        std.debug.print("  [error] could not format health URL\n", .{});
+        std.process.exit(2);
+    };
+
+    const headers: []const []const u8 = &.{};
+    const health_body = yc.http_util.curlGet(allocator, health_url, headers, "5") catch |err| {
+        std.debug.print("  [error] /health did not respond within 5s: {s}\n", .{@errorName(err)});
+        std.debug.print("         The process is alive but the HTTP loop is wedged.\n", .{});
+        std.debug.print("         Hint: capture forensics if needed, then restart the service.\n", .{});
+        problems += 1;
+        printDiagnoseSummary(problems);
+        std.process.exit(if (problems > 0) 2 else 0);
+    };
+    defer allocator.free(health_body);
+    std.debug.print("  [ok] /health responded ({d} bytes)\n", .{health_body.len});
+
+    // 5. /ready surfaces per-component health (gateway, scheduler, channels,
+    // dispatchers, telegram, etc.). If any component is unhealthy we say so.
+    const ready_url = std.fmt.bufPrint(&url_buf, "http://{s}:{d}/ready", .{ cfg.gateway.host, cfg.gateway.port }) catch null;
+    if (ready_url) |url| {
+        if (yc.http_util.curlGet(allocator, url, headers, "5")) |ready_body| {
+            defer allocator.free(ready_body);
+            // Cheap substring scan — JSON-parsing here is overkill and would
+            // pull more code into a path that runs constantly during ops work.
+            if (std.mem.indexOf(u8, ready_body, "\"healthy\":false") != null) {
+                std.debug.print("  [warn] /ready reports at least one unhealthy component\n", .{});
+                std.debug.print("         {s}\n", .{ready_body});
+                problems += 1;
+            } else {
+                std.debug.print("  [ok] /ready: all components healthy\n", .{});
+            }
+        } else |err| {
+            std.debug.print("  [warn] /ready probe failed: {s}\n", .{@errorName(err)});
+        }
+    }
+
+    // 6. Cron DB freshness — a stalled scheduler stops writing to cron.db.
+    const home = getEnvVarOwnedOrNull(allocator, "HOME");
+    defer if (home) |h| allocator.free(h);
+    const home_str = home orelse "/root";
+    if (std.fmt.allocPrint(allocator, "{s}/.nullclaw/cron.db", .{home_str})) |path| {
+        defer allocator.free(path);
+        if (std_compat.fs.openFileAbsolute(path, .{})) |f| {
+            defer f.close();
+            if (f.stat()) |s| {
+                const now_ns = std_compat.time.nanoTimestamp();
+                const age_secs = @divTrunc(now_ns - s.mtime, std.time.ns_per_s);
+                std.debug.print("  [info] cron.db last write: {d}s ago\n", .{age_secs});
+                if (age_secs > 3600) {
+                    std.debug.print("         (over 1 hour — verify scheduler is enqueuing)\n", .{});
+                }
+            } else |_| {}
+        } else |_| {}
+    } else |_| {}
+
+    printDiagnoseSummary(problems);
+    std.process.exit(if (problems > 0) 2 else 0);
+}
+
+fn printDiagnoseSummary(problems: u32) void {
+    std.debug.print("\n", .{});
+    if (problems == 0) {
+        std.debug.print("Summary: gateway healthy\n", .{});
+    } else {
+        std.debug.print("Summary: {d} problem(s) detected — see hints above\n", .{problems});
     }
 }
 
