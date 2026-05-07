@@ -39,6 +39,23 @@ fn setSocketNonblocking(handle: IoNet.Socket.Handle, nonblocking: bool) !void {
     }
 }
 
+fn setCloseOnExec(handle: IoNet.Socket.Handle) !void {
+    switch (builtin.os.tag) {
+        .windows, .wasi => return,
+        else => {},
+    }
+
+    while (true) {
+        switch (posix.errno(posix.system.fcntl(handle, posix.F.SETFD, posix.FD_CLOEXEC))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+const has_accept4 = @hasDecl(posix.system, "accept4");
+
 pub const has_unix_sockets = false;
 
 pub const Stream = struct {
@@ -47,7 +64,7 @@ pub const Stream = struct {
     pub const Handle = IoNet.Socket.Handle;
     pub const Reader = IoNet.Stream.Reader;
     pub const Writer = IoNet.Stream.Writer;
-    pub const ReadError = IoNet.Stream.Reader.Error || error{WouldBlock};
+    pub const ReadError = IoNet.Stream.Reader.Error || posix.ReadError || error{WouldBlock};
     pub const WriteError = IoNet.Stream.Writer.Error;
 
     fn toInner(self: Stream) IoNet.Stream {
@@ -72,6 +89,11 @@ pub const Stream = struct {
     }
 
     pub fn read(self: Stream, buffer: []u8) ReadError!usize {
+        switch (builtin.os.tag) {
+            .windows, .wasi => {},
+            else => return posix.read(self.handle, buffer),
+        }
+
         var stream_reader = self.toInner().reader(shared.io(), &[_]u8{});
         return stream_reader.interface.readSliceShort(buffer) catch |err| switch (err) {
             error.ReadFailed => return stream_reader.err orelse error.Unexpected,
@@ -259,6 +281,11 @@ pub const Server = struct {
     pub const AcceptError = IoNet.Server.AcceptError;
 
     pub fn accept(self: *Server) AcceptError!Connection {
+        switch (builtin.os.tag) {
+            .windows, .wasi => {},
+            else => return self.acceptPosix(),
+        }
+
         const accept_options: IoNet.Server.AcceptOptions = if (comptime IoNet.Server.AcceptOptions == void) {} else .{ .mode = .stream, .protocol = .tcp };
         var server: IoNet.Server = .{
             .socket = .{
@@ -273,6 +300,39 @@ pub const Server = struct {
         return .{
             .stream = .{ .handle = stream.socket.handle },
             .address = Address.fromCurrent(stream.socket.address),
+        };
+    }
+
+    fn acceptPosix(self: *Server) AcceptError!Connection {
+        var storage: Address = undefined;
+        var addr_len: posix.socklen_t = @sizeOf(Address);
+        const fd = while (true) {
+            const rc = if (has_accept4)
+                posix.system.accept4(self.stream.handle, &storage.any, &addr_len, posix.SOCK.CLOEXEC)
+            else
+                posix.system.accept(self.stream.handle, &storage.any, &addr_len);
+
+            switch (posix.errno(rc)) {
+                .SUCCESS => break @as(IoNet.Socket.Handle, @intCast(rc)),
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .BADF => return error.SocketNotListening,
+                .CONNABORTED => return error.ConnectionAborted,
+                .INVAL => return error.SocketNotListening,
+                .MFILE => return error.ProcessFdQuotaExceeded,
+                .NFILE => return error.SystemFdQuotaExceeded,
+                .NOBUFS, .NOMEM => return error.SystemResources,
+                .PERM => return error.BlockedByFirewall,
+                .PROTO => return error.ProtocolFailure,
+                else => |err| return posix.unexpectedErrno(err),
+            }
+        };
+        errdefer std.Io.Threaded.closeFd(fd);
+        if (!has_accept4) try setCloseOnExec(fd);
+        try setSocketNonblocking(fd, false);
+        return .{
+            .stream = .{ .handle = fd },
+            .address = storage,
         };
     }
 };
@@ -442,6 +502,58 @@ test "compat net normalizes listener and stream blocking mode" {
     defer conn.stream.close();
 
     try std.testing.expect(!socketIsNonblocking(conn.stream.handle));
+}
+
+test "compat net stream read returns before peer closes" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const addr = try Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .force_nonblocking = true });
+    defer server.deinit();
+
+    const client = try tcpConnectToAddress(server.listen_address);
+    defer client.close();
+
+    var conn = server.accept() catch |err| switch (err) {
+        error.WouldBlock => blk: {
+            std.time.sleep(10 * std.time.ns_per_ms);
+            break :blk try server.accept();
+        },
+        else => return err,
+    };
+    defer conn.stream.close();
+
+    if (@hasDecl(posix.SO, "RCVTIMEO")) {
+        const timeout = posix.timeval{ .sec = 1, .usec = 0 };
+        try posix.setsockopt(
+            conn.stream.handle,
+            posix.SOL.SOCKET,
+            posix.SO.RCVTIMEO,
+            &std.mem.toBytes(timeout),
+        );
+    }
+
+    const request = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    try client.writeAll(request);
+
+    var buf: [128]u8 = undefined;
+    const n = try conn.stream.read(&buf);
+    // Regression: Stream.read must return a short read as soon as request
+    // bytes arrive; waiting for peer close wedges the single-threaded gateway.
+    try std.testing.expectEqualStrings(request, buf[0..n]);
+}
+
+test "compat net nonblocking listener accept without connection returns WouldBlock" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const addr = try Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .force_nonblocking = true });
+    defer server.deinit();
+
+    // Regression: Zig 0.16's threaded accept path treats EAGAIN on a
+    // nonblocking listener as a programmer bug. The compatibility wrapper must
+    // expose it as WouldBlock so the gateway poll loop can keep running.
+    try std.testing.expectError(error.WouldBlock, server.accept());
 }
 
 fn socketIsNonblocking(handle: IoNet.Socket.Handle) bool {
