@@ -258,6 +258,26 @@ pub const time = struct {
     pub fn nanoTimestamp() i128 {
         return nowNanoseconds();
     }
+
+    pub fn monotonicNanoTimestamp() i128 {
+        return switch (builtin.os.tag) {
+            .wasi => blk: {
+                var ts: std.os.wasi.timestamp_t = undefined;
+                if (std.os.wasi.clock_time_get(.MONOTONIC, 1, &ts) == .SUCCESS) {
+                    break :blk @intCast(ts);
+                }
+                break :blk nanoTimestamp();
+            },
+            .windows => nanoTimestamp(),
+            else => blk: {
+                var ts: std.posix.timespec = undefined;
+                switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+                    .SUCCESS => break :blk @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec,
+                    else => break :blk nanoTimestamp(),
+                }
+            },
+        };
+    }
 };
 
 pub const thread = struct {

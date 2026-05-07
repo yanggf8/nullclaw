@@ -293,6 +293,24 @@ Never call `dbEnqueueJob` for manual triggers — it is a raw queue insert that 
 
 If any of these are omitted, a concurrent on-disk write (e.g. `load-from-seed` or a gateway API call) can silently strip the routing config from the persisted job. The regression test `mergeSchedulerTickChangesAndSave preserves routing fields on existing job update` in `src/daemon.zig` covers this path.
 
+#### Scheduler watchdog
+
+`src/cron/ticker.zig` includes a self-watchdog that guards against the failure mode observed on 2026-05-06: the gateway HTTP path wedged on a short-read bug in `std.Io.net.Stream.Reader`, which also stalled the inline scheduler ticker for ~21 hours with no log output and no crash.
+
+Behavior:
+
+- Each tick, the ticker writes a monotonic timestamp via `std_compat.time.monotonicNanoTimestamp()` into a shared `SchedulerWatchdogState`.
+- A separate watcher thread (spawned from `CronTicker.run()`) checks the timestamp every 60s.
+- If schedulable jobs exist and no tick has advanced for 10 minutes, the watcher logs a warning (once, latched until the ticker recovers).
+- At 15 minutes, the watcher calls `std.process.abort()` so systemd `Restart=always` recovers the process.
+
+Constraints:
+
+- Thresholds (`WATCHDOG_WARN_AFTER_NS = 10min`, `WATCHDOG_ABORT_AFTER_NS = 15min`) are fixed `const`s, not config — keeping the surface small was a deliberate KISS call.
+- `jobs_exist` is sampled **once at ticker startup**. If the inventory changes at runtime (empty DB gains a job, or all jobs are deleted), the arming state does not refresh. Restart the daemon to re-arm. This is documented in-source; re-checking every 60s would add a recurring DB query for negligible benefit.
+- The decision logic is extracted to a pure `schedulerWatchdogDecision()` function so tests can verify state transitions without invoking `abort()`.
+- No `libsystemd` / `sd_notify` dependency — the binary-size budget (CLAUDE.md: <1 MB target) does not allow it.
+
 #### Operator alert delivery
 
 `Config.scheduler.alert_channel` / `alert_to` / `alert_account` configure a fallback delivery destination for skill job failures. Both execution paths honour it:
