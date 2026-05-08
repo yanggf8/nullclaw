@@ -80,6 +80,7 @@ Localized documentation lives under `docs/en/` and `docs/zh/`. Use the links bel
 |---|---|---|
 | Start here | [`docs/en/README.md`](docs/en/README.md) | [`docs/zh/README.md`](docs/zh/README.md) |
 | Install | [`docs/en/installation.md`](docs/en/installation.md) | [`docs/zh/installation.md`](docs/zh/installation.md) |
+| Install Zig | [`docs/en/zig-installation.md`](docs/en/zig-installation.md) | [`docs/zh/zig-installation.md`](docs/zh/zig-installation.md) |
 | Configure | [`docs/en/configuration.md`](docs/en/configuration.md) | [`docs/zh/configuration.md`](docs/zh/configuration.md) |
 | Commands | [`docs/en/commands.md`](docs/en/commands.md) | [`docs/zh/commands.md`](docs/zh/commands.md) |
 | Development | [`docs/en/development.md`](docs/en/development.md) | [`docs/zh/development.md`](docs/zh/development.md) |
@@ -122,6 +123,7 @@ nullclaw --help
 > **Prerequisite:** use **Zig 0.16.0** (exact version).
 > Other Zig versions are currently unsupported and may fail to build.
 > Verify before building: `zig version` should print `0.16.0`.
+> Debian users who need Zig first can follow [`docs/en/zig-installation.md`](docs/en/zig-installation.md).
 
 ```bash
 git clone https://github.com/nullclaw/nullclaw.git
@@ -876,6 +878,7 @@ Implement a vtable interface, submit a PR:
 
 - [Chinese docs overview (中文文档总览)](docs/zh/README.md)
 - [Installation guide (安装指南)](docs/zh/installation.md)
+- [Zig installation (Zig 安装指南)](docs/zh/zig-installation.md)
 - [Configuration guide (配置指南)](docs/zh/configuration.md)
 - [Usage and operations (使用与运维)](docs/zh/usage.md)
 - [Architecture overview (架构总览)](docs/zh/architecture.md)
@@ -888,6 +891,7 @@ Implement a vtable interface, submit a PR:
 
 - [English docs overview](docs/en/README.md)
 - [Installation](docs/en/installation.md)
+- [Zig Installation](docs/en/zig-installation.md)
 - [Configuration](docs/en/configuration.md)
 - [Usage and operations](docs/en/usage.md)
 - [Architecture](docs/en/architecture.md)
