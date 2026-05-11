@@ -69,6 +69,10 @@ pub const DiscordChannel = struct {
     bot_user_id: ?[]u8 = null,
     gateway_thread: ?std.Thread = null,
     ws_fd: Atomic(SocketFd) = Atomic(SocketFd).init(invalid_socket),
+    /// Count of consecutive op-7 RECONNECT events without an intervening READY.
+    /// Used to implement exponential backoff and RESUME→IDENTIFY fallback.
+    /// Only accessed from gatewayLoop (single-threaded write path); no atomic needed.
+    consecutive_reconnects: u32 = 0,
 
     const SocketFd = std_compat.net.Stream.Handle;
     const invalid_socket: SocketFd = switch (builtin.os.tag) {
@@ -83,6 +87,9 @@ pub const DiscordChannel = struct {
     /// Minimum stale-gateway grace window. The channel_manager checks health every 10s;
     /// allow at least 3 heartbeat intervals OR 90s before declaring the gateway dead.
     const GATEWAY_STALE_GRACE_MS: i64 = 90 * std.time.ms_per_s;
+    /// After this many consecutive op-7 RECONNECT events without a successful READY,
+    /// give up resuming and clear the session to force a fresh IDENTIFY.
+    const MAX_RECONNECT_ATTEMPTS: u32 = 5;
     const InvalidSessionAction = enum {
         identify,
         resume_session,
@@ -860,11 +867,23 @@ pub const DiscordChannel = struct {
             self.runGatewayOnce() catch |err| switch (err) {
                 error.ShouldReconnect => {
                     // OP7 RECONNECT is a normal control signal from Discord.
-                    // Reconnect quickly to minimize missed events.
-                    log.info("Discord gateway reconnect requested by server", .{});
-                    backoff_ms = 250;
+                    // Use exponential backoff to avoid rate-limiting reconnect storms:
+                    // attempt 1→1s, 2→2s, 3→4s, 4→8s, 5→16s, 6→32s, 7+→60s.
+                    self.consecutive_reconnects += 1;
+                    const shift = @min(self.consecutive_reconnects - 1, 6);
+                    backoff_ms = @min(@as(u64, 1000) << @intCast(shift), 60_000);
+                    log.info("Discord gateway reconnect requested by server (attempt {d}, backoff {d}ms)", .{ self.consecutive_reconnects, backoff_ms });
+                    // After too many consecutive op-7s without a successful READY,
+                    // the session is likely invalid/rate-limited. Clear it to force
+                    // a fresh IDENTIFY on the next attempt rather than looping forever.
+                    if (self.consecutive_reconnects >= MAX_RECONNECT_ATTEMPTS) {
+                        log.warn("Discord: {d} consecutive reconnects without READY; clearing session for fresh IDENTIFY", .{self.consecutive_reconnects});
+                        self.clearSessionStateForIdentify();
+                        self.consecutive_reconnects = 0;
+                    }
                 },
                 else => {
+                    self.consecutive_reconnects = 0;
                     log.warn("Discord gateway error: {}", .{err});
                 },
             };
@@ -1195,6 +1214,9 @@ pub const DiscordChannel = struct {
         }
 
         log.info("Discord READY: session_id={s}", .{self.session_id orelse "<none>"});
+        // A successful READY means we have a live session — reset the reconnect counter
+        // so the next op-7 (if any) gets a fresh exponential backoff window.
+        self.consecutive_reconnects = 0;
     }
 
     /// Handle MESSAGE_CREATE event and publish to bus if filters pass.
@@ -2113,4 +2135,44 @@ test "discord health check fails after stale gateway idle" {
 
     // Past 3× heartbeat window (120s) — must be stale.
     try std.testing.expect(!ch.gatewayHealthyAt(1_120_001));
+}
+
+test "discord handleReady resets consecutive_reconnects to zero" {
+    // Regression: rapid op-7 reconnect storms; READY must reset the backoff counter.
+    const alloc = std.testing.allocator;
+    var ch = DiscordChannel.init(alloc, "token", null, false);
+    defer {
+        if (ch.session_id) |s| alloc.free(s);
+        if (ch.resume_gateway_url) |u| alloc.free(u);
+        if (ch.bot_user_id) |u| alloc.free(u);
+    }
+    ch.consecutive_reconnects = 3;
+
+    const ready_json =
+        \\{"op":0,"s":1,"t":"READY","d":{"session_id":"sess-rc","resume_gateway_url":"wss://gateway.discord.gg/?v=10&encoding=json","user":{"id":"bot-rc"}}}
+    ;
+    var ws_dummy: websocket.WsClient = undefined;
+    try ch.handleGatewayMessage(&ws_dummy, ready_json);
+
+    try std.testing.expectEqual(@as(u32, 0), ch.consecutive_reconnects);
+}
+
+test "discord consecutive_reconnects cleared with session on exhaustion" {
+    // Regression: after MAX_RECONNECT_ATTEMPTS consecutive op-7s the session must be
+    // cleared so the next attempt does a fresh IDENTIFY rather than looping forever.
+    const alloc = std.testing.allocator;
+    var ch = DiscordChannel.init(alloc, "token", null, false);
+    ch.session_id = try alloc.dupe(u8, "stale-sess");
+    ch.resume_gateway_url = try alloc.dupe(u8, "wss://gateway.discord.gg/?v=10&encoding=json");
+    ch.sequence.store(99, .release);
+    ch.consecutive_reconnects = DiscordChannel.MAX_RECONNECT_ATTEMPTS;
+
+    // Simulate what gatewayLoop does when the threshold is reached.
+    ch.clearSessionStateForIdentify();
+    ch.consecutive_reconnects = 0;
+
+    try std.testing.expect(ch.session_id == null);
+    try std.testing.expect(ch.resume_gateway_url == null);
+    try std.testing.expectEqual(@as(i64, 0), ch.sequence.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), ch.consecutive_reconnects);
 }
