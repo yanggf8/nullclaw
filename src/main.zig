@@ -44,7 +44,7 @@ const Command = enum {
 
 const SERVICE_SUBCOMMANDS = "install|start|stop|restart|status|uninstall";
 const CONFIG_SUBCOMMANDS = "show|get|set|unset|reload|validate";
-const CRON_SUBCOMMANDS = "list|show|explain|status|job-status|schedule|add|add-agent|add-skill|once|once-agent|remove|pause|resume|unpause|run|update|runs|degraded|run-by-trace|backup|restore|export-seed|init-seed";
+const CRON_SUBCOMMANDS = "list|show|explain|status|job-status|schedule|add|add-agent|add-skill|once|once-agent|remove|pause|resume|unpause|run|update|runs|trace|degraded|run-by-trace|backup|restore|export-seed|init-seed";
 const CHANNEL_SUBCOMMANDS = "list|info|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
@@ -1628,6 +1628,10 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         \\                                Update a cron job. --expression also recomputes next run time.
         \\  runs <id> [--limit N] [--json]
         \\                                List run history for a specific job (from cron_runs table)
+        \\  trace <id> [--limit N] [--event <substr>]
+        \\                                Pretty-print skill-trace events for a job from
+        \\                                ~/.nullclaw/skill-traces.jsonl. <id> matches by job_id prefix.
+        \\                                --limit defaults to unlimited; --event narrows by event-name substring.
         \\  degraded [--hours N] [--job <id>] [--json]
         \\                                List failed or degraded runs (status=error OR verified>=2) across all jobs.
         \\                                --hours defaults to 24.
@@ -1923,6 +1927,29 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             }
         }
         try yc.cron.cliListRuns(allocator, sub_args[1], runs_limit, runs_json);
+    } else if (std.mem.eql(u8, subcmd, "trace")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw cron trace <id> [--limit N] [--event <substr>]\n", .{});
+            std_compat.process.exit(1);
+        }
+        var trace_limit: usize = 0;
+        var trace_event: ?[]const u8 = null;
+        {
+            var ti: usize = 2;
+            while (ti < sub_args.len) : (ti += 1) {
+                if (std.mem.eql(u8, sub_args[ti], "--limit") and ti + 1 < sub_args.len) {
+                    ti += 1;
+                    trace_limit = std.fmt.parseInt(usize, sub_args[ti], 10) catch 0;
+                } else if (std.mem.eql(u8, sub_args[ti], "--event") and ti + 1 < sub_args.len) {
+                    ti += 1;
+                    trace_event = sub_args[ti];
+                } else {
+                    std.debug.print("Usage: nullclaw cron trace <id> [--limit N] [--event <substr>]\n", .{});
+                    std_compat.process.exit(1);
+                }
+            }
+        }
+        try yc.cron.cliTraceJob(allocator, sub_args[1], trace_event, trace_limit);
     } else if (std.mem.eql(u8, subcmd, "degraded")) {
         var hours: u32 = 24;
         var job_filter: ?[]const u8 = null;

@@ -6262,6 +6262,186 @@ pub fn cliListRuns(allocator: std.mem.Allocator, id: []const u8, limit: usize, j
     }
 }
 
+/// Path to the JSONL stream that skills append per-event diagnostics to.
+/// Convention: each line is one JSON object with `ts`, `job_id`, `skill`,
+/// `event` and zero or more event-specific fields. Skills decide which
+/// events to emit; this CLI does not impose a schema beyond `job_id` and
+/// `event` being string fields.
+pub const SKILL_TRACES_FILENAME = "skill-traces.jsonl";
+
+/// Pretty-print events from ~/.nullclaw/skill-traces.jsonl matching a given
+/// job_id (full or prefix), optionally narrowed by an event-name substring.
+///
+/// This is a read-only file scanner: no DB access, no parsing of unknown
+/// fields beyond the well-known ones. Unknown lines are skipped silently
+/// so a malformed entry from one skill does not block trace inspection.
+///
+/// `limit` is the maximum number of most-recent matching events to print
+/// (0 means unlimited).
+pub fn cliTraceJob(
+    allocator: std.mem.Allocator,
+    job_id_prefix: []const u8,
+    event_substring: ?[]const u8,
+    limit: usize,
+) !void {
+    const home = try platform.getHomeDir(allocator);
+    defer allocator.free(home);
+    const trace_path = try std_compat.fs.path.join(allocator, &.{ home, ".nullclaw", SKILL_TRACES_FILENAME });
+    defer allocator.free(trace_path);
+
+    var out_buf: [4096]u8 = undefined;
+    const stdout = std_compat.fs.File.stdout();
+    var bw = stdout.writer(&out_buf);
+    try writeTraceForPath(allocator, trace_path, job_id_prefix, event_substring, limit, &bw.interface);
+    try bw.interface.flush();
+}
+
+/// Testable core of `cliTraceJob`: read `trace_path`, filter, render.
+/// Same I/O contract as `cliTraceJob` except output goes to `writer` instead
+/// of stdout — lets tests assert against an Allocating writer.
+fn writeTraceForPath(
+    allocator: std.mem.Allocator,
+    trace_path: []const u8,
+    job_id_prefix: []const u8,
+    event_substring: ?[]const u8,
+    limit: usize,
+    writer: *std.Io.Writer,
+) !void {
+    const file = std_compat.fs.openFileAbsolute(trace_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            try writer.print("Trace file not found: {s}\n", .{trace_path});
+            return;
+        },
+        else => return err,
+    };
+    defer file.close();
+
+    const max_bytes: usize = 64 * 1024 * 1024; // 64 MiB safety cap
+    const content = try file.readToEndAlloc(allocator, max_bytes);
+    defer allocator.free(content);
+
+    var matched_lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer matched_lines.deinit(allocator);
+
+    var it = std.mem.tokenizeScalar(u8, content, '\n');
+    while (it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \r\t");
+        if (line.len == 0 or line[0] != '{') continue;
+        if (!traceLineMatches(allocator, line, job_id_prefix, event_substring)) continue;
+        try matched_lines.append(allocator, line);
+    }
+
+    if (matched_lines.items.len == 0) {
+        try writer.print("No trace events for job_id starting with '{s}'", .{job_id_prefix});
+        if (event_substring) |e| try writer.print(" and event matching '{s}'", .{e});
+        try writer.writeAll(".\n");
+        return;
+    }
+
+    // Show the most recent `limit` events (or all if limit==0). Events are
+    // appended chronologically by the skill, so the tail is the newest.
+    const lines = matched_lines.items;
+    const start: usize = if (limit == 0 or lines.len <= limit) 0 else lines.len - limit;
+
+    try writer.print("Trace for job_id^={s} ({d} matching events, showing {d}):\n", .{
+        job_id_prefix,
+        lines.len,
+        lines.len - start,
+    });
+    try writer.writeAll("─────────────────────────────────────────────────────────────────────────\n");
+
+    for (lines[start..]) |line| {
+        traceWriteCompactRow(allocator, line, writer) catch |err| {
+            try writer.print("  [parse error: {s}] {s}\n", .{ @errorName(err), line[0..@min(line.len, 120)] });
+        };
+    }
+}
+
+/// Test whether a JSONL line matches the given filters. Pure: no I/O.
+fn traceLineMatches(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    job_id_prefix: []const u8,
+    event_substring: ?[]const u8,
+) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return false;
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return false,
+    };
+
+    const job_id_val = obj.get("job_id") orelse return false;
+    const job_id = switch (job_id_val) {
+        .string => |s| s,
+        else => return false,
+    };
+    if (!std.mem.startsWith(u8, job_id, job_id_prefix)) return false;
+
+    if (event_substring) |needle| {
+        const event_val = obj.get("event") orelse return false;
+        const event = switch (event_val) {
+            .string => |s| s,
+            else => return false,
+        };
+        if (std.mem.indexOf(u8, event, needle) == null) return false;
+    }
+    return true;
+}
+
+/// Write one trace event to `writer` as a compact, human-readable row.
+/// Well-known fields get short labels; unknown fields are omitted.
+fn traceWriteCompactRow(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    writer: *std.Io.Writer,
+) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.NotJsonObject,
+    };
+
+    // ts is an ISO-8601 UTC string; show just HH:MM:SS for readability.
+    const ts_short: []const u8 = blk: {
+        if (obj.get("ts")) |v| {
+            switch (v) {
+                .string => |s| if (s.len >= 19) break :blk s[11..19] else break :blk s,
+                else => {},
+            }
+        }
+        break :blk "??:??:??";
+    };
+
+    const event_name: []const u8 = blk: {
+        if (obj.get("event")) |v| {
+            switch (v) {
+                .string => |s| break :blk s,
+                else => {},
+            }
+        }
+        break :blk "?";
+    };
+
+    try writer.print("  {s}  {s}", .{ ts_short, event_name });
+
+    // Append a fixed set of compact key=value pairs when present.
+    const fields = [_][]const u8{ "variant", "elapsed_ms", "returncode", "stdout_len", "prompt_chars", "topic", "start", "end", "error", "reason" };
+    for (fields) |k| {
+        if (obj.get(k)) |v| {
+            switch (v) {
+                .string => |s| try writer.print(" {s}={s}", .{ k, s[0..@min(s.len, 60)] }),
+                .integer => |n| try writer.print(" {s}={d}", .{ k, n }),
+                else => {},
+            }
+        }
+    }
+
+    try writer.writeAll("\n");
+}
+
 /// Query cron_runs for failed or degraded rows within a time window, optionally
 /// filtered by job_id. A row is included when EITHER `verified >= 2` (skill
 /// verification tagged it as degraded/failed) OR `status = 'error'` (shell or
@@ -10864,6 +11044,93 @@ test "human-path filter: dbListFilteredJobIds + selectCronJobsByIds returns matc
     try std.testing.expect(rendered.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Weekly schedule") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "oilcon") != null);
+}
+
+test "writeTraceForPath filters by job_id prefix, event substring, and limit" {
+    // Regression: cron trace must accept a job_id prefix (not just exact match)
+    // and an optional event-name substring, and apply --limit by keeping the
+    // most-recent N events. Lines that are not JSON objects must be skipped
+    // silently, and malformed JSON lines must not crash the scanner.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const trace_path = try std.fmt.allocPrint(allocator, "{s}/skill-traces.jsonl", .{base});
+    defer allocator.free(trace_path);
+
+    const content =
+        \\{"ts":"2026-05-11T00:30:11.238","job_id":"skill-75e98cbb-job","skill":"news","event":"llm_agent_start","variant":"default_ai","prompt_chars":3000}
+        \\not a json line — should be skipped
+        \\{"ts":"2026-05-11T00:30:24.487","job_id":"skill-75e98cbb-job","skill":"news","event":"llm_agent_exit","variant":"default_ai","elapsed_ms":13249,"returncode":0,"stdout_len":274}
+        \\{ "ts":"bad json
+        \\{"ts":"2026-05-11T00:31:00.000","job_id":"skill-otherjob","skill":"news","event":"llm_agent_start","variant":"default_tech"}
+        \\{"ts":"2026-05-11T00:31:13.000","job_id":"skill-75e98cbb-job","skill":"news","event":"news_cache_hit","variant":"default_ai_substage","start":0,"end":15}
+        \\
+    ;
+    {
+        const f = try std_compat.fs.createFileAbsolute(trace_path, .{});
+        defer f.close();
+        try f.writeAll(content);
+    }
+
+    // (1) Prefix match returns the 3 events for skill-75e98cbb-job, in order.
+    {
+        var sink: std.Io.Writer.Allocating = .init(allocator);
+        defer sink.deinit();
+        try writeTraceForPath(allocator, trace_path, "skill-75e98cbb", null, 0, &sink.writer);
+        const out = sink.written();
+        try std.testing.expect(std.mem.indexOf(u8, out, "3 matching events") != null);
+        // Chronological order preserved: llm_agent_start before llm_agent_exit before news_cache_hit.
+        const start_pos = std.mem.indexOf(u8, out, "llm_agent_start").?;
+        const exit_pos = std.mem.indexOf(u8, out, "llm_agent_exit").?;
+        const hit_pos = std.mem.indexOf(u8, out, "news_cache_hit").?;
+        try std.testing.expect(start_pos < exit_pos);
+        try std.testing.expect(exit_pos < hit_pos);
+        // skill-otherjob must NOT appear.
+        try std.testing.expect(std.mem.indexOf(u8, out, "default_tech") == null);
+    }
+
+    // (2) Event substring narrows to just llm_agent_* events.
+    {
+        var sink: std.Io.Writer.Allocating = .init(allocator);
+        defer sink.deinit();
+        try writeTraceForPath(allocator, trace_path, "skill-75e98cbb", "llm_agent", 0, &sink.writer);
+        const out = sink.written();
+        try std.testing.expect(std.mem.indexOf(u8, out, "2 matching events") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "news_cache_hit") == null);
+    }
+
+    // (3) --limit 1 keeps only the most-recent event (news_cache_hit at 00:31:13).
+    {
+        var sink: std.Io.Writer.Allocating = .init(allocator);
+        defer sink.deinit();
+        try writeTraceForPath(allocator, trace_path, "skill-75e98cbb", null, 1, &sink.writer);
+        const out = sink.written();
+        try std.testing.expect(std.mem.indexOf(u8, out, "3 matching events, showing 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "news_cache_hit") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "llm_agent_start") == null);
+    }
+
+    // (4) No matches → friendly message, no crash.
+    {
+        var sink: std.Io.Writer.Allocating = .init(allocator);
+        defer sink.deinit();
+        try writeTraceForPath(allocator, trace_path, "skill-nonexistent", null, 0, &sink.writer);
+        const out = sink.written();
+        try std.testing.expect(std.mem.indexOf(u8, out, "No trace events") != null);
+    }
+
+    // (5) Missing file → friendly message, no crash.
+    {
+        var sink: std.Io.Writer.Allocating = .init(allocator);
+        defer sink.deinit();
+        const missing = try std.fmt.allocPrint(allocator, "{s}/does-not-exist.jsonl", .{base});
+        defer allocator.free(missing);
+        try writeTraceForPath(allocator, missing, "anything", null, 0, &sink.writer);
+        const out = sink.written();
+        try std.testing.expect(std.mem.indexOf(u8, out, "not found") != null);
+    }
 }
 
 test "dbListJobsJsonFiltered match is case insensitive" {
