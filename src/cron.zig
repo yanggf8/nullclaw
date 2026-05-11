@@ -2470,16 +2470,6 @@ pub fn ensureCronRunsTable(db: *c.sqlite3) !void {
 }
 
 /// Ensure the cron_run_queue table exists in the given DB.
-///
-/// Schema lifecycle (Change 1: lease-based claim):
-/// - `pending`: enqueued by the ticker, not yet claimed.
-/// - `in_progress`: claimed by a worker. The claim is only valid while
-///   `lease_until > now`. After the lease expires, any worker may re-claim
-///   the row and increment `attempts`.
-/// - `failed`: terminal — `attempts` reached `max_attempts`. The row stays
-///   in the table until the operator acknowledges it via
-///   `nullclaw cron ack <row_id>`.
-/// - `expired`: terminal — `deadline_at < now` at dequeue time. Same ack flow.
 pub fn ensureRunQueueTable(db: *c.sqlite3) !void {
     var err_msg: [*c]u8 = null;
     const rc = c.sqlite3_exec(db, CRON_RUN_QUEUE_SQL, null, null, &err_msg);
@@ -2487,19 +2477,6 @@ pub fn ensureRunQueueTable(db: *c.sqlite3) !void {
         if (err_msg) |msg| c.sqlite3_free(msg);
         return error.RunQueueTableCreateFailed;
     }
-    // Migration: lease-based claim columns. All have safe defaults so existing
-    // rows survive an upgrade unchanged (lease_until=0 → immediately reclaimable;
-    // attempts=0 → full retry budget; deadline_at=0 → no deadline).
-    _ = c.sqlite3_exec(db, "ALTER TABLE cron_run_queue ADD COLUMN lease_until INTEGER NOT NULL DEFAULT 0", null, null, null);
-    _ = c.sqlite3_exec(db, "ALTER TABLE cron_run_queue ADD COLUMN lease_owner TEXT", null, null, null);
-    _ = c.sqlite3_exec(db, "ALTER TABLE cron_run_queue ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0", null, null, null);
-    _ = c.sqlite3_exec(db, "ALTER TABLE cron_run_queue ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3", null, null, null);
-    _ = c.sqlite3_exec(db, "ALTER TABLE cron_run_queue ADD COLUMN last_error TEXT", null, null, null);
-    _ = c.sqlite3_exec(db, "ALTER TABLE cron_run_queue ADD COLUMN deadline_at INTEGER NOT NULL DEFAULT 0", null, null, null);
-    _ = c.sqlite3_exec(db, "ALTER TABLE cron_run_queue ADD COLUMN acknowledged_at INTEGER NOT NULL DEFAULT 0", null, null, null);
-    // Composite index supports the dequeue predicate
-    // `status='pending' OR (status='in_progress' AND lease_until < now)`.
-    _ = c.sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_run_queue_lease ON cron_run_queue(status, lease_until)", null, null, null);
 }
 
 pub fn ensureCronTable(db: *c.sqlite3) !void {
@@ -10338,59 +10315,6 @@ test "dbResetInProgressJobs resets stale rows" {
     try std.testing.expect(status_ptr != null);
     const status_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
     try std.testing.expectEqualStrings("pending", status_ptr[0..status_len]);
-}
-
-test "ensureRunQueueTable migrates lease columns idempotently" {
-    if (!build_options.enable_sqlite) return error.SkipZigTest;
-
-    var iso = try makeIsolatedTestScheduler();
-    defer iso.deinit();
-
-    const db = try openCronDbAtPath(iso.db_path_buf);
-    defer _ = c.sqlite3_close(db);
-
-    // First call creates table + migration columns. Second call must be a no-op
-    // (the ALTER TABLE statements would fail without IF NOT EXISTS semantics —
-    // we rely on sqlite returning SQLITE_ERROR for "duplicate column" which we
-    // ignore via the discarded return value).
-    try ensureRunQueueTable(db);
-    try ensureRunQueueTable(db);
-
-    // Verify all 7 lease columns are present and have the documented defaults.
-    const expected_columns = [_]struct { name: []const u8, default_present: bool }{
-        .{ .name = "lease_until", .default_present = true },
-        .{ .name = "lease_owner", .default_present = false },
-        .{ .name = "attempts", .default_present = true },
-        .{ .name = "max_attempts", .default_present = true },
-        .{ .name = "last_error", .default_present = false },
-        .{ .name = "deadline_at", .default_present = true },
-        .{ .name = "acknowledged_at", .default_present = true },
-    };
-    for (expected_columns) |col| {
-        var stmt: ?*c.sqlite3_stmt = null;
-        const sql = "SELECT 1 FROM pragma_table_info('cron_run_queue') WHERE name=?1";
-        try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db, sql, -1, &stmt, null));
-        defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_text(stmt, 1, col.name.ptr, @intCast(col.name.len), SQLITE_STATIC);
-        try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
-        _ = col.default_present; // present-ness asserted by SQLITE_ROW above
-    }
-
-    // Insert a row using only the legacy columns (simulating an old client) and
-    // confirm the new defaults are populated automatically.
-    const ins_sql = "INSERT INTO cron_run_queue (job_id, enqueued_at, status) VALUES ('legacy', 100, 'pending')";
-    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(db, ins_sql, null, null, null));
-
-    var sel: ?*c.sqlite3_stmt = null;
-    const sel_sql = "SELECT lease_until, attempts, max_attempts, deadline_at, acknowledged_at FROM cron_run_queue WHERE job_id='legacy'";
-    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db, sel_sql, -1, &sel, null));
-    defer _ = c.sqlite3_finalize(sel);
-    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(sel));
-    try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(sel, 0));
-    try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(sel, 1));
-    try std.testing.expectEqual(@as(i64, 3), c.sqlite3_column_int64(sel, 2));
-    try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(sel, 3));
-    try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(sel, 4));
 }
 
 test "dbLoadJobSpec persists and restores delivery_best_effort and session_target" {
