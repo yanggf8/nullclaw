@@ -131,6 +131,23 @@ To inspect one run by trace:
 nullclaw cron run-by-trace <trace_id>
 ```
 
+For per-event diagnostics from skills (cache hits, LLM call timings, substaging
+events, validation failures), use `cron trace`. It scans
+`~/.nullclaw/skill-traces.jsonl` and pretty-prints matching events:
+
+```bash
+nullclaw cron trace skill-75e98cbb                         # all events for that job_id (prefix match)
+nullclaw cron trace skill-75e98cbb --event llm_agent       # narrow by event-name substring
+nullclaw cron trace skill-75e98cbb --limit 10              # most-recent 10 events only
+```
+
+The job_id argument is matched as a prefix, so the first 8-12 chars of a UUID
+are usually enough. Each row shows `HH:MM:SS event variant=… elapsed_ms=…
+returncode=… stdout_len=…` — known fields are surfaced; unknown ones are
+omitted to keep rows scannable. For the raw JSON payload (including stderr
+tails and full stack traces), `grep <job_id> ~/.nullclaw/skill-traces.jsonl`
+remains the right tool.
+
 To diagnose what a job will actually execute before it runs:
 
 ```bash

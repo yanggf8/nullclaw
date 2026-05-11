@@ -131,6 +131,16 @@ nullclaw cron list --match oil --json
 nullclaw cron run-by-trace <trace_id>
 ```
 
+若要查看 skill 自身寫入的逐事件診斷（cache 命中、LLM 呼叫耗時、substaging 事件、驗證失敗等），使用 `cron trace`。它會掃描 `~/.nullclaw/skill-traces.jsonl` 並排版列出符合的事件：
+
+```bash
+nullclaw cron trace skill-75e98cbb                         # 該 job_id 的所有事件（前綴比對）
+nullclaw cron trace skill-75e98cbb --event llm_agent       # 以事件名稱子字串收斂
+nullclaw cron trace skill-75e98cbb --limit 10              # 只顯示最近 10 筆
+```
+
+job_id 參數採前綴比對，通常 UUID 的前 8-12 個字元就足以唯一識別。每列顯示 `HH:MM:SS event variant=… elapsed_ms=… returncode=… stdout_len=…` — 已知欄位會列出，未知欄位則省略以保持可讀性。若需完整 JSON（含 stderr 尾端與完整堆疊），仍建議用 `grep <job_id> ~/.nullclaw/skill-traces.jsonl`。
+
 若要在任務執行前診斷它實際會跑什麼：
 
 ```bash

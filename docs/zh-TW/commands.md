@@ -103,6 +103,7 @@
 | `nullclaw cron remove <id>` | 刪除任務 |
 | `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>] [--verify <mode>] [--repair <policy>]` | 更新已有任務；`--enable` 同時清除 paused 標誌，`--disable` 同時設定 |
 | `nullclaw cron runs <id> [--limit N] [--json]` | 查看任務最近執行記錄（包含 exit code、failure class、repair action、verified 狀態與 trace ID） |
+| `nullclaw cron trace <id> [--limit N] [--event <substr>]` | 從 `~/.nullclaw/skill-traces.jsonl` 排版列出 job_id 前綴符合 `<id>` 的逐事件診斷。`--event` 以事件名稱子字串收斂；`--limit` 只保留最近 N 筆 |
 | `nullclaw cron degraded [--hours N] [--job <id>] [--json]` | 列出時間窗內（預設 24 小時）所有失敗或降級的執行；比對條件為 `status=error` 或 `verified>=2`。有結果時附帶 `run-by-trace` 提示 |
 | `nullclaw cron run-by-trace <trace_id> [--json]` | 依 `trace_id` 查詢執行記錄;無對應結果時以 exit 1 結束,方便 shell pipeline 使用 |
 | `nullclaw cron backup` | 將所有任務匯出為帶時間戳記的 seed 檔案 |
