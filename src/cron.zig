@@ -3961,6 +3961,12 @@ pub fn cliListJobs(allocator: std.mem.Allocator, limit: usize, json_out: bool, f
     var out_buf: [4096]u8 = undefined;
     var bw = stdout.writer(&out_buf);
     try printWeeklyTable(allocator, jobs_to_print, std_compat.time.timestamp(), &bw.interface);
+    // Flush is mandatory — without it, output that fits entirely in the 4 KiB
+    // buffer (e.g. a filtered list of <30 fires) is never written to stdout.
+    // The unfiltered case happens to flush mid-write because 32 jobs × ~3 fires
+    // each exceeds the buffer; the filtered case did not, and silently produced
+    // an empty table after the "Filter:" header.
+    try bw.interface.flush();
 }
 
 /// CLI: show upcoming schedule within a time window, or all jobs.
@@ -4115,6 +4121,7 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, sho
         var out_buf: [4096]u8 = undefined;
         var bw = std_compat.fs.File.stdout().writer(&out_buf);
         try printWeeklyTable(allocator, all_jobs, now, &bw.interface);
+        try bw.interface.flush();
         return;
     }
 
@@ -10876,6 +10883,63 @@ test "dbListJobsJsonFiltered supports empty JSON and human filter summary" {
     const summary = try cronListFilterSummary(std.testing.allocator, filter);
     defer std.testing.allocator.free(summary);
     try std.testing.expectEqualStrings("match=missing", summary);
+}
+
+test "human-path filter: dbListFilteredJobIds + selectCronJobsByIds returns matching jobs" {
+    // Regression: `nullclaw cron list --skill <name>` printed "Filter: skill=<name>"
+    // and then nothing — even when matching jobs existed in the DB. The JSON path
+    // (--json) returned them correctly but the human weekly-table path lost them.
+    //
+    // This test exercises the same call chain the human path takes:
+    //   loadJobsForRead → all_jobs
+    //   dbListFilteredJobIds → matching IDs
+    //   selectCronJobsByIds(all_jobs, ids) → final CronJob slice
+    // and asserts the final slice is non-empty for a known-matching filter.
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+
+    // Seed the DB then close the writer so the read-only reopen below sees it.
+    {
+        const seed_db = try openCronDbAtPath(iso.db_path_buf);
+        defer closeCronDb(seed_db);
+        try seedCronListFilterFixture(seed_db);
+    }
+
+    // Step 1: SQL filter returns the expected ID for --skill oilcon.
+    const filter_db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(filter_db);
+    const ids = try dbListFilteredJobIds(filter_db, std.testing.allocator, .{ .skill = "oilcon" }, 0);
+    defer freeCronListIds(std.testing.allocator, ids);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    try std.testing.expectEqualStrings("job-oil", ids[0]);
+
+    // Step 2: load the same DB into a scheduler the way cliListJobs does.
+    var scheduler = CronScheduler.init(std.testing.allocator, 1024, true);
+    defer scheduler.deinit();
+    scheduler.db_path = iso.db_path_buf;
+    try loadJobsForRead(&scheduler);
+    const all_jobs = scheduler.listJobs();
+    try std.testing.expect(all_jobs.len >= 1);
+
+    // Step 3: selectCronJobsByIds(all_jobs, ids) must return exactly 1 CronJob
+    // whose .id matches "job-oil". This is where the human path was losing the row.
+    const selected = try selectCronJobsByIds(std.testing.allocator, all_jobs, ids);
+    defer std.testing.allocator.free(selected);
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    try std.testing.expectEqualStrings("job-oil", selected[0].id);
+
+    // Step 4: end-to-end — printWeeklyTable into an Allocating writer must produce
+    // a non-empty rendering. Catches the original bug class even if the data flow
+    // above stays correct (e.g. someone forgets to flush a buffered stdout writer).
+    var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sink.deinit();
+    try printWeeklyTable(std.testing.allocator, selected, std_compat.time.timestamp(), &sink.writer);
+    const rendered = sink.written();
+    try std.testing.expect(rendered.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Weekly schedule") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "oilcon") != null);
 }
 
 test "dbListJobsJsonFiltered match is case insensitive" {
