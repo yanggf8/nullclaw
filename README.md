@@ -767,7 +767,7 @@ See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including 
 | `service install\|start\|stop\|restart\|status\|uninstall` | Manage background service |
 | `doctor` | Diagnose system health |
 | `status [--json]` | Show full system status or emit the machine-readable runtime snapshot |
-| `channel list\|info\|start\|status\|add\|remove` | Manage channels, including JSON account inventory for automation |
+| `channel list\|info\|start\|status\|add\|remove\|telegram-bot-token` | Manage channels and expose narrow channel-owned secrets to trusted local tooling |
 | `cron list\|status\|add\|add-agent\|once\|once-agent\|remove\|pause\|resume\|run\|update\|runs` | Manage scheduled tasks |
 | `skills list\|install\|remove\|info` | Manage skill packs, including `install --name <query>` registry search |
 | `history list\|show` | View session conversation history |

@@ -81,6 +81,7 @@
 | `nullclaw channel start telegram` | 启动指定渠道 |
 | `nullclaw channel status` | 查看渠道健康状态 |
 | `nullclaw channel info <type> [--json]` | 查看某类渠道的已配置账号 |
+| `nullclaw channel telegram-bot-token <account>` | 输出已配置 Telegram 账号的 bot token，供受信任的本机工具使用 |
 | `nullclaw channel add <type>` | 提示如何往配置里添加某类渠道 |
 | `nullclaw channel remove <name>` | 提示如何从配置里移除渠道 |
 

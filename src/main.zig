@@ -45,7 +45,7 @@ const Command = enum {
 const SERVICE_SUBCOMMANDS = "install|start|stop|restart|status|uninstall";
 const CONFIG_SUBCOMMANDS = "show|get|set|unset|reload|validate";
 const CRON_SUBCOMMANDS = "list|show|explain|status|job-status|schedule|add|add-agent|add-skill|once|once-agent|remove|pause|resume|unpause|run|update|runs|trace|degraded|run-by-trace|backup|restore|export-seed|init-seed";
-const CHANNEL_SUBCOMMANDS = "list|info|start|status|add|remove";
+const CHANNEL_SUBCOMMANDS = "list|info|start|status|add|remove|telegram-bot-token";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
 const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|store|update|delete|drain-outbox|forget|run-hygiene";
@@ -2062,6 +2062,7 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             \\  status                        Show channel health/status
             \\  add <type> <config_json>      Add a channel
             \\  remove <name>                 Remove a channel
+            \\  telegram-bot-token <account>  Print Telegram bot token for an account
             \\
         , .{CHANNEL_SUBCOMMANDS}), .{});
         std_compat.process.exit(1);
@@ -2188,6 +2189,17 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             if (!yc.channel_catalog.isConfigured(&cfg, meta.id)) continue;
             std.debug.print("  {s}: configured (use `channel start` to verify)\n", .{meta.label});
         }
+    } else if (std.mem.eql(u8, subcmd, "telegram-bot-token")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw channel telegram-bot-token <account>\n", .{});
+            std_compat.process.exit(1);
+        }
+        const token = telegramBotTokenForAccount(&cfg, sub_args[1]) orelse {
+            std.debug.print("Telegram account '{s}' is not configured or has no bot token.\n", .{sub_args[1]});
+            std_compat.process.exit(1);
+        };
+        printStdoutBytes(token);
+        printStdoutBytes("\n");
     } else if (std.mem.eql(u8, subcmd, "add")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw channel add <type>\n", .{});
@@ -2212,6 +2224,16 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         std.debug.print("Unknown channel command: {s}\n", .{subcmd});
         std_compat.process.exit(1);
     }
+}
+
+fn telegramBotTokenForAccount(config: *const yc.config.Config, account_id: []const u8) ?[]const u8 {
+    for (config.channels.telegram) |account| {
+        if (!std.mem.eql(u8, account.account_id, account_id)) continue;
+        const token = std.mem.trim(u8, account.bot_token, " \t\r\n");
+        if (token.len == 0) return null;
+        return token;
+    }
+    return null;
 }
 
 fn tryReadGatewayRuntimeStatusJson(allocator: std.mem.Allocator) ?[]const u8 {
@@ -6350,6 +6372,25 @@ test "hasConfiguredStartableChannels returns true when telegram configured" {
 
     if (!yc.channel_catalog.isBuildEnabled(.telegram)) return error.SkipZigTest;
     try std.testing.expect(hasConfiguredStartableChannels(&cfg));
+}
+
+test "telegramBotTokenForAccount returns only configured non-empty token" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .telegram = &[_]yc.config.TelegramConfig{
+                .{ .account_id = "main", .bot_token = "123:abc" },
+                .{ .account_id = "empty", .bot_token = "  \n" },
+            },
+        },
+    };
+
+    try std.testing.expectEqualStrings("123:abc", telegramBotTokenForAccount(&cfg, "main") orelse return error.TestUnexpectedResult);
+    try std.testing.expect(telegramBotTokenForAccount(&cfg, "empty") == null);
+    try std.testing.expect(telegramBotTokenForAccount(&cfg, "missing") == null);
 }
 
 test "resolveConfiguredRuntimeChannel matches external plugin name" {

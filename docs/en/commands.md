@@ -95,6 +95,7 @@ Notes:
 | `nullclaw channel start telegram` | Start a specific channel |
 | `nullclaw channel status` | Show channel health |
 | `nullclaw channel info <type> [--json]` | Show configured accounts for one channel type |
+| `nullclaw channel telegram-bot-token <account>` | Print the Telegram bot token for a configured account; intended for trusted local tools |
 | `nullclaw channel add <type>` | Print guidance for adding a channel to config |
 | `nullclaw channel remove <name>` | Print guidance for removing a channel from config |
 

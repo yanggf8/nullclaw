@@ -81,6 +81,7 @@
 | `nullclaw channel start telegram` | 啟動指定頻道 |
 | `nullclaw channel status` | 查看頻道健康狀態 |
 | `nullclaw channel info <type> [--json]` | 查看某類頻道的已設定帳號 |
+| `nullclaw channel telegram-bot-token <account>` | 輸出已設定 Telegram 帳號的 bot token，供受信任的本機工具使用 |
 | `nullclaw channel add <type>` | 提示如何往設定裡新增某類頻道 |
 | `nullclaw channel remove <name>` | 提示如何從設定裡移除頻道 |
 
