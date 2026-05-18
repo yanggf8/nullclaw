@@ -1549,11 +1549,60 @@ fn parseCronAgentOptions(sub_args: []const []const u8, start_index: usize) !Cron
 }
 
 /// Parse a timezone offset string like "+8", "-5", "0" into seconds.
-fn parseTzOffset(raw: []const u8) i32 {
+/// Parse a `--tz` argument like `+8`, `+08`, `+08:00`, `-5`, `-05:30`
+/// into a signed seconds offset. Returns `error.InvalidTzOffset` on
+/// malformed input. Empty string is rejected (use a real offset or
+/// omit `--tz` entirely).
+///
+/// The 2026-05-18 bug: the previous implementation `parseInt(trimmed, 10)`
+/// silently failed on `+08:00` (the `:` is not a decimal digit) and
+/// returned 0, so cron jobs added with `--tz +08:00` ran at UTC and
+/// fired 8 hours late in local time. The strict parser below covers
+/// the `±HH`, `±HH:MM`, and `±H` forms uniformly so the user can't
+/// hit that footgun again.
+fn parseTzOffsetStrict(raw: []const u8) error{InvalidTzOffset}!i32 {
     const trimmed = std.mem.trim(u8, raw, " \t");
-    if (trimmed.len == 0) return 0;
-    const hours = std.fmt.parseInt(i32, trimmed, 10) catch return 0;
-    return hours * 3600;
+    if (trimmed.len == 0) return error.InvalidTzOffset;
+
+    var sign: i32 = 1;
+    var rest = trimmed;
+    if (rest[0] == '+') {
+        rest = rest[1..];
+    } else if (rest[0] == '-') {
+        sign = -1;
+        rest = rest[1..];
+    }
+    if (rest.len == 0) return error.InvalidTzOffset;
+
+    var hours_str = rest;
+    var minutes_str: []const u8 = "";
+    if (std.mem.indexOfScalar(u8, rest, ':')) |colon| {
+        hours_str = rest[0..colon];
+        minutes_str = rest[colon + 1 ..];
+        if (hours_str.len == 0 or minutes_str.len == 0) return error.InvalidTzOffset;
+    }
+
+    // Hours and minutes parts are unsigned (sign was already consumed).
+    const hours = std.fmt.parseInt(i32, hours_str, 10) catch return error.InvalidTzOffset;
+    if (hours < 0 or hours > 14) return error.InvalidTzOffset;
+
+    var minutes: i32 = 0;
+    if (minutes_str.len > 0) {
+        minutes = std.fmt.parseInt(i32, minutes_str, 10) catch return error.InvalidTzOffset;
+        if (minutes < 0 or minutes > 59) return error.InvalidTzOffset;
+    }
+
+    return sign * (hours * 3600 + minutes * 60);
+}
+
+fn parseTzOffset(raw: []const u8) i32 {
+    return parseTzOffsetStrict(raw) catch {
+        std.debug.print(
+            "Invalid --tz value '{s}': expected like +8, +08, +08:00, -5, -05:30 (hours 0-14, minutes 0-59)\n",
+            .{raw},
+        );
+        std.process.exit(1);
+    };
 }
 
 fn parseCronAddAgentOptions(sub_args: []const []const u8) !CronAddAgentOptions {
@@ -7322,4 +7371,58 @@ test "appendAgentSessionTerminationJson renders terminated session payload" {
 
     try appendAgentSessionTerminationJson(&writer, "s-1");
     try std.testing.expectEqualStrings("{\"session_key\":\"s-1\",\"terminated\":true}", writer.buffered());
+}
+
+test "parseTzOffsetStrict accepts +H, +HH, +HH:MM and signed variants" {
+    // Regression: +08:00 silently parsed as 0 before 2026-05-18.
+    try std.testing.expectEqual(@as(i32, 8 * 3600), try parseTzOffsetStrict("+8"));
+    try std.testing.expectEqual(@as(i32, 8 * 3600), try parseTzOffsetStrict("+08"));
+    try std.testing.expectEqual(@as(i32, 8 * 3600), try parseTzOffsetStrict("+08:00"));
+    try std.testing.expectEqual(@as(i32, -5 * 3600), try parseTzOffsetStrict("-5"));
+    try std.testing.expectEqual(@as(i32, -(5 * 3600 + 30 * 60)), try parseTzOffsetStrict("-05:30"));
+    // Same numeric output for the equivalent +HH:MM and +HH and +H forms.
+    try std.testing.expectEqual(
+        try parseTzOffsetStrict("+8"),
+        try parseTzOffsetStrict("+08:00"),
+    );
+}
+
+test "parseTzOffsetStrict accepts zero and unsigned hours" {
+    try std.testing.expectEqual(@as(i32, 0), try parseTzOffsetStrict("0"));
+    try std.testing.expectEqual(@as(i32, 0), try parseTzOffsetStrict("+0"));
+    try std.testing.expectEqual(@as(i32, 0), try parseTzOffsetStrict("-0"));
+    try std.testing.expectEqual(@as(i32, 0), try parseTzOffsetStrict("+00:00"));
+    // Unsigned hours are treated as positive.
+    try std.testing.expectEqual(@as(i32, 5 * 3600), try parseTzOffsetStrict("5"));
+}
+
+test "parseTzOffsetStrict accepts whitespace padding" {
+    try std.testing.expectEqual(@as(i32, 8 * 3600), try parseTzOffsetStrict("  +08:00  "));
+    try std.testing.expectEqual(@as(i32, 8 * 3600), try parseTzOffsetStrict("\t+8\t"));
+}
+
+test "parseTzOffsetStrict rejects malformed input" {
+    // Empty (after trim).
+    try std.testing.expectError(error.InvalidTzOffset, parseTzOffsetStrict(""));
+    try std.testing.expectError(error.InvalidTzOffset, parseTzOffsetStrict("   "));
+    // Sign alone.
+    try std.testing.expectError(error.InvalidTzOffset, parseTzOffsetStrict("+"));
+    try std.testing.expectError(error.InvalidTzOffset, parseTzOffsetStrict("-"));
+    // Non-numeric hours.
+    try std.testing.expectError(error.InvalidTzOffset, parseTzOffsetStrict("UTC"));
+    try std.testing.expectError(error.InvalidTzOffset, parseTzOffsetStrict("Asia/Taipei"));
+    try std.testing.expectError(error.InvalidTzOffset, parseTzOffsetStrict("+abc"));
+    // Hours out of range (real timezones top out at ±14).
+    try std.testing.expectError(error.InvalidTzOffset, parseTzOffsetStrict("+25"));
+    try std.testing.expectError(error.InvalidTzOffset, parseTzOffsetStrict("-15"));
+    // Empty hours or minutes around the colon.
+    try std.testing.expectError(error.InvalidTzOffset, parseTzOffsetStrict(":30"));
+    try std.testing.expectError(error.InvalidTzOffset, parseTzOffsetStrict("+8:"));
+    try std.testing.expectError(error.InvalidTzOffset, parseTzOffsetStrict("+:30"));
+    // Minutes out of range.
+    try std.testing.expectError(error.InvalidTzOffset, parseTzOffsetStrict("+5:60"));
+    try std.testing.expectError(error.InvalidTzOffset, parseTzOffsetStrict("+5:99"));
+    // Garbage after parseable prefix (parseInt is strict, so this fails).
+    try std.testing.expectError(error.InvalidTzOffset, parseTzOffsetStrict("+8junk"));
+    try std.testing.expectError(error.InvalidTzOffset, parseTzOffsetStrict("+08:00:00"));
 }
