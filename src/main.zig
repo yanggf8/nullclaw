@@ -1406,6 +1406,7 @@ const CronAddSkillOptions = struct {
     tz_offset_s: i32 = 0,
     verification_mode: yc.cron.VerificationMode = .none,
     repair_policy: yc.cron.RepairPolicy = .none,
+    force: bool = false,
 };
 
 const CronAddShellOptions = struct {
@@ -1465,6 +1466,8 @@ fn parseCronAddSkillOptions(allocator: std.mem.Allocator, sub_args: []const []co
         } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--repair")) {
             options.repair_policy = parseCronRepairArg(sub_args[i + 1]);
             i += 1;
+        } else if (std.mem.eql(u8, sub_args[i], "--force")) {
+            options.force = true;
         } else if (std.mem.eql(u8, sub_args[i], "--skill-args") and i + 1 < sub_args.len) {
             // --skill-args <value>: the user passed the value as a quoted string after --skill-args,
             // store only the value (not the flag itself) to avoid double-prefix on re-invocation.
@@ -1652,8 +1655,12 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         \\                                Add a recurring agent cron job
         \\  add-skill <expression> <skill> [args...] [--deliver-to <id>] [--account <id>]
         \\             [--timeout <secs>] [--tz <offset>] [--verify <mode>] [--repair <policy>]
-        \\             [-- <skill-args...>]
-        \\                                Add a recurring skill cron job.
+        \\             [--force] [-- <skill-args...>]
+        \\                                Add a recurring skill cron job. Rejected if
+        \\                                the skill cannot be resolved via SKILL.md.
+        \\                                --force skips ONLY the skill-resolution check;
+        \\                                cron expression, tz, verify, repair, and skill-arg
+        \\                                safety checks still apply.
         \\                                --verify one of: none|exit_only|content_nonempty|content_has_trace|skill_contract
         \\                                --repair one of: none|retry_once|alert_only|pause_on_fail
         \\                                Use `--` to forward later args verbatim to the skill
@@ -1808,10 +1815,24 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         );
     } else if (std.mem.eql(u8, subcmd, "add-skill")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron add-skill <expression> <skill> [args...] [--deliver-to <id>] [--account <id>] [--timeout <secs>] [--tz <offset>] [--verify <mode>] [--repair <policy>] [-- <skill-args...>]\n", .{});
+            std.debug.print("Usage: nullclaw cron add-skill <expression> <skill> [args...] [--deliver-to <id>] [--account <id>] [--timeout <secs>] [--tz <offset>] [--verify <mode>] [--repair <policy>] [--force] [-- <skill-args...>]\n", .{});
             std.process.exit(1);
         }
         const options = parseCronAddSkillOptions(allocator, sub_args);
+        if (!options.force) {
+            // Preflight: confirm the skill resolves before persisting the cron entry.
+            // Prevents ghost entries that fail only at first fire (e.g., missing
+            // ~/.nullclaw/skills/<name> symlink, malformed SKILL.md Script section).
+            const resolved = yc.cron.resolveSkillExec(allocator, sub_args[2], null) catch |err| {
+                std.debug.print("Skill '{s}' is not registered or not resolvable: {s}\n", .{ sub_args[2], @errorName(err) });
+                std.debug.print("Hints:\n", .{});
+                std.debug.print("  - Symlink the source repo into ~/.nullclaw/skills/{s}\n", .{sub_args[2]});
+                std.debug.print("  - Verify SKILL.md has a '## Script' section with a script path\n", .{});
+                std.debug.print("  - Use --force to register anyway (entry will fail at first fire)\n", .{});
+                std_compat.process.exit(1);
+            };
+            allocator.free(resolved);
+        }
         const delivery: yc.cron.DeliveryConfig = if (options.deliver_to) |dt| .{
             .mode = .always,
             .channel = "telegram",
@@ -6750,6 +6771,58 @@ test "parseCronAddSkillOptions strips --skill-args flag prefix" {
     try std.testing.expect(std.mem.indexOf(u8, sa, "--mode pre-market") != null);
     // The flag "--skill-args" itself must NOT appear in stored skill_args
     try std.testing.expect(std.mem.indexOf(u8, sa, "--skill-args") == null);
+}
+
+test "parseCronAddSkillOptions recognizes --force and keeps it out of skill_args" {
+    // --force is consumed by the scheduler-side parser as a bare flag so
+    // preflight skill resolution can be bypassed. It must not leak into
+    // the script-facing skill_args, which would surprise scripts that
+    // also accept a --force option of their own.
+    const args = [_][]const u8{
+        "add-skill",
+        "0 9 * * *",
+        "demo",
+        "--force",
+        "--deliver-to",
+        "123",
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const options = parseCronAddSkillOptions(arena.allocator(), &args);
+
+    try std.testing.expect(options.force);
+    try std.testing.expectEqualStrings("123", options.deliver_to.?);
+    if (options.skill_args) |sa| {
+        try std.testing.expect(std.mem.indexOf(u8, sa, "--force") == null);
+    }
+}
+
+test "parseCronAddSkillOptions defaults force to false" {
+    const args = [_][]const u8{ "add-skill", "0 9 * * *", "demo" };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const options = parseCronAddSkillOptions(arena.allocator(), &args);
+    try std.testing.expect(!options.force);
+}
+
+test "parseCronAddSkillOptions passes --force through after -- separator" {
+    // Symmetry with --verify/--repair: a --force token AFTER the `--`
+    // separator belongs to the skill, not the scheduler. Scheduler should
+    // ignore it (force stays false) and the script should still see it.
+    const args = [_][]const u8{
+        "add-skill",
+        "0 9 * * *",
+        "demo",
+        "--",
+        "--force",
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const options = parseCronAddSkillOptions(arena.allocator(), &args);
+    try std.testing.expect(!options.force);
+    const sa = options.skill_args.?;
+    try std.testing.expect(std.mem.indexOf(u8, sa, "--force") != null);
 }
 
 test "memoryAgeDays returns correct day count" {
