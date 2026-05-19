@@ -127,6 +127,8 @@ pub const CostConfig = config_types.CostConfig;
 pub const PeripheralBoardConfig = config_types.PeripheralBoardConfig;
 pub const PeripheralsConfig = config_types.PeripheralsConfig;
 pub const HardwareConfig = config_types.HardwareConfig;
+pub const WorkspaceAuditTriageConfig = config_types.WorkspaceAuditTriageConfig;
+pub const WorkspaceAuditConfig = config_types.WorkspaceAuditConfig;
 pub const SandboxConfig = config_types.SandboxConfig;
 pub const ResourceLimitsConfig = config_types.ResourceLimitsConfig;
 pub const AuditConfig = config_types.AuditConfig;
@@ -237,6 +239,7 @@ pub const Config = struct {
     cost: CostConfig = .{},
     peripherals: PeripheralsConfig = .{},
     hardware: HardwareConfig = .{},
+    workspace_audit: WorkspaceAuditConfig = .{},
     security: SecurityConfig = .{},
     tools: ToolsConfig = .{},
     session: SessionConfig = .{},
@@ -1237,6 +1240,29 @@ pub const Config = struct {
         }
         if (self.mcp_servers.len > 0) {
             try self.writeMcpServersSection(w);
+        }
+
+        const audit_triage = self.workspace_audit.llm_triage;
+        if (audit_triage.provider != null or audit_triage.model != null or audit_triage.max_calls != null) {
+            try w.print("  \"workspace_audit\": {{\n", .{});
+            try w.print("    \"llm_triage\": {{", .{});
+            var wrote_triage_field = false;
+            if (audit_triage.provider) |provider| {
+                try w.print("\n      \"provider\": ", .{});
+                try writeJsonStr(w, provider);
+                wrote_triage_field = true;
+            }
+            if (audit_triage.model) |model| {
+                if (wrote_triage_field) try w.print(",", .{});
+                try w.print("\n      \"model\": ", .{});
+                try writeJsonStr(w, model);
+                wrote_triage_field = true;
+            }
+            if (audit_triage.max_calls) |max_calls| {
+                if (wrote_triage_field) try w.print(",", .{});
+                try w.print("\n      \"max_calls\": {d}", .{max_calls});
+            }
+            try w.print("\n    }}\n  }},\n", .{});
         }
 
         // Diagnostics (with nested otel)
@@ -4797,6 +4823,81 @@ test "parse agents.defaults.model supports explicit provider field" {
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("custom:https://example.com/api", cfg.default_provider);
     try std.testing.expectEqualStrings("meta-llama/Llama-4-70B-Instruct", cfg.default_model.?);
+}
+
+test "parse workspace audit llm triage config" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"workspace_audit":{"llm_triage":{"provider":"ollama","model":"qwen2.5-coder:7b","max_calls":12}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqualStrings("ollama", cfg.workspace_audit.llm_triage.provider.?);
+    try std.testing.expectEqualStrings("qwen2.5-coder:7b", cfg.workspace_audit.llm_triage.model.?);
+    try std.testing.expectEqual(@as(?usize, 12), cfg.workspace_audit.llm_triage.max_calls);
+}
+
+test "parse workspace audit llm triage model ref" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{
+        \\  "models": {"providers": {"openrouter": {}}},
+        \\  "workspace_audit": {"llm_triage": {"model": "openrouter/anthropic/claude-sonnet-4.6", "max_llm_calls": 3}}
+        \\}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqualStrings("openrouter", cfg.workspace_audit.llm_triage.provider.?);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4.6", cfg.workspace_audit.llm_triage.model.?);
+    try std.testing.expectEqual(@as(?usize, 3), cfg.workspace_audit.llm_triage.max_calls);
+}
+
+test "save writes workspace audit llm triage config" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+        .workspace_audit = .{
+            .llm_triage = .{
+                .provider = "ollama",
+                .model = "qwen2.5-coder:7b",
+                .max_calls = 12,
+            },
+        },
+    };
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"workspace_audit\"") != null);
+    try std.testing.expectEqualStrings("ollama", loaded.workspace_audit.llm_triage.provider.?);
+    try std.testing.expectEqualStrings("qwen2.5-coder:7b", loaded.workspace_audit.llm_triage.model.?);
+    try std.testing.expectEqual(@as(?usize, 12), loaded.workspace_audit.llm_triage.max_calls);
 }
 
 test "parse legacy default_provider with model-only primary preserves model" {

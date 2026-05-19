@@ -147,6 +147,28 @@ Common per-provider fields:
 - Sets default model route, typically `provider/vendor/model`.
 - Example: `openrouter/anthropic/claude-sonnet-4`
 
+### `workspace_audit.llm_triage`
+
+- Selects the provider/model used by `nullclaw workspace audit --llm-triage external`.
+- Does not enable LLM triage by itself; the command-line mode remains opt-in.
+- Falls back to `agents.defaults.model.primary` when omitted.
+
+Example:
+
+```json
+{
+  "workspace_audit": {
+    "llm_triage": {
+      "provider": "ollama",
+      "model": "qwen2.5-coder:7b",
+      "max_calls": 20
+    }
+  }
+}
+```
+
+You can also provide the model as a provider-prefixed ref when the provider is configured in `models.providers`, for example `"model": "openrouter/anthropic/claude-sonnet-4"`.
+
 ### `model_routes`
 
 - Optional top-level routing table for automatic per-turn model selection in `nullclaw agent`.

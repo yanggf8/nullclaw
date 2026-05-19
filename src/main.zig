@@ -1744,9 +1744,12 @@ fn printWorkspaceUsage() void {
         \\                           external sends envelopes to the agent's configured
         \\                           provider (anthropic/openai/openrouter/ollama/...)
         \\                           (raw secret values are NEVER included in envelopes)
-        \\      --llm-model NAME     Model id override (default: cfg.agents.defaults.model.primary)
-        \\      --llm-provider NAME  Provider override (default: cfg.default_provider)
-        \\      --llm-max-calls N    Maximum external LLM calls per audit (default: 50)
+        \\      --llm-model NAME     Model override (default: workspace_audit.llm_triage.model,
+        \\                           then cfg.agents.defaults.model.primary)
+        \\      --llm-provider NAME  Provider override (default: workspace_audit.llm_triage.provider,
+        \\                           then cfg.default_provider)
+        \\      --llm-max-calls N    External LLM call cap (default: workspace_audit.llm_triage.max_calls,
+        \\                           then 50)
         \\
     , .{WORKSPACE_SUBCOMMANDS}), .{});
 }
@@ -3256,6 +3259,18 @@ fn runWorkspaceEdit(allocator: std.mem.Allocator, args: []const []const u8, cfg:
     };
 }
 
+fn workspaceAuditTriageProviderName(cli_provider: ?[]const u8, cfg: *const yc.config.Config) []const u8 {
+    return cli_provider orelse cfg.workspace_audit.llm_triage.provider orelse cfg.default_provider;
+}
+
+fn workspaceAuditTriageModelName(cli_model: ?[]const u8, cfg: *const yc.config.Config) ?[]const u8 {
+    return cli_model orelse cfg.workspace_audit.llm_triage.model orelse cfg.default_model;
+}
+
+fn workspaceAuditTriageMaxLlmCalls(cfg: *const yc.config.Config) usize {
+    return cfg.workspace_audit.llm_triage.max_calls orelse yc.audit.triager.DEFAULT_MAX_LLM_CALLS;
+}
+
 fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg: yc.config.Config) !void {
     var exclude_patterns: std.ArrayListUnmanaged([]const u8) = .empty;
     defer exclude_patterns.deinit(allocator);
@@ -3263,7 +3278,9 @@ fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg
     var options = yc.workspace_audit.Options{
         .workspace_dir = cfg.workspace_dir,
     };
-    var triage_options = yc.audit.triager.Options{};
+    var triage_options = yc.audit.triager.Options{
+        .max_llm_calls = workspaceAuditTriageMaxLlmCalls(&cfg),
+    };
     var triage_provider_name: ?[]const u8 = null;
     var triage_model_name: ?[]const u8 = null;
     var owned_provider_api_key: ?[]u8 = null;
@@ -3366,17 +3383,11 @@ fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg
     options.collect_triage_context = triage_options.mode != .off;
 
     if (triage_options.mode == .external) {
-        if (triage_provider_name == null) {
-            triage_provider_name = cfg.default_provider;
-        }
-        if (triage_model_name == null) {
-            triage_model_name = cfg.default_model;
-        }
-        if (triage_model_name == null) {
-            std.debug.print("workspace audit: no model configured. Set agents.defaults.model.primary or pass --llm-model.\n", .{});
+        const provider_name = workspaceAuditTriageProviderName(triage_provider_name, &cfg);
+        const model_name = workspaceAuditTriageModelName(triage_model_name, &cfg) orelse {
+            std.debug.print("workspace audit: no model configured. Set workspace_audit.llm_triage.model, agents.defaults.model.primary, or pass --llm-model.\n", .{});
             std_compat.process.exit(1);
-        }
-        const provider_name = triage_provider_name.?;
+        };
         owned_provider_api_key = resolveWorkspaceAuditTriageApiKey(allocator, &cfg, provider_name) catch |err| switch (err) {
             error.NoApiKey => {
                 std.debug.print("workspace audit: no api_key for provider '{s}'. Set providers.{s}.api_key, an environment key, or use a local/keyless provider.\n", .{ provider_name, provider_name });
@@ -3393,7 +3404,7 @@ fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg
         if (triage_provider_holder) |*holder| {
             provider_triage_client = .{
                 .provider = holder.provider(),
-                .model = triage_model_name.?,
+                .model = model_name,
                 .temperature = 0.0,
             };
             if (provider_triage_client) |*client| {
@@ -5509,6 +5520,29 @@ test "workspace audit triage provider holder uses full provider config" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "workspace audit triage config selects provider model and budget before defaults" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .allocator = std.testing.allocator,
+        .default_provider = "openrouter",
+        .default_model = "anthropic/claude-sonnet-4.6",
+        .workspace_audit = .{
+            .llm_triage = .{
+                .provider = "ollama",
+                .model = "qwen2.5-coder:7b",
+                .max_calls = 12,
+            },
+        },
+    };
+
+    try std.testing.expectEqualStrings("ollama", workspaceAuditTriageProviderName(null, &cfg));
+    try std.testing.expectEqualStrings("qwen2.5-coder:7b", workspaceAuditTriageModelName(null, &cfg).?);
+    try std.testing.expectEqual(@as(usize, 12), workspaceAuditTriageMaxLlmCalls(&cfg));
+    try std.testing.expectEqualStrings("openai", workspaceAuditTriageProviderName("openai", &cfg));
+    try std.testing.expectEqualStrings("gpt-5.4", workspaceAuditTriageModelName("gpt-5.4", &cfg).?);
 }
 
 test "configureWindowsConsoleUtf8 is safe to call" {

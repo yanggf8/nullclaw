@@ -153,14 +153,30 @@ Three modes:
 
 - `--llm-triage off` (default) — no LLM activity; behavior identical to a baseline scan.
 - `--llm-triage dry-run` — print the envelopes that *would* be sent (to stderr) without making any network call. Use this to confirm what would leave the machine before turning the feature on.
-- `--llm-triage external` — submit envelopes through the configured provider vtable. Uses the configured primary provider and model unless overridden by `--llm-provider` / `--llm-model`. When the provider is local (e.g. Ollama) the envelopes do not leave the machine at all.
+- `--llm-triage external` — submit envelopes through the configured provider vtable. Uses `workspace_audit.llm_triage.{provider,model}` when present, then the configured primary provider/model, unless overridden by `--llm-provider` / `--llm-model`. When the provider is local (e.g. Ollama) the envelopes do not leave the machine at all.
+
+To pin audit triage to a smaller/local model without changing the normal agent model, set:
+
+```json
+{
+  "workspace_audit": {
+    "llm_triage": {
+      "provider": "ollama",
+      "model": "qwen2.5-coder:7b",
+      "max_calls": 20
+    }
+  }
+}
+```
+
+This config does not enable external LLM calls by itself; the operator still has to pass `--llm-triage external`. CLI flags `--llm-provider`, `--llm-model`, and `--llm-max-calls` override these config values for a single run.
 
 Every `external` request is appended to `~/.nullclaw/audit-log.jsonl` as `{"timestamp": ..., "envelope": ..., "verdict": ...}`. The log is append-only and intended for after-the-fact verification of what metadata was sent.
 
 ### Operator notes
 
 - Default `--llm-triage off` means no behavior change for existing scans. Enable explicitly when triaging false positives is a problem.
-- For privacy-sensitive deployments, pin the primary provider to `ollama` (or another local-only provider) before enabling `--llm-triage external`.
+- For privacy-sensitive deployments, pin `workspace_audit.llm_triage.provider` to `ollama` (or another local-only provider) before enabling `--llm-triage external`.
 - Verdict values are advisory: a `false_positive` decision drops the finding; a `real_secret` decision may adjust severity. The deterministic Stage 1 detectors remain authoritative on whether a candidate is surfaced at all.
 
 ## Next Steps

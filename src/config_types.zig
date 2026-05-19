@@ -1735,6 +1735,18 @@ pub const HardwareConfig = struct {
     workspace_datasheets: bool = false,
 };
 
+// ── Workspace audit config ──────────────────────────────────────
+
+pub const WorkspaceAuditTriageConfig = struct {
+    provider: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    max_calls: ?usize = null,
+};
+
+pub const WorkspaceAuditConfig = struct {
+    llm_triage: WorkspaceAuditTriageConfig = .{},
+};
+
 // ── Security sub-configs ────────────────────────────────────────
 
 pub const SandboxConfig = struct {
