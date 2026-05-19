@@ -9950,7 +9950,7 @@ test "jsonWrapChallenge escapes malicious challenge value" {
 
 test "probeGatewayAddressAvailable returns AddressInUse when port is bound" {
     const test_addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
-    var listener = try test_addr.listen(.{ .reuse_address = true });
+    var listener = try test_addr.listen(.{ .reuse_address = false });
     defer listener.deinit();
 
     // Regression: the gateway probe must not silently treat an active listener
@@ -9961,7 +9961,7 @@ test "probeGatewayAddressAvailable returns AddressInUse when port is bound" {
 test "run returns AddressInUse when port is already bound" {
     // Find an available port by binding to port 0
     const test_addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
-    var listener = try test_addr.listen(.{ .reuse_address = true });
+    var listener = try test_addr.listen(.{ .reuse_address = false });
     defer listener.deinit();
 
     // Get the actual port that was assigned
