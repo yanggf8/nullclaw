@@ -79,7 +79,10 @@ optional `redact_email`, `redact_phone`, `redact_card`, `redact_id`, and
 disabled categories pass through unchanged.
 
 The model-facing `sqlite_query` tool always returns redacted results. Raw
-sensitive SQLite output is not exposed through the agent tool schema.
+sensitive SQLite output is not exposed through the agent tool schema. It also
+rejects common text transform / encoding functions such as `hex(...)` and
+`substr(...)`, because those can turn PII into a form the text redactor cannot
+recover after query execution.
 
 Each call uses a fresh one-way redactor, so placeholder counters restart from
 `[EMAIL_1]` / `[PHONE_1]` inside that call and no plaintext reverse map is kept

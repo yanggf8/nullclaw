@@ -36,6 +36,7 @@ pub const SqliteQueryTool = struct {
     pub const tool_description =
         "Run a read-only SQL query against a SQLite database in the workspace. " ++
         "Only SELECT, WITH, and PRAGMA table_info statements are permitted. " ++
+        "Common text transform / encoding functions that can bypass redaction are rejected. " ++
         "Returns a PII-redacted JSON object {columns, rows, row_count, truncated}. " ++
         "Bounded by max_rows and an internal byte cap. Multi-statement input is rejected.";
     pub const tool_params =
@@ -166,9 +167,17 @@ fn classifyStatement(query: []const u8) ?[]const u8 {
     }
 
     const first = firstKeyword(trimmed) orelse return "could not parse first keyword";
-    if (eqIgnoreCase(first, "SELECT")) return null;
+    if (eqIgnoreCase(first, "SELECT")) {
+        if (findForbiddenRedactionBypassFunction(trimmed)) |_| {
+            return "SQL text transform / encoding functions are not allowed in sqlite_query";
+        }
+        return null;
+    }
     if (eqIgnoreCase(first, "WITH")) {
         // CTE — accept; sqlite3_stmt_readonly will catch any write inside it
+        if (findForbiddenRedactionBypassFunction(trimmed)) |_| {
+            return "SQL text transform / encoding functions are not allowed in sqlite_query";
+        }
         return null;
     }
     if (eqIgnoreCase(first, "PRAGMA")) {
@@ -186,6 +195,119 @@ fn classifyStatement(query: []const u8) ?[]const u8 {
         return "only PRAGMA table_info is allowed";
     }
     return "only SELECT, WITH, or PRAGMA table_info statements are allowed";
+}
+
+fn skipSqlQuoted(sql: []const u8, start: usize, quote: u8) usize {
+    var i = start + 1;
+    while (i < sql.len) : (i += 1) {
+        if (sql[i] != quote) continue;
+        if (i + 1 < sql.len and sql[i + 1] == quote) {
+            i += 1;
+            continue;
+        }
+        return i + 1;
+    }
+    return sql.len;
+}
+
+fn skipSqlBracketIdentifier(sql: []const u8, start: usize) usize {
+    var i = start + 1;
+    while (i < sql.len) : (i += 1) {
+        if (sql[i] == ']') return i + 1;
+    }
+    return sql.len;
+}
+
+fn skipSqlTrivia(sql: []const u8, start: usize) usize {
+    var i = start;
+    while (i < sql.len) {
+        const ch = sql[i];
+        if (ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n') {
+            i += 1;
+            continue;
+        }
+        if (i + 1 < sql.len and ch == '-' and sql[i + 1] == '-') {
+            i += 2;
+            while (i < sql.len and sql[i] != '\n') i += 1;
+            continue;
+        }
+        if (i + 1 < sql.len and ch == '/' and sql[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < sql.len and !(sql[i] == '*' and sql[i + 1] == '/')) i += 1;
+            if (i + 1 < sql.len) i += 2;
+            continue;
+        }
+        return i;
+    }
+    return i;
+}
+
+fn isSqlIdentifierStart(ch: u8) bool {
+    return std.ascii.isAlphabetic(ch) or ch == '_';
+}
+
+fn isSqlIdentifierContinue(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_';
+}
+
+fn isForbiddenRedactionBypassFunction(name: []const u8) bool {
+    const functions = [_][]const u8{
+        "hex",
+        "quote",
+        "printf",
+        "substr",
+        "substring",
+        "replace",
+        "unicode",
+        "char",
+        "lower",
+        "upper",
+        "json_quote",
+    };
+    for (functions) |function_name| {
+        if (eqIgnoreCase(name, function_name)) return true;
+    }
+    return false;
+}
+
+fn findForbiddenRedactionBypassFunction(sql: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < sql.len) {
+        const ch = sql[i];
+        if (ch == '\'' or ch == '"' or ch == '`') {
+            i = skipSqlQuoted(sql, i, ch);
+            continue;
+        }
+        if (ch == '[') {
+            i = skipSqlBracketIdentifier(sql, i);
+            continue;
+        }
+        if (i + 1 < sql.len and ch == '-' and sql[i + 1] == '-') {
+            i += 2;
+            while (i < sql.len and sql[i] != '\n') i += 1;
+            continue;
+        }
+        if (i + 1 < sql.len and ch == '/' and sql[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < sql.len and !(sql[i] == '*' and sql[i + 1] == '/')) i += 1;
+            if (i + 1 < sql.len) i += 2;
+            continue;
+        }
+        if (!isSqlIdentifierStart(ch)) {
+            i += 1;
+            continue;
+        }
+
+        const start = i;
+        i += 1;
+        while (i < sql.len and isSqlIdentifierContinue(sql[i])) i += 1;
+        const ident = sql[start..i];
+        const call_pos = skipSqlTrivia(sql, i);
+        if (call_pos < sql.len and sql[call_pos] == '(' and isForbiddenRedactionBypassFunction(ident)) {
+            return ident;
+        }
+    }
+    return null;
 }
 
 fn stripCommentsAndWhitespace(s: []const u8) []const u8 {
@@ -792,6 +914,29 @@ test "sqlite_query: redacts sensitive result values by default" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "[TOKEN_1]") != null);
 }
 
+test "sqlite_query: rejects SQL transforms that can bypass redaction" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/sensitive.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populateSensitive(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"sensitive.db\",\"query\":\"SELECT hex(email), substr(card, 1, 4) FROM sensitive\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+
+    // Regression: output redaction cannot recover PII once SQL has encoded or
+    // sliced it, so reject these transforms before SQLite prepares the query.
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "transform") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "616C696365406578616D706C652E636F6D") == null);
+}
+
 test "sqlite_query: include_sensitive is rejected in agent tool context" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -902,6 +1047,8 @@ test "classifyStatement: accepts SELECT" {
     try std.testing.expect(classifyStatement("SELECT 1") == null);
     try std.testing.expect(classifyStatement("  -- comment\nSELECT 1") == null);
     try std.testing.expect(classifyStatement("/* foo */ select * from t") == null);
+    try std.testing.expect(classifyStatement("SELECT count(*) FROM t") == null);
+    try std.testing.expect(classifyStatement("SELECT 'hex(email)' AS literal FROM t") == null);
 }
 
 test "classifyStatement: rejects keyword-prefixed garbage" {
@@ -923,6 +1070,13 @@ test "classifyStatement: rejects PRAGMA look-alikes" {
     try std.testing.expect(classifyStatement("PRAGMA table_info") == null);
     try std.testing.expect(classifyStatement("PRAGMA table_info(u)") == null);
     try std.testing.expect(classifyStatement("PRAGMA table_info ( u )") == null);
+}
+
+test "classifyStatement: rejects redaction-bypass transforms" {
+    try std.testing.expect(classifyStatement("SELECT hex(email) FROM sensitive") != null);
+    try std.testing.expect(classifyStatement("SELECT quote(api_token) FROM sensitive") != null);
+    try std.testing.expect(classifyStatement("SELECT substr(email, 1, 4) FROM sensitive") != null);
+    try std.testing.expect(classifyStatement("WITH s AS (SELECT email FROM sensitive) SELECT upper(email) FROM s") != null);
 }
 
 test "sqlite_query: max_rows <= 0 explicitly rejected" {
