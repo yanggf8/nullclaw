@@ -152,6 +152,9 @@ pub const CronJob = struct {
     delete_after_run: bool = false,
     created_at_s: i64 = 0,
     last_output: ?[]const u8 = null,
+    /// Tail of the last failing run's stderr (up to ~1KB). Mirrors the
+    /// field on the legacy `cron.CronJob`. Cleared on the next success.
+    last_stderr: ?[]const u8 = null,
     delivery: DeliveryConfig = .{},
     tz_offset_s: i32 = 0,
     verification_mode: VerificationMode = .none,

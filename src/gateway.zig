@@ -3909,7 +3909,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         if (db_path_opt) |dp| {
                             const db2 = cron_mod.openCronDbAtPath(dp) catch return;
                             defer cron_mod.closeCronDb(db2);
-                            cron_mod.dbCompleteJob(db2, job_id, row_id, ts, status_str, output_str, dar, run_result_opt, trace_id, false, source) catch {};
+                            cron_mod.dbCompleteJob(db2, job_id, row_id, ts, status_str, output_str, dar, run_result_opt, trace_id, false, source, null) catch {};
                         }
                     } else if (be_opt.*) |*be| {
                         be.backend().complete(job_id, row_id, ts, status_str, output_str, delivered) catch |e|
@@ -3917,7 +3917,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     } else if (db_path_opt) |dp| {
                         const db2 = cron_mod.openCronDbAtPath(dp) catch return;
                         defer cron_mod.closeCronDb(db2);
-                        cron_mod.dbCompleteJob(db2, job_id, row_id, ts, status_str, output_str, dar, null, trace_id, false, source) catch {};
+                        cron_mod.dbCompleteJob(db2, job_id, row_id, ts, status_str, output_str, dar, null, trace_id, false, source, null) catch {};
                     }
                 }
             }.call;

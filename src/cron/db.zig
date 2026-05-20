@@ -282,7 +282,7 @@ pub const DbCronBackend = struct {
         // We need delete_after_run to decide the completion path.
         // Load it cheaply from the DB.
         const dar = try dbGetDeleteAfterRun(db, id);
-        try cron.dbCompleteJob(db, id, row_id, now, status, output, dar, null, null, false, null);
+        try cron.dbCompleteJob(db, id, row_id, now, status, output, dar, null, null, false, null, null);
     }
 
     fn vtableResetInProgress(ptr: *anyopaque) anyerror!void {
@@ -523,7 +523,7 @@ fn dbApplyPatch(db: *c.sqlite3, id: []const u8, patch: types.CronJobPatch) !void
     tx_open = false;
 }
 
-/// Load a full CronJob by ID (includes all columns + last_output).
+/// Load a full CronJob by ID (includes all columns + last_output + last_stderr).
 /// Returns null if not found. All strings allocated into `allocator`.
 fn dbLoadJobFull(db: *c.sqlite3, allocator: std.mem.Allocator, id: []const u8) !?types.CronJob {
     const sql =
@@ -531,7 +531,8 @@ fn dbLoadJobFull(db: *c.sqlite3, allocator: std.mem.Allocator, id: []const u8) !
         "next_run_secs, last_run_secs, last_status, paused, one_shot, " ++
         "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
         "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs, " ++
-        "delivery_best_effort, session_target, skill_name, skill_args, tz_offset_s " ++
+        "delivery_best_effort, session_target, skill_name, skill_args, tz_offset_s, " ++
+        "last_stderr " ++
         "FROM cron_jobs WHERE id=?1";
 
     var stmt: ?*c.sqlite3_stmt = null;
@@ -587,6 +588,7 @@ fn dbLoadJobFull(db: *c.sqlite3, allocator: std.mem.Allocator, id: []const u8) !
         .skill_name = try colTextOpt(stmt, 23, allocator),
         .skill_args = try colTextOpt(stmt, 24, allocator),
         .tz_offset_s = @intCast(c.sqlite3_column_int(stmt, 25)),
+        .last_stderr = try colTextOpt(stmt, 26, allocator),
     };
 }
 
@@ -846,8 +848,8 @@ fn dbSaveJobDirect(db: *c.sqlite3, job: *const cron.CronJob) !void {
         "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs, " ++
         "delivery_best_effort, session_target, skill_name, skill_args, tz_offset_s, " ++
         "delivery_peer_kind, delivery_peer_id, delivery_thread_id, " ++
-        "verification_mode, repair_policy) " ++
-        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31)";
+        "verification_mode, repair_policy, last_stderr) " ++
+        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)";
     var stmt: ?*c.sqlite3_stmt = null;
     var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
     if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -896,6 +898,7 @@ fn dbSaveJobDirect(db: *c.sqlite3, job: *const cron.CronJob) !void {
     _ = c.sqlite3_bind_text(stmt, 30, vm_str.ptr, @intCast(vm_str.len), SQLITE_STATIC);
     const rp_str = job.repair_policy.asStr();
     _ = c.sqlite3_bind_text(stmt, 31, rp_str.ptr, @intCast(rp_str.len), SQLITE_STATIC);
+    if (job.last_stderr) |le| _ = c.sqlite3_bind_text(stmt, 32, le.ptr, @intCast(le.len), SQLITE_STATIC) else _ = c.sqlite3_bind_null(stmt, 32);
 
     rc = c.sqlite3_step(stmt);
     if (rc != c.SQLITE_DONE) return error.StepFailed;

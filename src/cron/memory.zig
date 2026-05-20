@@ -397,6 +397,7 @@ fn copyJobToTypes(allocator: std.mem.Allocator, job: cron.CronJob) !types.CronJo
         .last_run_secs = job.last_run_secs,
         .last_status = if (job.last_status) |s| try allocator.dupe(u8, s) else null,
         .last_output = if (job.last_output) |o| try allocator.dupe(u8, o) else null,
+        .last_stderr = if (job.last_stderr) |e| try allocator.dupe(u8, e) else null,
         .created_at_s = job.created_at_s,
         .tz_offset_s = job.tz_offset_s,
     };

@@ -332,11 +332,29 @@ pub const CronJob = struct {
     delete_after_run: bool = false,
     created_at_s: i64 = 0,
     last_output: ?[]const u8 = null,
+    /// Tail of the last failing run's stderr (up to LAST_STDERR_TAIL_BYTES).
+    /// Captured only when last_status == "error"; cleared on the next success.
+    /// Makes pre-skill failures (FileNotFoundError, permission denied, etc.)
+    /// visible via `cron show` without requiring trace-marker reads.
+    last_stderr: ?[]const u8 = null,
     delivery: DeliveryConfig = .{},
     tz_offset_s: i32 = 0,
     verification_mode: VerificationMode = .none,
     repair_policy: RepairPolicy = .none,
 };
+
+/// Maximum bytes of stderr captured into `CronJob.last_stderr`.
+/// Tuned for "enough to identify common failures" (PATH errors, missing
+/// modules, auth failures) without unbounded growth on chatty skills.
+pub const LAST_STDERR_TAIL_BYTES: usize = 1024;
+
+/// Copy the trailing `LAST_STDERR_TAIL_BYTES` of `stderr` to an owned slice.
+/// Returns null on OOM. Caller frees on success.
+pub fn captureStderrTail(allocator: std.mem.Allocator, stderr: []const u8) ?[]const u8 {
+    if (stderr.len == 0) return null;
+    const start = if (stderr.len > LAST_STDERR_TAIL_BYTES) stderr.len - LAST_STDERR_TAIL_BYTES else 0;
+    return allocator.dupe(u8, stderr[start..]) catch null;
+}
 
 /// Duration unit for "once" delay parsing.
 pub const DurationUnit = enum {
@@ -664,6 +682,7 @@ pub const CronScheduler = struct {
         if (job.skill_name) |sn| self.allocator.free(sn);
         if (job.skill_args) |sa| self.allocator.free(sa);
         if (job.last_output) |output| self.allocator.free(output);
+        if (job.last_stderr) |stderr_tail| self.allocator.free(stderr_tail);
         if (job.delivery.channel_owned) {
             if (job.delivery.channel) |channel| self.allocator.free(channel);
         }
@@ -1183,6 +1202,15 @@ pub const CronScheduler = struct {
                         self.allocator.free(result.stdout);
                         break :blk null;
                     };
+
+                    // Capture stderr tail on failure so operators can diagnose
+                    // pre-skill errors (FileNotFoundError, EACCES, etc.) via
+                    // `cron show`. Cleared on success to bound storage.
+                    if (job.last_stderr) |old| self.allocator.free(old);
+                    job.last_stderr = if (!success and result.stderr.len > 0)
+                        captureStderrTail(self.allocator, result.stderr)
+                    else
+                        null;
 
                     if (out_bus) |b| {
                         const output = job.last_output orelse "";
@@ -2409,6 +2437,7 @@ const CRON_TABLE_SQL =
     \\  last_run_secs       INTEGER,
     \\  last_status         TEXT,
     \\  last_output         TEXT,
+    \\  last_stderr         TEXT,
     \\  paused              INTEGER NOT NULL DEFAULT 0,
     \\  one_shot            INTEGER NOT NULL DEFAULT 0,
     \\  delete_after_run    INTEGER NOT NULL DEFAULT 0,
@@ -2506,6 +2535,9 @@ pub fn ensureCronTable(db: *c.sqlite3) !void {
     // Migration: add observability columns for per-job verification and repair policy.
     _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN verification_mode TEXT NOT NULL DEFAULT 'none'", null, null, null);
     _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN repair_policy TEXT NOT NULL DEFAULT 'none'", null, null, null);
+    // Migration: add last_stderr column so pre-skill failures (FileNotFoundError,
+    // EACCES, etc.) surface via `cron show` without trace-marker reads.
+    _ = c.sqlite3_exec(db, "ALTER TABLE cron_jobs ADD COLUMN last_stderr TEXT", null, null, null);
     try ensureRunQueueTable(db);
     try ensureCronRunsTable(db);
 }
@@ -2520,8 +2552,8 @@ fn dbSaveJob(db: *c.sqlite3, job: *const CronJob) !void {
         "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs, " ++
         "delivery_best_effort, session_target, skill_name, skill_args, tz_offset_s, " ++
         "delivery_peer_kind, delivery_peer_id, delivery_thread_id, " ++
-        "verification_mode, repair_policy) " ++
-        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31)";
+        "verification_mode, repair_policy, last_stderr) " ++
+        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)";
 
     var stmt: ?*c.sqlite3_stmt = null;
     var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
@@ -2629,6 +2661,11 @@ fn dbSaveJob(db: *c.sqlite3, job: *const CronJob) !void {
     _ = c.sqlite3_bind_text(stmt, 30, vm_str.ptr, @intCast(vm_str.len), SQLITE_STATIC);
     const rp_str = job.repair_policy.asStr();
     _ = c.sqlite3_bind_text(stmt, 31, rp_str.ptr, @intCast(rp_str.len), SQLITE_STATIC);
+    if (job.last_stderr) |le| {
+        _ = c.sqlite3_bind_text(stmt, 32, le.ptr, @intCast(le.len), SQLITE_STATIC);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 32);
+    }
 
     rc = c.sqlite3_step(stmt);
     if (rc != c.SQLITE_DONE) return error.StepFailed;
@@ -2777,7 +2814,8 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
         "delete_after_run, enabled, delivery_mode, delivery_channel, " ++
         "delivery_account_id, delivery_to, created_at_s, last_output, timeout_secs, " ++
         "skill_name, skill_args, delivery_best_effort, tz_offset_s, " ++
-        "session_target, delivery_peer_kind, delivery_peer_id, delivery_thread_id " ++
+        "session_target, delivery_peer_kind, delivery_peer_id, delivery_thread_id, " ++
+        "last_stderr " ++
         "FROM cron_jobs ORDER BY rowid ASC";
 
     var stmt: ?*c.sqlite3_stmt = null;
@@ -2883,6 +2921,7 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
         };
         const delivery_peer_id = try dbColumnTextOpt(stmt, 27, allocator);
         const delivery_thread_id = try dbColumnTextOpt(stmt, 28, allocator);
+        const last_stderr_opt = try dbColumnTextOpt(stmt, 29, allocator);
 
         // Normalize last_status to a static literal ("ok"/"error"/null).
         // freeJobOwned does NOT free last_status, so we must never heap-allocate it.
@@ -2910,6 +2949,7 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
             .delete_after_run = delete_after_run,
             .created_at_s = created_at_s,
             .last_output = last_output_opt,
+            .last_stderr = last_stderr_opt,
             .skill_name = skill_name_opt,
             .skill_args = skill_args_opt,
             .session_target = session_target,
@@ -3265,6 +3305,9 @@ fn appendCronJobJson(
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(buf, allocator, "last_output");
     try appendNullableString(buf, allocator, job.last_output);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "last_stderr");
+    try appendNullableString(buf, allocator, job.last_stderr);
 
     try buf.appendSlice(allocator, "}");
 }
@@ -5237,7 +5280,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             const raw_skill_cmd = resolveSkillExec(spec_alloc, spec.skill_name, spec.skill_args) catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: skill resolution failed: {s}\n", .{@errorName(err)}) catch "error: skill resolution failed\n";
                 stderr_h.writeAll(m) catch {};
-                dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_skill") catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_skill", null) catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
             const skill_cmd = raw_skill_cmd;
@@ -5246,7 +5289,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             var skill_env = buildManualSkillChildEnv(spec_alloc, run_trace_id, spec.timeout_secs) catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: env setup failed: {s}\n", .{@errorName(err)}) catch "error: env setup failed\n";
                 stderr_h.writeAll(m) catch {};
-                dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_skill") catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_skill", null) catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
             defer skill_env.deinit();
@@ -5263,7 +5306,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             skill_child.spawn() catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: skill spawn failed: {s}\n", .{@errorName(err)}) catch "error: skill spawn failed\n";
                 stderr_h.writeAll(m) catch {};
-                dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_skill") catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_skill", null) catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
 
@@ -5363,6 +5406,12 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 skill_stderr.items
             else
                 null;
+            const stderr_tail_for_db: ?[]const u8 = if (!skill_ok and skill_stderr.items.len > 0)
+                captureStderrTail(allocator, skill_stderr.items)
+            else
+                null;
+            defer if (stderr_tail_for_db) |t| allocator.free(t);
+
             dbCompleteJob(
                 db,
                 spec.id,
@@ -5375,6 +5424,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 run_trace_id,
                 true, // manual=1
                 "cron_manual_skill",
+                stderr_tail_for_db,
             ) catch {};
 
             if (run_result.verified != 1) {
@@ -5403,7 +5453,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             }) catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: shell spawn failed: {s}\n", .{@errorName(err)}) catch "error: shell spawn failed\n";
                 stderr_h.writeAll(m) catch {};
-                dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_shell") catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_shell", null) catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
             var current_stdout = result.stdout;
@@ -5451,6 +5501,11 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             if (current_stdout.len > 0) stdout_h.writeAll(current_stdout) catch {};
             if (current_stderr.len > 0) stderr_h.writeAll(current_stderr) catch {};
             const status_str: []const u8 = if (current_exit_code == 0) "ok" else "error";
+            const stderr_tail_for_db: ?[]const u8 = if (current_exit_code != 0 and current_stderr.len > 0)
+                captureStderrTail(allocator, current_stderr)
+            else
+                null;
+            defer if (stderr_tail_for_db) |t| allocator.free(t);
             dbCompleteJob(
                 db,
                 spec.id,
@@ -5463,6 +5518,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 run_trace_id,
                 true,
                 "cron_manual_shell",
+                stderr_tail_for_db,
             ) catch {};
             std.process.exit(current_exit_code);
         },
@@ -5479,7 +5535,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             }) catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: agent run failed: {s}\n", .{@errorName(err)}) catch "error: agent run failed\n";
                 stderr_h.writeAll(m) catch {};
-                dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_agent") catch {};
+                dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, execErrorRunResult(), run_trace_id, true, "cron_manual_agent", null) catch {};
                 std.process.exit(CronRunExit.internal_error);
             };
             var final_output = result.output;
@@ -5531,6 +5587,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 run_trace_id,
                 true,
                 "cron_manual_agent",
+                null, // runAgentJob does not expose stderr separately
             ) catch {};
             std.process.exit(if (!current_timed_out and current_exit_code == 0) CronRunExit.ok else CronRunExit.internal_error);
         },
@@ -5669,7 +5726,7 @@ pub fn cliShowJob(
         "last_run_secs, last_status, paused, enabled, one_shot, " ++
         "delivery_mode, delivery_channel, delivery_account_id, delivery_to, " ++
         "timeout_secs, session_target, skill_name, skill_args, " ++
-        "verification_mode, repair_policy, tz_offset_s, created_at_s " ++
+        "verification_mode, repair_policy, tz_offset_s, created_at_s, last_stderr " ++
         "FROM cron_jobs WHERE id=?1";
     var stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(db, spec_sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
@@ -5715,6 +5772,7 @@ pub fn cliShowJob(
     const repair_policy = (try dbColumnTextOpt(stmt, 20, a)) orelse "none";
     const tz_offset_s = c.sqlite3_column_int(stmt, 21);
     const created_at = c.sqlite3_column_int64(stmt, 22);
+    const last_stderr_opt = try dbColumnTextOpt(stmt, 23, a);
 
     const limit = if (runs_limit == 0) @as(usize, 10) else runs_limit;
 
@@ -5746,6 +5804,8 @@ pub fn cliShowJob(
         } else try buf.appendSlice(allocator, "null");
         try buf.appendSlice(allocator, ",\"last_status\":");
         if (last_status) |s| try appendJsonStr(&buf, allocator, s) else try buf.appendSlice(allocator, "null");
+        try buf.appendSlice(allocator, ",\"last_stderr\":");
+        if (last_stderr_opt) |s| try appendJsonStr(&buf, allocator, s) else try buf.appendSlice(allocator, "null");
         try buf.appendSlice(allocator, ",\"command\":");
         if (command_opt) |s| try appendJsonStr(&buf, allocator, s) else try buf.appendSlice(allocator, "null");
         try buf.appendSlice(allocator, ",\"prompt\":");
@@ -5831,6 +5891,11 @@ pub fn cliShowJob(
         }
         try logCronShowTimestampLines(allocator, "last run", last_run_secs_raw, tz_offset_s);
         log.info("Last status:  {s}", .{ls});
+        if (last_stderr_opt) |stderr_tail| {
+            if (stderr_tail.len > 0) {
+                log.info("Last stderr:  {s}", .{stderr_tail});
+            }
+        }
         log.info("Enabled:      {}   Paused: {}{s}   One-shot: {}", .{ enabled, paused, pause_suffix, one_shot });
     } else {
         log.info("Last run:     (never)", .{});
@@ -7791,6 +7856,7 @@ pub fn dbCompleteJob(
     trace_id: ?[]const u8,
     manual: bool,
     source: ?[]const u8,
+    last_stderr: ?[]const u8,
 ) !void {
     if (delete_after_run) {
         const del_sql = "DELETE FROM cron_jobs WHERE id=?1";
@@ -7802,7 +7868,7 @@ pub fn dbCompleteJob(
         }
     } else {
         const upd_sql =
-            "UPDATE cron_jobs SET last_run_secs=?1, last_status=?2, last_output=?3 WHERE id=?4";
+            "UPDATE cron_jobs SET last_run_secs=?1, last_status=?2, last_output=?3, last_stderr=?4 WHERE id=?5";
         var upd_stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db, upd_sql, -1, &upd_stmt, null) == c.SQLITE_OK) {
             _ = c.sqlite3_bind_int64(upd_stmt, 1, last_run_secs);
@@ -7812,7 +7878,12 @@ pub fn dbCompleteJob(
             } else {
                 _ = c.sqlite3_bind_null(upd_stmt, 3);
             }
-            _ = c.sqlite3_bind_text(upd_stmt, 4, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
+            if (last_stderr) |e| {
+                _ = c.sqlite3_bind_text(upd_stmt, 4, e.ptr, @intCast(e.len), SQLITE_STATIC);
+            } else {
+                _ = c.sqlite3_bind_null(upd_stmt, 4);
+            }
+            _ = c.sqlite3_bind_text(upd_stmt, 5, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
             _ = c.sqlite3_step(upd_stmt);
             _ = c.sqlite3_finalize(upd_stmt);
         }
@@ -8478,6 +8549,39 @@ pub fn dbGetJobOutputJson(db: *c.sqlite3, job_id: []const u8, buf: *std.ArrayLis
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
+
+test "captureStderrTail returns null for empty stderr" {
+    try std.testing.expectEqual(@as(?[]const u8, null), captureStderrTail(std.testing.allocator, ""));
+}
+
+test "captureStderrTail returns full stderr when below cap" {
+    const short: []const u8 = "FileNotFoundError: persona-core";
+    const got = captureStderrTail(std.testing.allocator, short) orelse return error.UnexpectedNull;
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings(short, got);
+}
+
+test "captureStderrTail keeps only trailing bytes when over cap" {
+    // Build a stderr that is LAST_STDERR_TAIL_BYTES + 256 bytes long. The tail
+    // we keep must be the last LAST_STDERR_TAIL_BYTES bytes — preserving the
+    // operationally-important error context that appears just before the
+    // process exited.
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try buf.appendNTimes(std.testing.allocator, 'X', LAST_STDERR_TAIL_BYTES + 256);
+    const marker = "TAILMARK";
+    try buf.appendSlice(std.testing.allocator, marker);
+
+    const got = captureStderrTail(std.testing.allocator, buf.items) orelse return error.UnexpectedNull;
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expectEqual(LAST_STDERR_TAIL_BYTES, got.len);
+    try std.testing.expect(std.mem.endsWith(u8, got, marker));
+    // The tail-marker tells us the END is preserved; absence of leading 'X'
+    // garbage matters less, but assert one byte from the discarded prefix is
+    // gone to lock the behavior.
+    try std.testing.expect(std.mem.count(u8, got, "X") < buf.items.len - marker.len);
+}
 
 test "parseDuration minutes" {
     try std.testing.expectEqual(@as(i64, 1800), try parseDuration("30m"));
@@ -10451,7 +10555,7 @@ test "dbCompleteJob writes result and removes queue row" {
     const dequeued = (try dbDequeueNextJob(db, std.testing.allocator)).?;
     defer std.testing.allocator.free(dequeued.job_id);
 
-    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", "output text", false, null, null, false, null);
+    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", "output text", false, null, null, false, null, null);
 
     // Queue should be empty.
     var stmt: ?*c.sqlite3_stmt = null;
@@ -10628,7 +10732,7 @@ test "dbCompleteJob inserts cron_runs history row" {
     const dequeued = (try dbDequeueNextJob(db, std.testing.allocator)).?;
     defer std.testing.allocator.free(dequeued.job_id);
 
-    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", "hello output", false, null, null, false, null);
+    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", "hello output", false, null, null, false, null, null);
 
     // cron_runs should have one row for this job.
     var stmt: ?*c.sqlite3_stmt = null;
@@ -10661,7 +10765,7 @@ test "dbListRunsJson returns JSON array of runs" {
 
     const dequeued = (try dbDequeueNextJob(db, std.testing.allocator)).?;
     defer std.testing.allocator.free(dequeued.job_id);
-    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", "out", false, null, null, false, null);
+    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", "out", false, null, null, false, null, null);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
@@ -10788,7 +10892,7 @@ test "cron_runs pruning removes rows older than 30 days" {
     _ = try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now);
     const dequeued = (try dbDequeueNextJob(db, std.testing.allocator)).?;
     defer std.testing.allocator.free(dequeued.job_id);
-    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", null, false, null, null, false, null);
+    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "ok", null, false, null, null, false, null, null);
 
     // Only the fresh row should remain.
     var cnt_stmt: ?*c.sqlite3_stmt = null;
@@ -10825,7 +10929,7 @@ test "cron_runs started_at differs from finished_at when worker delays" {
 
     // Simulate a job that takes time: finish_time > dequeue_time.
     const finish_time = dequeue_time + 5;
-    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, finish_time, "ok", null, false, null, null, false, null);
+    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, finish_time, "ok", null, false, null, null, false, null, null);
 
     // started_at should be <= dequeue_time, finished_at should be finish_time.
     var s: ?*c.sqlite3_stmt = null;
@@ -11394,7 +11498,7 @@ test "dbCompleteJob shell run with status=error writes verified=0 and is matched
     defer std.testing.allocator.free(dequeued.job_id);
 
     // Shell completion: run_result=null, status="error" — simulates a non-zero exit.
-    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "error", null, false, null, null, false, null);
+    try dbCompleteJob(db, dequeued.job_id, dequeued.queue_row_id, now, "error", null, false, null, null, false, null, null);
 
     // Verify: the run row has verified=0 (because run_result was null) and status='error'.
     var stmt: ?*c.sqlite3_stmt = null;
@@ -11457,6 +11561,7 @@ test "dbCompleteJob persists trace_id when run_result is null" {
         "trace-success",
         false,
         null,
+        null,
     );
 
     var stmt: ?*c.sqlite3_stmt = null;
@@ -11514,6 +11619,7 @@ test "dbCompleteJob persists run_result classification fields for exec errors" {
         execErrorRunResult(),
         "trace-exec-error",
         true,
+        null,
         null,
     );
 
@@ -11580,6 +11686,7 @@ test "dbCompleteJob persists source column" {
         "trace-source",
         false,
         test_source,
+        null,
     );
 
     var stmt: ?*c.sqlite3_stmt = null;
