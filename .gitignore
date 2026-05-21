@@ -21,9 +21,14 @@ result
 config.json
 config.signal.json
 
-# IDE configurations
+# Local scratch
+tmp/
+
+# IDE / agent tooling
 .idea/
 .vscode/
 .cursor/
 .trae/
 .codebuddy/
+.codex
+.antigravitycli/
