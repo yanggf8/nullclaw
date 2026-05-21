@@ -3879,17 +3879,20 @@ fn printWeeklyTable(allocator: std.mem.Allocator, all_jobs: []const CronJob, now
         };
 
         // Past slots: most-recent gets last_status, earlier ones get [done].
-        const suffix: []const u8 = if (entry.fire_time >= now)
+        const slot_suffix: []const u8 = if (entry.fire_time >= now)
             ""
         else if (most_recent_past[entry.job_idx] == ei)
             if (job.last_status) |s| if (std.mem.eql(u8, s, "ok")) " [ok]" else " [error]" else " [done]"
         else
             " [done]";
+        const last_status = job.last_status orelse "never";
+        var job_tz_buf: [16]u8 = undefined;
+        const job_tz_label = formatUtcOffsetLabel(job.tz_offset_s, &job_tz_buf);
 
         if (detail.len > 0) {
-            try writer.print("  {s} {s}  [{s}] {s}  {s}{s}\n", .{ dow, time_str, job.job_type.asStr(), label, detail, suffix });
+            try writer.print("  {s} {s}  [{s}] {s}  {s}{s}  (tz: {s}, last: {s})\n", .{ dow, time_str, job.job_type.asStr(), label, detail, slot_suffix, job_tz_label, last_status });
         } else {
-            try writer.print("  {s} {s}  [{s}] {s}{s}\n", .{ dow, time_str, job.job_type.asStr(), label, suffix });
+            try writer.print("  {s} {s}  [{s}] {s}{s}  (tz: {s}, last: {s})\n", .{ dow, time_str, job.job_type.asStr(), label, slot_suffix, job_tz_label, last_status });
         }
     }
 }
@@ -4127,11 +4130,13 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, sho
             };
             const status = job.last_status orelse "never";
             const done: []const u8 = if (fire_time < now) " [done]" else "";
+            var job_tz_buf: [16]u8 = undefined;
+            const job_tz_label = formatUtcOffsetLabel(job.tz_offset_s, &job_tz_buf);
 
             if (detail.len > 0) {
-                log.info("  {s}  [{s}] {s}  {s}  (status: {s}{s})", .{ time_str, job.job_type.asStr(), label, detail, status, done });
+                log.info("  {s}  [{s}] {s}  {s}  (tz: {s}, last: {s}{s})", .{ time_str, job.job_type.asStr(), label, detail, job_tz_label, status, done });
             } else {
-                log.info("  {s}  [{s}] {s}  (status: {s}{s})", .{ time_str, job.job_type.asStr(), label, status, done });
+                log.info("  {s}  [{s}] {s}  (tz: {s}, last: {s}{s})", .{ time_str, job.job_type.asStr(), label, job_tz_label, status, done });
             }
         }
         return;
@@ -4193,11 +4198,14 @@ pub fn cliSchedule(allocator: std.mem.Allocator, hours: u32, show_all: bool, sho
             .agent => if (job.prompt) |p| p[0..@min(p.len, 40)] else job.command,
             .shell => "",
         };
+        const last_status = job.last_status orelse "never";
+        var job_tz_buf: [16]u8 = undefined;
+        const job_tz_label = formatUtcOffsetLabel(job.tz_offset_s, &job_tz_buf);
 
         if (detail.len > 0) {
-            log.info("  {s}  [{s}] {s}  {s}", .{ time_str, job.job_type.asStr(), label, detail });
+            log.info("  {s}  [{s}] {s}  {s}  (tz: {s}, last: {s})", .{ time_str, job.job_type.asStr(), label, detail, job_tz_label, last_status });
         } else {
-            log.info("  {s}  [{s}] {s}", .{ time_str, job.job_type.asStr(), label });
+            log.info("  {s}  [{s}] {s}  (tz: {s}, last: {s})", .{ time_str, job.job_type.asStr(), label, job_tz_label, last_status });
         }
     }
 }
@@ -5855,6 +5863,10 @@ pub fn cliShowJob(
         if (model_opt) |mm| log.info("Model:        {s}", .{mm});
     }
     log.info("Schedule:     {s}", .{expr});
+    {
+        var tz_buf: [16]u8 = undefined;
+        log.info("Timezone:     {s}", .{formatUtcOffsetLabel(tz_offset_s, &tz_buf)});
+    }
     try logCronShowTimestampLines(allocator, "next", next_run, tz_offset_s);
     log.info("Session:      {s}", .{session_target});
 
@@ -5982,6 +5994,24 @@ fn extractScriptPathFromResolved(resolved: []const u8) []const u8 {
     const rest = resolved[prefix.len..];
     const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
     return rest[0..end];
+}
+
+fn appendScriptFileMetadata(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, script_path: []const u8) !void {
+    const stat = std_compat.fs.cwd().statFile(script_path) catch |err| {
+        try buf.appendSlice(allocator, "Script stat:     unavailable (");
+        try buf.appendSlice(allocator, @errorName(err));
+        try buf.appendSlice(allocator, ")\n");
+        return;
+    };
+
+    const mtime_secs_i128 = @divTrunc(stat.mtime, std.time.ns_per_s);
+    const mtime_secs: i64 = if (mtime_secs_i128 < 0) -1 else @intCast(mtime_secs_i128);
+    var mtime_buf: [64]u8 = undefined;
+    try buf.appendSlice(allocator, "Script mtime:    ");
+    try buf.appendSlice(allocator, formatUnixTimestamp(mtime_secs, &mtime_buf));
+    try buf.appendSlice(allocator, "\nScript size:     ");
+    try buf.appendSlice(allocator, std.fmt.bufPrint(&mtime_buf, "{d} bytes", .{stat.size}) catch "unknown");
+    try buf.append(allocator, '\n');
 }
 
 fn buildCronExplainJob(
@@ -6130,9 +6160,12 @@ fn buildCronExplainJob(
         try buf.append(allocator, '\n');
     }
     if (resolved_cmd) |cmd| {
+        const script_path = extractScriptPathFromResolved(cmd);
         try buf.appendSlice(allocator, "Script path:     ");
-        try buf.appendSlice(allocator, extractScriptPathFromResolved(cmd));
-        try buf.appendSlice(allocator, "\nResolved:        ");
+        try buf.appendSlice(allocator, script_path);
+        try buf.append(allocator, '\n');
+        try appendScriptFileMetadata(&buf, allocator, script_path);
+        try buf.appendSlice(allocator, "Resolved:        ");
         try buf.appendSlice(allocator, cmd);
         try buf.append(allocator, '\n');
     } else if (resolution_error) |err| {
@@ -11148,6 +11181,8 @@ test "human-path filter: dbListFilteredJobIds + selectCronJobsByIds returns matc
     try std.testing.expect(rendered.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Weekly schedule") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "oilcon") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "tz:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "last:") != null);
 }
 
 test "writeTraceForPath filters by job_id prefix, event substring, and limit" {
@@ -11289,6 +11324,9 @@ fn makeExplainSkillFixture(tmp: *std.testing.TmpDir, allocator: std.mem.Allocato
         \\~/skills/oil/scripts/run.py
         \\
     );
+    const script_file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/oil/scripts/run.py", .{});
+    defer script_file.close();
+    try script_file.writeAll("#!/usr/bin/env python3\n");
     const home = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     errdefer allocator.free(home);
     const skills_dir = try std.fs.path.join(allocator, &.{ home, "skills" });
@@ -11320,6 +11358,8 @@ test "cron explain skill job shows resolved path and args" {
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "Script path:") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "/skills/oil/scripts/run.py") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Script mtime:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Script size:") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Args:            --market WTI") != null);
 }
 
