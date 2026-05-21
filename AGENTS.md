@@ -267,6 +267,15 @@ Never use `/skill <name>` or `-m /skill <name>` as a cron prompt. It spawns a su
 - To report a semantic problem while still exiting `0`, emit `[skill-status:degraded]` or `[skill-status:failed]` and still emit the trace marker. The scheduler records these as `failure_class=contract_degraded` / `contract_failed` and applies the configured repair policy.
 - Use non-zero exit codes for transport/execution failures (spawn error, timeout, uncaught exception). Use the skill-status markers for semantic “the script ran but the result is not good enough” outcomes.
 
+#### systemd execution environment
+
+Cron-fired skills inherit the daemon's full env (`buildCronChildEnv` copies `getEnvMap()` to the child), so anything missing from the daemon's env is missing from the skill. Two recurring failure modes:
+
+1. **PATH gap** — systemd's default `PATH` is `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin`. It does NOT include `~/.local/bin` (persona-core) or `~/nullclaw/zig-out/bin` (nullclaw). Skills that `subprocess.run(["persona-core", ...])` will FileNotFoundError pre-skill-code, leaving no skill-side trace. Fix: export `PATH=...` in `~/.nullclaw/.env` (loaded via `EnvironmentFile=`). After editing, `systemctl --user restart nullclaw.service` — env changes do not propagate to running daemons.
+2. **Auth tokens** — persona-core and similar tools need their long-lived API tokens in env (`TURSO_READ_TOKEN`, `TURSO_WRITE_TOKEN`, `TURSO_SECRETS_TOKEN`, `PERSONA_REGISTRY_DB_URL`, etc.). On-demand token minting paths that require interactive OAuth (e.g., `turso db tokens create`) will fail in cron context once any cached token expires.
+
+To verify a skill's full cron-execution surface without burning real LLM calls / publishes: add a throwaway `cron add-skill` entry with `--dry-run` or `--check` args and an expression that never naturally fires (e.g., `"0 4 1 1 1"` = Jan 1 04:00 Monday), then `nullclaw cron run <id>` and inspect `cron show <id> --json` for `last_status: "ok"`, `last_stderr: null`, `runs[0].verified: 1`. Remove the throwaway entry after.
+
 #### Source of truth
 
 `~/.nullclaw/cron.db` is the scheduler authority for a running claw. `~/.nullclaw/cron-seed.json` is a bootstrap/backup artifact, not an ongoing source of truth.
@@ -365,7 +374,7 @@ CREATE TABLE IF NOT EXISTS cron_runs (
 
 CLI access (all inspection commands open the DB read-only via `openCronDbReadOnlyAtPath`):
 - `nullclaw cron runs <id> [--limit N] [--json]` — per-job history (last 50 by default); shows `src=` and `trace=` columns
-- `nullclaw cron show <id> [--runs N]` — spec + recent runs; displays `(auto-paused)` suffix when the last run recorded `repair_action=paused_job`, plus `fc=`/`ra=` per run
+- `nullclaw cron show <id> [--runs N]` — spec + recent runs; displays `(auto-paused)` suffix when the last run recorded `repair_action=paused_job`, plus `fc=`/`ra=` per run. On a failing run, also shows `Last stderr:` (tail of the child process's stderr, capped at ~1KB) — useful for catching pre-skill failures like `FileNotFoundError` (PATH gap), `EACCES`, missing Python modules, etc.
 - `nullclaw cron job-status [--json]` — last known status per job, sorted by recency
 - `nullclaw cron list [--limit N] [--json]` — all jobs as JSON array (stdout)
 - `nullclaw cron schedule [--hours N] [--all] [--today] [--json]` — upcoming fires as JSON array
