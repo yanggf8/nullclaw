@@ -1483,8 +1483,29 @@ pub fn collectChildOutputWithTimeout(
     var stderr_open = true;
     var timed_out = false;
     var read_buf: [4096]u8 = undefined;
+    // Diagnostic: when NULLCLAW_CRON_POLL_DEBUG is set, log every Nth loop
+    // iteration with poll/read state. Used to capture hard evidence of a
+    // busy-spin (high CPU, no progress) in collectChildOutputWithTimeout.
+    const poll_debug = blk: {
+        if (platform.getEnvOrNull(allocator, "NULLCLAW_CRON_POLL_DEBUG")) |v| {
+            allocator.free(v);
+            break :blk true;
+        }
+        break :blk false;
+    };
+    var loop_iters: u64 = 0;
+    var last_poll_rc: i32 = 0;
+    var last_stdout_revents: i16 = 0;
+    var last_stderr_revents: i16 = 0;
     while (true) {
         if (!stdout_open and !stderr_open) break;
+        loop_iters += 1;
+        if (poll_debug and loop_iters % 1000 == 0) {
+            log.warn(
+                "[cron-poll-debug] iter={d} stdout_open={} stderr_open={} timed_out={} last_poll_rc={d} stdout_revents=0x{x} stderr_revents=0x{x} stdout_bytes={d} stderr_bytes={d}",
+                .{ loop_iters, stdout_open, stderr_open, timed_out, last_poll_rc, @as(u16, @bitCast(last_stdout_revents)), @as(u16, @bitCast(last_stderr_revents)), stdout.items.len, stderr.items.len },
+            );
+        }
 
         if (comptime builtin.os.tag == .windows) {
             if (stdout_open) {
@@ -1533,31 +1554,52 @@ pub fn collectChildOutputWithTimeout(
                     .revents = 0,
                 },
             };
-            _ = try std.posix.poll(&poll_fds, poll_ms);
+            const poll_rc = try std.posix.poll(&poll_fds, poll_ms);
+            if (poll_debug) {
+                last_poll_rc = @intCast(poll_rc);
+                last_stdout_revents = poll_fds[0].revents;
+                last_stderr_revents = poll_fds[1].revents;
+            }
 
-            if (stdout_open and (poll_fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
-                const n = stdout_file.read(&read_buf) catch |err| switch (err) {
-                    error.WouldBlock => 0,
-                    else => return err,
-                };
-                if (n == 0) {
+            // POLLNVAL (invalid fd) and POLLERR are terminal: the pipe end is
+            // gone (commonly after the child is killed on timeout, which closes
+            // its fds). Treat them as ready-to-close — without this the loop
+            // polls a dead fd forever, since poll() returns immediately on a
+            // pending POLLNVAL but a bare POLL.IN|HUP check never consumes it.
+            const terminal_revents = std.posix.POLL.ERR | std.posix.POLL.NVAL;
+            const readable_revents = std.posix.POLL.IN | std.posix.POLL.HUP | terminal_revents;
+
+            if (stdout_open and (poll_fds[0].revents & readable_revents) != 0) {
+                if ((poll_fds[0].revents & terminal_revents) != 0) {
                     stdout_open = false;
                 } else {
-                    try stdout.appendSlice(allocator, read_buf[0..n]);
-                    if (stdout.items.len > AGENT_MAX_OUTPUT_BYTES) return error.StdoutStreamTooLong;
+                    const n = stdout_file.read(&read_buf) catch |err| switch (err) {
+                        error.WouldBlock => 0,
+                        else => return err,
+                    };
+                    if (n == 0) {
+                        stdout_open = false;
+                    } else {
+                        try stdout.appendSlice(allocator, read_buf[0..n]);
+                        if (stdout.items.len > AGENT_MAX_OUTPUT_BYTES) return error.StdoutStreamTooLong;
+                    }
                 }
             }
 
-            if (stderr_open and (poll_fds[1].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
-                const n = stderr_file.read(&read_buf) catch |err| switch (err) {
-                    error.WouldBlock => 0,
-                    else => return err,
-                };
-                if (n == 0) {
+            if (stderr_open and (poll_fds[1].revents & readable_revents) != 0) {
+                if ((poll_fds[1].revents & terminal_revents) != 0) {
                     stderr_open = false;
                 } else {
-                    try stderr.appendSlice(allocator, read_buf[0..n]);
-                    if (stderr.items.len > AGENT_MAX_OUTPUT_BYTES) return error.StderrStreamTooLong;
+                    const n = stderr_file.read(&read_buf) catch |err| switch (err) {
+                        error.WouldBlock => 0,
+                        else => return err,
+                    };
+                    if (n == 0) {
+                        stderr_open = false;
+                    } else {
+                        try stderr.appendSlice(allocator, read_buf[0..n]);
+                        if (stderr.items.len > AGENT_MAX_OUTPUT_BYTES) return error.StderrStreamTooLong;
+                    }
                 }
             }
         }
@@ -1565,6 +1607,10 @@ pub fn collectChildOutputWithTimeout(
         if (!timed_out and hasTimeoutExpired(start_ns, timeout_secs)) {
             try terminateAgentChildHard(child);
             timed_out = true;
+            // terminateAgentChildHard -> child.kill() waits and closes the
+            // stdout/stderr pipe handles. Continuing to poll those now-dead
+            // fds is pointless and risks a busy-spin on POLLNVAL — stop here.
+            break;
         }
     }
 
