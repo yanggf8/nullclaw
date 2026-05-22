@@ -276,6 +276,10 @@ Cron-fired skills inherit the daemon's full env (`buildCronChildEnv` copies `get
 
 To verify a skill's full cron-execution surface without burning real LLM calls / publishes: add a throwaway `cron add-skill` entry with `--dry-run` or `--check` args and an expression that never naturally fires (e.g., `"0 4 1 1 1"` = Jan 1 04:00 Monday), then `nullclaw cron run <id>` and inspect `cron show <id> --json` for `last_status: "ok"`, `last_stderr: null`, `runs[0].verified: 1`. Remove the throwaway entry after.
 
+#### Cron entry vs skill argparse contract
+
+The cron entry's `skill_args` and the skill's `run.py` argparse must agree. If `run.py` requires a subcommand (e.g. ainews requires `write`), every cron entry for that skill must pass it. An entry with `skill_args: None` will hit argparse's no-subcommand path, print help, exit 2, and emit `[skill-status:failed]` — the skill never runs its own code. `cron update` can change expression/tz/verify/repair but **not** `skill_args`; fixing a stale-arg entry requires remove + re-add. Mirror the same `skill_args` into `~/.nullclaw/cron-seed.json` so a restore can't reintroduce the broken entry. `cron explain <id>` shows the resolved command, useful for confirming the args actually reach the spawn.
+
 #### Source of truth
 
 `~/.nullclaw/cron.db` is the scheduler authority for a running claw. `~/.nullclaw/cron-seed.json` is a bootstrap/backup artifact, not an ongoing source of truth.
