@@ -27,6 +27,7 @@ tmp/
 # IDE / agent tooling
 .idea/
 .vscode/
+.history/
 .cursor/
 .trae/
 .codebuddy/

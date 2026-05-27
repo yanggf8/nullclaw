@@ -228,6 +228,7 @@ pub const SqliteMemory = struct {
         }
 
         var self_ = Self{ .db = db, .allocator = allocator };
+        errdefer self_.deinit();
         try self_.configurePragmas(use_wal);
         try self_.migrate();
         try self_.migrateSessionId();
