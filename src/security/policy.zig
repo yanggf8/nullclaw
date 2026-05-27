@@ -90,10 +90,11 @@ pub fn resolveAllowedCommands(
 pub const PolicyGates = packed struct(u8) {
     command_not_allowed: bool = false,
     high_risk_blocked: bool = false,
+    medium_risk_blocked: bool = false,
     approval_required: bool = false,
     rate_limited: bool = false,
     autonomy_blocked: bool = false,
-    _pad: u3 = 0,
+    _pad: u2 = 0,
 };
 
 /// Structured audit entry emitted for every policy decision.
@@ -247,6 +248,15 @@ pub const SecurityPolicy = struct {
         // Integrated our explicit audit on the approval path for observability consistency with cron/shell jobs.
         if (risk == .medium) {
             if (self.block_medium_risk_commands) {
+                self.audit(.{
+                    .timestamp_ns = std_compat.time.nanoTimestamp(),
+                    .action_type = .command,
+                    .command = command,
+                    .risk_level = risk,
+                    .gates_fired = .{ .medium_risk_blocked = true },
+                    .decision = .denied,
+                    .denial_reason = "medium risk blocked",
+                });
                 return error.MediumRiskBlocked;
             }
             if (self.autonomy == .supervised and

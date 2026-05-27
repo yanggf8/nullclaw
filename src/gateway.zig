@@ -3275,6 +3275,22 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
             ctx.response_body = "{\"error\":\"skill jobs require skill_name\"}";
             return;
         }
+
+        // Validate at add time (not just execution) to prevent persisting unsafe jobs.
+        if (is_skill_job) {
+            cron_mod.validateSkillNameSafe(skill_name_opt.?) catch {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"invalid or unsafe skill_name\"}";
+                return;
+            };
+            if (skill_args_opt) |sa| {
+                cron_mod.validateSkillArgsSafe(sa) catch {
+                    ctx.response_status = "400 Bad Request";
+                    ctx.response_body = "{\"error\":\"invalid or unsafe skill_args\"}";
+                    return;
+                };
+            }
+        }
         const cmd: []const u8 = if (prompt_opt != null)
             prompt_opt.?
         else if (command_opt) |c|
@@ -7466,6 +7482,7 @@ pub fn run(
                 .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
                 .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
                 .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
+                .block_medium_risk_commands = cfg.autonomy.block_medium_risk_commands,
                 .allow_raw_url_chars = cfg.autonomy.allow_raw_url_chars,
                 .tracker = if (sec_tracker_opt) |*tracker| tracker else null,
             };

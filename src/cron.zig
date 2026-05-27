@@ -1795,7 +1795,7 @@ pub fn resolveSkillExec(allocator: std.mem.Allocator, skill_name: ?[]const u8, s
 
 /// Validate that a skill name is safe for path construction.
 /// Rejects names containing path separators, null bytes, control characters, or "..".
-fn validateSkillNameSafe(name: []const u8) !void {
+pub fn validateSkillNameSafe(name: []const u8) !void {
     if (name.len == 0 or std.mem.eql(u8, name, "..")) return error.UnsafeSkillName;
     for (name) |ch| {
         if (ch == '/' or ch == '\\' or ch == '"' or ch == 0 or ch < 0x20) return error.UnsafeSkillName;
@@ -1808,7 +1808,7 @@ fn validateSkillNameSafe(name: []const u8) !void {
 /// underscores, dots, forward slashes, @, and valid UTF-8 bytes (>=0x80).
 /// Shell metacharacters are all ASCII (<0x80), so multi-byte UTF-8
 /// sequences cannot form shell syntax. The input must be valid UTF-8.
-fn validateSkillArgsSafe(args: []const u8) !void {
+pub fn validateSkillArgsSafe(args: []const u8) !void {
     if (!std.unicode.utf8ValidateSlice(args)) return error.UnsafeSkillArgs;
     for (args) |ch| {
         switch (ch) {
@@ -1866,6 +1866,14 @@ pub fn resolveSkillExecFrom(
         break;
     }
     const raw_path = script_path orelse return error.NoScriptPath;
+
+    // Basic safety: reject obvious shell metacharacters in the script path itself.
+    for (raw_path) |ch| {
+        switch (ch) {
+            ';', '&', '|', '`', '$', '(', ')', '<', '>', '\n', '\r', '\t' => return error.UnsafeSkillScriptPath,
+            else => {},
+        }
+    }
 
     // Expand leading ~ to tilde_home.
     const expanded = if (std.mem.startsWith(u8, raw_path, "~/"))
