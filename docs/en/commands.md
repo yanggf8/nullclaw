@@ -174,6 +174,12 @@ whitespace differ. It does not delete or rewrite entries.
 | `nullclaw workspace edit AGENTS.md` | Open a bootstrap markdown file in `$EDITOR` |
 | `nullclaw workspace reset-md --dry-run` | Preview workspace markdown reset |
 | `nullclaw workspace reset-md --include-bootstrap --clear-memory-md` | Reset bundled markdown files and optionally clear extra files |
+| `nullclaw workspace audit` | Scan workspace files for likely secret leaks (token prefixes, PEM blocks, credentials in URLs, high-entropy strings) |
+| `nullclaw workspace audit --staged \| --commit <sha> \| --range a..b` | Audit a staged diff, a historical commit, or a git revision range instead of the workspace tree |
+| `nullclaw workspace audit --json [--only-secrets] [--fail-on <level>]` | Machine-readable output for CI integration; non-zero exit when findings meet the threshold |
+| `nullclaw workspace audit --llm-triage external` | Re-classify findings via `workspace_audit.llm_triage` or the configured primary LLM provider using privacy-preserving envelopes (no raw secret value leaves the machine) |
+| `nullclaw workspace audit --llm-provider ollama --llm-model qwen2.5-coder:7b --llm-max-calls 20` | Override the configured audit triage provider, model, and external-call budget for one run |
+| `nullclaw workspace audit --llm-triage dry-run` | Print the envelopes that would be sent without calling the LLM |
 | `nullclaw capabilities` | Show a text capability summary |
 | `nullclaw capabilities --json` | Show a JSON capability manifest |
 | `nullclaw config show [--json]` | Print the full on-disk config |

@@ -1521,17 +1521,11 @@ pub const SessionManager = struct {
             break :blk owned_api_key;
         };
 
-        const holder = providers.ProviderHolder.fromConfigWithApiMode(
+        const holder = providers.holderFromConfig(
             self.allocator,
+            self.config,
             profile.provider,
             provider_api_key,
-            self.config.getProviderBaseUrl(profile.provider),
-            self.config.getProviderNativeTools(profile.provider),
-            self.config.getProviderUserAgent(profile.provider),
-            self.config.getProviderApiMode(profile.provider),
-            self.config.getProviderMaxStreamingPromptBytes(profile.provider),
-            self.config.getProviderChatTemplateEnableThinkingParam(profile.provider),
-            self.config.getProviderExtraBodyParams(profile.provider),
         );
         return .{
             .holder = holder,

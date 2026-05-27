@@ -358,17 +358,11 @@ fn resolveProfileProvider(
         break :blk owned_api_key;
     };
 
-    const holder = providers.ProviderHolder.fromConfigWithApiMode(
+    const holder = providers.holderFromConfig(
         allocator,
+        cfg,
         profile.provider,
         provider_api_key,
-        cfg.getProviderBaseUrl(profile.provider),
-        cfg.getProviderNativeTools(profile.provider),
-        cfg.getProviderUserAgent(profile.provider),
-        cfg.getProviderApiMode(profile.provider),
-        cfg.getProviderMaxStreamingPromptBytes(profile.provider),
-        cfg.getProviderChatTemplateEnableThinkingParam(profile.provider),
-        cfg.getProviderExtraBodyParams(profile.provider),
     );
     return .{
         .holder = holder,

@@ -24,6 +24,7 @@ pub const api_error_details = @import("api_error_details.zig");
 pub const scrub = @import("scrub.zig");
 pub const api_key = @import("api_key.zig");
 pub const factory = @import("factory.zig");
+pub const configured = @import("configured.zig");
 pub const helpers = @import("helpers.zig");
 
 // Re-exports from scrub.zig
@@ -46,13 +47,10 @@ pub const detectProviderByApiKey = factory.detectProviderByApiKey;
 pub const compatibleProviderUrl = factory.compatibleProviderUrl;
 pub const compatibleProviderDisplayName = factory.compatibleProviderDisplayName;
 pub const ProviderHolder = factory.ProviderHolder;
+pub const holderFromConfig = configured.holderFromConfig;
+pub const holderFromEntry = configured.holderFromEntry;
 
 // Re-exports from helpers.zig
-pub const complete = helpers.complete;
-pub const completeWithSystem = helpers.completeWithSystem;
-pub const providerUrl = helpers.providerUrl;
-pub const buildRequestBody = helpers.buildRequestBody;
-pub const buildRequestBodyWithSystem = helpers.buildRequestBodyWithSystem;
 pub const isReasoningModel = helpers.isReasoningModel;
 pub const appendGenerationFields = helpers.appendGenerationFields;
 pub const appendGeminiThinkingConfig = helpers.appendGeminiThinkingConfig;
@@ -64,7 +62,6 @@ pub const convertToolsAnthropic = helpers.convertToolsAnthropic;
 pub const convertToolsResponses = helpers.convertToolsResponses;
 pub const curlPostTimed = helpers.curlPostTimed;
 pub const curlPostFormTimed = helpers.curlPostFormTimed;
-pub const extractContent = helpers.extractContent;
 pub const SplitThinkContent = helpers.SplitThinkContent;
 pub const splitThinkContent = helpers.splitThinkContent;
 pub const stripThinkBlocks = helpers.stripThinkBlocks;
@@ -75,6 +72,7 @@ pub const appendOpenAiBodyExtraParams = helpers.appendOpenAiBodyExtraParams;
 // Direct re-exports from utility modules
 pub const appendJsonString = json_util.appendJsonString;
 pub const curlPost = http_util.curlPost;
+pub const preserveCurlTransportError = http_util.preserveCurlTransportError;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Core Types

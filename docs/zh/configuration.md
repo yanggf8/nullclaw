@@ -129,8 +129,30 @@ nullclaw onboard --interactive
 
 ### `agents.defaults.model.primary`
 
-- 设置默认模型路由，格式通常为：`provider/vendor/model`。
+- 设置默认模型路由，通常是 `provider/vendor/model`。
 - 示例：`openrouter/anthropic/claude-sonnet-4`
+
+### `workspace_audit.llm_triage`
+
+- 选择 `nullclaw workspace audit --llm-triage external` 使用的 provider/model。
+- 该配置本身不会启用 LLM triage；命令行模式仍然必须显式开启。
+- 省略时回退到 `agents.defaults.model.primary`。
+
+示例：
+
+```json
+{
+  "workspace_audit": {
+    "llm_triage": {
+      "provider": "ollama",
+      "model": "qwen2.5-coder:7b",
+      "max_calls": 20
+    }
+  }
+}
+```
+
+如果 provider 已在 `models.providers` 中配置，也可以把 model 写成带 provider 前缀的引用，例如 `"model": "openrouter/anthropic/claude-sonnet-4"`。
 
 ### `model_routes`
 

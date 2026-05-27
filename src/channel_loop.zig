@@ -59,17 +59,11 @@ fn providerHasStartupCredentials(
 
     if (hasNonEmptyCredential(resolved_key)) return true;
 
-    var holder = providers.ProviderHolder.fromConfigWithApiMode(
+    var holder = providers.holderFromConfig(
         allocator,
+        config,
         provider_name,
         null,
-        config.getProviderBaseUrl(provider_name),
-        config.getProviderNativeTools(provider_name),
-        config.getProviderUserAgent(provider_name),
-        config.getProviderApiMode(provider_name),
-        config.getProviderMaxStreamingPromptBytes(provider_name),
-        config.getProviderChatTemplateEnableThinkingParam(provider_name),
-        config.getProviderExtraBodyParams(provider_name),
     );
     defer holder.deinit();
 

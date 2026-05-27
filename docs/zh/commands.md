@@ -147,6 +147,12 @@
 | `nullclaw workspace edit AGENTS.md` | 用 `$EDITOR` 打开 bootstrap 文件 |
 | `nullclaw workspace reset-md --dry-run` | 预览将要重置的 markdown prompt 文件 |
 | `nullclaw workspace reset-md --include-bootstrap --clear-memory-md` | 重置 bundled markdown，并可附带清理 bootstrap / memory 文件 |
+| `nullclaw workspace audit` | 扫描工作区文件，检测潜在的密钥泄漏（已知 token 前缀、PEM 块、URL 中嵌入的凭据、高熵字符串） |
+| `nullclaw workspace audit --staged \| --commit <sha> \| --range a..b` | 仅扫描已暂存 diff、单个历史提交，或某个 git 修订区间 |
+| `nullclaw workspace audit --json [--only-secrets] [--fail-on <level>]` | 输出机器可读 JSON，达到阈值时返回非零退出码，便于 CI 集成 |
+| `nullclaw workspace audit --llm-triage external` | 通过 `workspace_audit.llm_triage` 或已配置的 primary LLM provider 使用隐私安全 envelope 重新分类（原始密钥值不离开本机） |
+| `nullclaw workspace audit --llm-provider ollama --llm-model qwen2.5-coder:7b --llm-max-calls 20` | 为单次运行覆盖 audit triage 的 provider、model 和外部调用预算 |
+| `nullclaw workspace audit --llm-triage dry-run` | 仅打印将要发送的 envelope，不调用 LLM |
 | `nullclaw capabilities` | 输出运行时能力摘要 |
 | `nullclaw capabilities --json` | 输出 JSON manifest |
 | `nullclaw config show [--json]` | 输出完整的磁盘配置 |

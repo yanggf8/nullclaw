@@ -270,6 +270,73 @@ fn parsePrimaryModelObject(
     return null;
 }
 
+fn jsonNonEmptyString(value: std.json.Value) ?[]const u8 {
+    if (value != .string or value.string.len == 0) return null;
+    return value.string;
+}
+
+fn setWorkspaceAuditTriageRef(
+    allocator: std.mem.Allocator,
+    triage: *types.WorkspaceAuditTriageConfig,
+    parsed_ref: PrimaryModelRef,
+) !void {
+    const provider = try allocator.dupe(u8, parsed_ref.provider);
+    errdefer allocator.free(provider);
+    const model = try allocator.dupe(u8, parsed_ref.model);
+    triage.provider = provider;
+    triage.model = model;
+}
+
+fn parseWorkspaceAuditTriageModel(
+    allocator: std.mem.Allocator,
+    explicit_provider_names: []const []const u8,
+    triage: *types.WorkspaceAuditTriageConfig,
+    value: std.json.Value,
+) !void {
+    if (value == .string) {
+        const model_value = jsonNonEmptyString(value) orelse return;
+        if (triage.provider == null) {
+            if (splitPrimaryModelRefWithProviders(model_value, explicit_provider_names)) |parsed_ref| {
+                try setWorkspaceAuditTriageRef(allocator, triage, parsed_ref);
+                return;
+            }
+        }
+        triage.model = try allocator.dupe(u8, model_value);
+        return;
+    }
+
+    if (value != .object) return;
+    var provider_allocated_here = false;
+    errdefer if (provider_allocated_here) {
+        allocator.free(triage.provider.?);
+        triage.provider = null;
+    };
+    if (triage.provider == null) {
+        if (value.object.get("provider")) |provider_value| {
+            if (jsonNonEmptyString(provider_value)) |provider| {
+                triage.provider = try allocator.dupe(u8, provider);
+                provider_allocated_here = true;
+            }
+        }
+    }
+
+    const primary_value = value.object.get("primary") orelse return;
+    const primary = jsonNonEmptyString(primary_value) orelse return;
+    if (triage.provider == null) {
+        if (splitPrimaryModelRefWithProviders(primary, explicit_provider_names)) |parsed_ref| {
+            try setWorkspaceAuditTriageRef(allocator, triage, parsed_ref);
+            return;
+        }
+    }
+    triage.model = try allocator.dupe(u8, primary);
+}
+
+fn parseWorkspaceAuditTriageMaxCalls(triage: *types.WorkspaceAuditTriageConfig, value: std.json.Value) void {
+    if (value == .integer and value.integer >= 0) {
+        triage.max_calls = @intCast(value.integer);
+    }
+}
+
 fn splitPrimaryModelRefWithProviders(primary: []const u8, provider_names: []const []const u8) ?PrimaryModelRef {
     if (model_refs.splitProviderModelWithKnownProviders(primary, provider_names)) |split| {
         return .{
@@ -1143,6 +1210,35 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     try named_agent_list.append(self.allocator, agent_cfg);
                 }
                 self.agents = try named_agent_list.toOwnedSlice(self.allocator);
+            }
+        }
+    }
+
+    // Workspace audit config. This only selects the model endpoint used when
+    // the operator explicitly runs `workspace audit --llm-triage external`.
+    if (root.get("workspace_audit")) |workspace_audit_value| {
+        if (workspace_audit_value == .object) {
+            if (workspace_audit_value.object.get("llm_triage")) |triage_value| {
+                if (triage_value == .object) {
+                    if (triage_value.object.get("provider")) |provider_value| {
+                        if (jsonNonEmptyString(provider_value)) |provider| {
+                            self.workspace_audit.llm_triage.provider = try self.allocator.dupe(u8, provider);
+                        }
+                    }
+                    if (triage_value.object.get("model")) |model_value| {
+                        try parseWorkspaceAuditTriageModel(
+                            self.allocator,
+                            explicit_provider_names,
+                            &self.workspace_audit.llm_triage,
+                            model_value,
+                        );
+                    }
+                    if (triage_value.object.get("max_calls")) |max_calls_value| {
+                        parseWorkspaceAuditTriageMaxCalls(&self.workspace_audit.llm_triage, max_calls_value);
+                    } else if (triage_value.object.get("max_llm_calls")) |max_calls_value| {
+                        parseWorkspaceAuditTriageMaxCalls(&self.workspace_audit.llm_triage, max_calls_value);
+                    }
+                }
             }
         }
     }

@@ -11,6 +11,7 @@ const bus_mod = @import("bus.zig");
 const config_mod = @import("config.zig");
 const config_types = @import("config_types.zig");
 const observability = @import("observability.zig");
+const provider_names = @import("provider_names.zig");
 const providers = @import("providers/root.zig");
 const thread_stacks = @import("thread_stacks.zig");
 
@@ -436,6 +437,37 @@ fn resolveWorkspacePath(
     return std_compat.fs.path.join(allocator, &.{ home_dir, normalized_workspace_path }) catch null;
 }
 
+fn findConfiguredProvider(
+    configured_providers: []const config_types.ProviderEntry,
+    provider_name: []const u8,
+) ?config_types.ProviderEntry {
+    for (configured_providers) |entry| {
+        if (provider_names.providerNamesMatch(entry.name, provider_name)) return entry;
+    }
+    return null;
+}
+
+fn resolveSubagentProviderApiKey(
+    configured_provider: ?config_types.ProviderEntry,
+    explicit_api_key: ?[]const u8,
+    fallback_api_key: ?[]const u8,
+) ?[]const u8 {
+    if (explicit_api_key) |api_key| return api_key;
+    if (configured_provider) |entry| {
+        if (entry.api_key) |api_key| return api_key;
+    }
+    return fallback_api_key;
+}
+
+fn subagentProviderHolder(
+    allocator: Allocator,
+    provider_name: []const u8,
+    api_key: ?[]const u8,
+    configured_provider: ?config_types.ProviderEntry,
+) providers.ProviderHolder {
+    return providers.holderFromEntry(allocator, provider_name, api_key, configured_provider);
+}
+
 // ── Thread function ─────────────────────────────────────────────
 
 fn subagentThreadFn(ctx: *ThreadContext) void {
@@ -466,10 +498,10 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         "You are a background subagent. Complete the assigned task concisely and accurately. Use available tools when they materially improve correctness."
     else
         "You are a background subagent. Complete the assigned task concisely and accurately. You have no access to interactive tools — focus on reasoning and analysis.";
-    var api_key = ctx.manager.api_key;
     var default_provider = ctx.manager.default_provider;
     var default_model = ctx.manager.default_model;
     var temperature: f64 = 0.7;
+    var explicit_api_key: ?[]const u8 = null;
     var effective_workspace = ctx.manager.workspace_dir;
     var resolved_workspace: ?[]const u8 = null;
     defer if (resolved_workspace) |workspace_dir| ctx.manager.allocator.free(workspace_dir);
@@ -482,7 +514,7 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
 
         default_provider = agent_cfg.provider;
         default_model = agent_cfg.model;
-        api_key = agent_cfg.api_key orelse ctx.manager.api_key;
+        explicit_api_key = agent_cfg.api_key;
         if (agent_cfg.system_prompt) |sp| system_prompt = sp;
         if (agent_cfg.temperature) |t| temperature = t;
         if (agent_cfg.workspace_path) |workspace_path| {
@@ -498,6 +530,9 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
             }
         }
     }
+
+    const configured_provider = findConfiguredProvider(ctx.manager.configured_providers, default_provider);
+    const api_key = resolveSubagentProviderApiKey(configured_provider, explicit_api_key, ctx.manager.api_key);
 
     if (ctx.manager.task_runner) |runner| {
         const request = TaskRunRequest{
@@ -540,20 +575,25 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
     var cfg_arena = std.heap.ArenaAllocator.init(ctx.manager.allocator);
     defer cfg_arena.deinit();
 
-    // Build a config-like struct that providers.completeWithSystem() accepts
-    const cfg = .{
-        .api_key = api_key,
-        .default_provider = default_provider,
-        .default_model = default_model,
-        .temperature = temperature,
-        .max_tokens = @as(?u64, null),
+    const model = default_model orelse {
+        ctx.manager.completeTask(ctx.task_id, null, @errorName(error.NoDefaultModel));
+        return;
     };
 
-    const result = providers.completeWithSystem(
+    var holder = subagentProviderHolder(
         cfg_arena.allocator(),
-        &cfg,
+        default_provider,
+        api_key,
+        configured_provider,
+    );
+    defer holder.deinit();
+
+    const result = holder.provider().chatWithSystem(
+        cfg_arena.allocator(),
         system_prompt,
         ctx.task,
+        model,
+        temperature,
     ) catch |err| {
         ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
         return;
@@ -572,6 +612,63 @@ fn waitTaskTerminalStatus(manager: *SubagentManager, task_id: u64) !TaskStatus {
         std_compat.thread.sleep(10 * std.time.ns_per_ms);
     }
     return error.TestUnexpectedResult;
+}
+
+test "subagent provider api key prefers explicit then configured then fallback" {
+    const entries = [_]config_types.ProviderEntry{.{
+        .name = "groq",
+        .api_key = "configured-key",
+    }};
+    const configured = findConfiguredProvider(&entries, "groq");
+    try std.testing.expect(configured != null);
+
+    try std.testing.expectEqualStrings(
+        "explicit-key",
+        resolveSubagentProviderApiKey(configured, "explicit-key", "fallback-key").?,
+    );
+    try std.testing.expectEqualStrings(
+        "configured-key",
+        resolveSubagentProviderApiKey(configured, null, "fallback-key").?,
+    );
+    try std.testing.expectEqualStrings(
+        "fallback-key",
+        resolveSubagentProviderApiKey(null, null, "fallback-key").?,
+    );
+    try std.testing.expect(resolveSubagentProviderApiKey(null, null, null) == null);
+}
+
+test "subagent provider holder applies configured provider options" {
+    const configured = config_types.ProviderEntry{
+        .name = "custom-local",
+        .base_url = "http://localhost:4321/v1",
+        .native_tools = false,
+        .user_agent = "nullclaw-test",
+        .api_mode = .responses,
+        .chat_template_enable_thinking_param = true,
+        .max_streaming_prompt_bytes = 123,
+        .extra_body_params = "{\"seed\":1}",
+    };
+
+    var holder = subagentProviderHolder(
+        std.testing.allocator,
+        "custom-local",
+        null,
+        configured,
+    );
+    defer holder.deinit();
+
+    switch (holder) {
+        .compatible => |*provider| {
+            try std.testing.expectEqualStrings("http://localhost:4321/v1", provider.base_url);
+            try std.testing.expect(!provider.native_tools);
+            try std.testing.expectEqualStrings("nullclaw-test", provider.user_agent.?);
+            try std.testing.expectEqual(providers.compatible.CompatibleApiMode.responses, provider.api_mode);
+            try std.testing.expect(provider.chat_template_enable_thinking_param);
+            try std.testing.expectEqual(@as(?usize, 123), provider.max_streaming_prompt_bytes);
+            try std.testing.expectEqualStrings("{\"seed\":1}", provider.extra_body_params.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 fn testTaskRunnerOk(allocator: Allocator, request: TaskRunRequest) ![]const u8 {
