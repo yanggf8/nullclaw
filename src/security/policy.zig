@@ -1997,15 +1997,15 @@ const TestAuditCapture = struct {
 
 test "audit callback fires on high_risk_blocked" {
     var cap = TestAuditCapture{};
+    // rm (and similar) remain high-risk under the upstream 3-tier model.
     const p = SecurityPolicy{
         .autonomy = .supervised,
-        .allowed_commands = &.{"curl"},
-        .allow_raw_url_chars = true,
+        .allowed_commands = &.{"rm"},
         .block_high_risk_commands = true,
         .audit_fn = TestAuditCapture.callback,
         .audit_ctx = &cap,
     };
-    _ = p.validateCommandExecution("curl https://example.com", false) catch {};
+    _ = p.validateCommandExecution("rm -rf /tmp", false) catch {};
     try std.testing.expectEqual(@as(usize, 1), cap.count);
     const e = cap.entry.?;
     try std.testing.expectEqual(e.decision, .denied);
