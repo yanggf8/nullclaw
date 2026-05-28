@@ -1421,26 +1421,39 @@ test "DbCronBackend policy block on shell job records failure_class" {
         null,
     );
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    const runs_sql = "SELECT status, failure_class, verified, source FROM cron_runs WHERE job_id=?1";
-    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_prepare_v2(db, runs_sql, -1, &stmt, null));
-    defer _ = c.sqlite3_finalize(stmt);
-    _ = c.sqlite3_bind_text(stmt, 1, job.id.ptr, @intCast(job.id.len), SQLITE_STATIC);
-    try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(stmt));
+    var runs_json: std.ArrayListUnmanaged(u8) = .empty;
+    defer runs_json.deinit(allocator);
+    try cron.dbListRunsJson(db, job.id, 10, &runs_json, allocator);
 
-    const status_ptr = c.sqlite3_column_text(stmt, 0).?;
-    const status_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
-    try std.testing.expectEqualStrings("error", status_ptr[0..status_len]);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, runs_json.items, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .array);
 
-    const fc_ptr = c.sqlite3_column_text(stmt, 1).?;
-    const fc_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
-    try std.testing.expectEqualStrings("policy_medium_blocked", fc_ptr[0..fc_len]);
+    var found_run = false;
+    for (parsed.value.array.items) |run_value| {
+        if (run_value != .object) continue;
+        const obj = run_value.object;
+        const run_job_id = obj.get("job_id") orelse continue;
+        if (run_job_id != .string or !std.mem.eql(u8, run_job_id.string, job.id)) continue;
 
-    try std.testing.expectEqual(@as(i32, 3), c.sqlite3_column_int(stmt, 2));
+        found_run = true;
+        const status = obj.get("status") orelse return error.MissingStatus;
+        try std.testing.expect(status == .string);
+        try std.testing.expectEqualStrings("error", status.string);
 
-    const source_ptr = c.sqlite3_column_text(stmt, 3).?;
-    const source_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 3));
-    try std.testing.expectEqualStrings("cron_scheduler_shell", source_ptr[0..source_len]);
+        const failure_class = obj.get("failure_class") orelse return error.MissingFailureClass;
+        try std.testing.expect(failure_class == .string);
+        try std.testing.expectEqualStrings("policy_medium_blocked", failure_class.string);
+
+        const verified = obj.get("verified") orelse return error.MissingVerified;
+        try std.testing.expect(verified == .integer);
+        try std.testing.expect(verified.integer != 0);
+
+        const source = obj.get("source") orelse return error.MissingSource;
+        try std.testing.expect(source == .string);
+        try std.testing.expectEqualStrings("cron_scheduler_shell", source.string);
+    }
+    try std.testing.expect(found_run);
 }
 
 test "DbCronBackend tick enqueues due jobs" {
