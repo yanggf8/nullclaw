@@ -85,9 +85,9 @@ curl -X POST \
   http://127.0.0.1:3000/cron/add
 ```
 
-技能任务失败时，警报优先投递到任务自身的 `delivery_to` 目标；若任务未设定投递目标，则回退到设置中的 `scheduler.alert_channel` / `scheduler.alert_to`。
+技能任务失败时，警报优先投递到任务自身的 `delivery_to` 目标；若任务未配置投递目标，则回退到配置中的 `scheduler.alert_channel` / `scheduler.alert_to`。
 
-`/cron/update` 传入 `{"enabled": true}` 会同时清除 `paused` 标志，传入 `{"enabled": false}` 则同时设定。这样 `--enable`/`--disable` 与 `pause`/`resume` 的语义保持一致——通过 update 重新启用的任务将在下次排程时间正常触发。
+`/cron/update` 传入 `{"enabled": true}` 会同时清除 `paused` 标志，传入 `{"enabled": false}` 则同时设置。这样 `--enable`/`--disable` 与 `pause`/`resume` 的语义保持一致——通过 update 重新启用的任务将在下次排程时间正常触发。
 
 ### 6) Max webhook 投递
 
