@@ -1203,10 +1203,7 @@ pub const CronScheduler = struct {
                         null;
                     defer if (resolved_shell_cmd) |rc| self.allocator.free(rc);
                     const effective_shell_cmd = resolved_shell_cmd orelse job.command;
-                    const policy_decision: CronShellPolicyDecision = if (builtin.is_test and self.security_policy == null)
-                        .allowed
-                    else
-                        checkCronShellPolicy(self.security_policy, effective_shell_cmd);
+                    const policy_decision = checkCronShellPolicy(self.security_policy, effective_shell_cmd);
                     switch (policy_decision) {
                         .allowed => {},
                         .blocked => |blocked| {
@@ -9615,6 +9612,54 @@ test "addRun prunes history" {
     try std.testing.expect(runs.len <= 3);
 }
 
+const TestCronShellPolicyFixture = struct {
+    allocator: std.mem.Allocator,
+    tracker_ptr: *security.RateTracker,
+    policy_ptr: *security.SecurityPolicy,
+
+    fn init(allocator: std.mem.Allocator, scheduler: *CronScheduler) !TestCronShellPolicyFixture {
+        const tracker_ptr = try allocator.create(security.RateTracker);
+        errdefer allocator.destroy(tracker_ptr);
+        tracker_ptr.* = security.RateTracker.init(allocator, 100);
+
+        const policy_ptr = try allocator.create(security.SecurityPolicy);
+        errdefer {
+            tracker_ptr.deinit();
+            allocator.destroy(tracker_ptr);
+        }
+        errdefer allocator.destroy(policy_ptr);
+        policy_ptr.* = .{
+            .autonomy = .full,
+            .allowed_commands = &.{"*"},
+            .block_medium_risk_commands = false,
+            .block_high_risk_commands = false,
+            .tracker = tracker_ptr,
+        };
+        scheduler.setSecurityPolicy(policy_ptr);
+
+        return .{
+            .allocator = allocator,
+            .tracker_ptr = tracker_ptr,
+            .policy_ptr = policy_ptr,
+        };
+    }
+
+    fn deinit(self: *TestCronShellPolicyFixture) void {
+        self.tracker_ptr.deinit();
+        self.allocator.destroy(self.tracker_ptr);
+        self.allocator.destroy(self.policy_ptr);
+    }
+};
+
+test "checkCronShellPolicy fails closed when policy missing" {
+    // Regression: test builds must not silently treat a missing scheduler
+    // SecurityPolicy as allowed; only I/O side effects may be bypassed in tests.
+    switch (checkCronShellPolicy(null, "echo no-policy")) {
+        .fail_closed => {},
+        else => return error.ExpectedFailClosed,
+    }
+}
+
 test "listRuns returns only matching job runs when interleaved" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
@@ -9871,6 +9916,8 @@ test "one-shot job deleted after tick execution" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
+    var policy_fixture = try TestCronShellPolicyFixture.init(allocator, &scheduler);
+    defer policy_fixture.deinit();
 
     const job = try scheduler.addOnce("1s", "echo oneshot");
     // Verify job was created
@@ -9897,8 +9944,10 @@ test "shell job uses configured cwd for relative output paths" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     scheduler.setShellCwd(workspace);
     defer scheduler.deinit();
+    var policy_fixture = try TestCronShellPolicyFixture.init(std.testing.allocator, &scheduler);
+    defer policy_fixture.deinit();
 
-    _ = try scheduler.addOnce("1s", "echo cwd_ok > cwd_proof.txt");
+    _ = try scheduler.addOnce("1s", "touch cwd_proof.txt");
     scheduler.jobs.items[0].next_run_secs = 0;
 
     _ = scheduler.tick(std_compat.time.timestamp(), null);
@@ -9911,6 +9960,8 @@ test "shell job delivers stdout via bus" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
+    var policy_fixture = try TestCronShellPolicyFixture.init(allocator, &scheduler);
+    defer policy_fixture.deinit();
 
     var test_bus = bus.Bus.init();
     defer test_bus.close();
@@ -10036,6 +10087,8 @@ test "tick without bus still executes jobs" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
+    var policy_fixture = try TestCronShellPolicyFixture.init(allocator, &scheduler);
+    defer policy_fixture.deinit();
 
     _ = try scheduler.addJob("* * * * *", "echo silent");
     scheduler.jobs.items[0].next_run_secs = 0;
@@ -10053,12 +10106,22 @@ test "CronScheduler tick blocks shell command when policy denies medium risk" {
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
 
-    const policy = security.SecurityPolicy{
+    const tracker_ptr = try allocator.create(security.RateTracker);
+    defer {
+        tracker_ptr.deinit();
+        allocator.destroy(tracker_ptr);
+    }
+    tracker_ptr.* = security.RateTracker.init(allocator, 20);
+
+    const policy_ptr = try allocator.create(security.SecurityPolicy);
+    defer allocator.destroy(policy_ptr);
+    policy_ptr.* = .{
         .autonomy = .full,
         .allowed_commands = &.{"curl"},
         .block_medium_risk_commands = true,
+        .tracker = tracker_ptr,
     };
-    scheduler.setSecurityPolicy(&policy);
+    scheduler.setSecurityPolicy(policy_ptr);
 
     _ = try scheduler.addJob("* * * * *", "curl https://example.com");
     scheduler.jobs.items[0].next_run_secs = 0;
@@ -10117,6 +10180,8 @@ test "tick records cron start delivery attribution" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
+    var policy_fixture = try TestCronShellPolicyFixture.init(allocator, &scheduler);
+    defer policy_fixture.deinit();
 
     var observer = RecordingObserver{};
     scheduler.observer = observer.observer();
@@ -10138,6 +10203,8 @@ test "tick reschedules recurring job using cron expression" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
+    var policy_fixture = try TestCronShellPolicyFixture.init(allocator, &scheduler);
+    defer policy_fixture.deinit();
 
     _ = try scheduler.addJob("*/10 * * * *", "echo periodic");
     scheduler.jobs.items[0].next_run_secs = 0;
@@ -10150,6 +10217,8 @@ test "tick reschedules anchored recurring job using cron expression" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
+    var policy_fixture = try TestCronShellPolicyFixture.init(allocator, &scheduler);
+    defer policy_fixture.deinit();
 
     _ = try scheduler.addJob("8/25 * * * *", "echo anchored");
     scheduler.jobs.items[0].next_run_secs = 480;

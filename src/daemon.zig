@@ -3356,6 +3356,22 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
     loaded.db_path = db_path;
     defer loaded.deinit();
     try cron.loadJobs(&loaded);
+    const loaded_tracker_ptr = try allocator.create(security.RateTracker);
+    defer {
+        loaded_tracker_ptr.deinit();
+        allocator.destroy(loaded_tracker_ptr);
+    }
+    loaded_tracker_ptr.* = security.RateTracker.init(allocator, 100);
+    const loaded_policy_ptr = try allocator.create(security.SecurityPolicy);
+    defer allocator.destroy(loaded_policy_ptr);
+    loaded_policy_ptr.* = .{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_medium_risk_commands = false,
+        .block_high_risk_commands = false,
+        .tracker = loaded_tracker_ptr,
+    };
+    loaded.setSecurityPolicy(loaded_policy_ptr);
 
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
     defer {
