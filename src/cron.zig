@@ -12,6 +12,7 @@ const admin_output = @import("admin_output.zig");
 const agent_routing = @import("agent_routing.zig");
 const telegram = @import("channels/telegram.zig");
 const signal = @import("channels/signal.zig");
+const security = @import("security/policy.zig");
 const Config = @import("config.zig").Config;
 
 const sqlite_mod = if (build_options.enable_sqlite)
@@ -22,6 +23,31 @@ const c = sqlite_mod.c;
 const SQLITE_STATIC = sqlite_mod.SQLITE_STATIC;
 
 const log = std.log.scoped(.cron);
+
+pub const CronShellPolicyError = error{ CommandNotAllowed, HighRiskBlocked, MediumRiskBlocked, ApprovalRequired };
+
+pub const CronShellPolicyDecision = union(enum) {
+    allowed,
+    blocked: struct { err: CronShellPolicyError, failure_class: []const u8 },
+    fail_closed,
+};
+
+pub fn cronShellPolicyFailureClass(err: CronShellPolicyError) []const u8 {
+    return switch (err) {
+        error.MediumRiskBlocked => "policy_medium_blocked",
+        error.HighRiskBlocked => "policy_high_blocked",
+        error.CommandNotAllowed => "policy_denied",
+        error.ApprovalRequired => "policy_approval_required",
+    };
+}
+
+pub fn checkCronShellPolicy(pol_opt: ?*const security.SecurityPolicy, cmd: []const u8) CronShellPolicyDecision {
+    const pol = pol_opt orelse return .fail_closed;
+    _ = pol.validateCommandExecution(cmd, false) catch |err| {
+        return .{ .blocked = .{ .err = err, .failure_class = cronShellPolicyFailureClass(err) } };
+    };
+    return .allowed;
+}
 
 pub const JobType = enum {
     shell,
@@ -648,6 +674,7 @@ pub const CronScheduler = struct {
     /// no delivery config of its own (delivery.mode == .none).
     alert_delivery: ?DeliveryConfig = null,
     observer: ?observability.Observer = null,
+    security_policy: ?*const security.SecurityPolicy = null,
 
     pub fn init(allocator: std.mem.Allocator, max_tasks: usize, enabled: bool) CronScheduler {
         return .{
@@ -670,6 +697,10 @@ pub const CronScheduler = struct {
 
     pub fn setAlertDelivery(self: *CronScheduler, delivery: DeliveryConfig) void {
         self.alert_delivery = delivery;
+    }
+
+    pub fn setSecurityPolicy(self: *CronScheduler, policy: *const security.SecurityPolicy) void {
+        self.security_policy = policy;
     }
 
     fn freeJobOwned(self: *CronScheduler, job: CronJob) void {
@@ -1172,6 +1203,36 @@ pub const CronScheduler = struct {
                         null;
                     defer if (resolved_shell_cmd) |rc| self.allocator.free(rc);
                     const effective_shell_cmd = resolved_shell_cmd orelse job.command;
+                    const policy_decision = checkCronShellPolicy(self.security_policy, effective_shell_cmd);
+                    switch (policy_decision) {
+                        .allowed => {},
+                        .blocked => |blocked| {
+                            log.warn("cron shell job '{s}' blocked by policy: {s}", .{ job.id, @errorName(blocked.err) });
+                            job.last_status = "error";
+                            job.last_run_secs = now;
+                            if (job.last_output) |old| self.allocator.free(old);
+                            job.last_output = null;
+                            if (job.last_stderr) |old| self.allocator.free(old);
+                            job.last_stderr = self.allocator.dupe(u8, blocked.failure_class) catch null;
+                            if (out_bus) |b| {
+                                _ = deliverResult(self.allocator, job.delivery, "cron shell job blocked by policy", false, b) catch {};
+                            }
+                            continue;
+                        },
+                        .fail_closed => {
+                            log.err("security policy not available for cron shell job '{s}' - failing closed", .{job.id});
+                            job.last_status = "error";
+                            job.last_run_secs = now;
+                            if (job.last_output) |old| self.allocator.free(old);
+                            job.last_output = null;
+                            if (job.last_stderr) |old| self.allocator.free(old);
+                            job.last_stderr = self.allocator.dupe(u8, "policy_denied") catch null;
+                            if (out_bus) |b| {
+                                _ = deliverResult(self.allocator, job.delivery, "cron shell job blocked by policy", false, b) catch {};
+                            }
+                            continue;
+                        },
+                    }
                     const result = std_compat.process.Child.run(.{
                         .allocator = self.allocator,
                         .argv = &.{ platform.getShell(), platform.getShellFlag(), effective_shell_cmd },
@@ -1795,7 +1856,7 @@ pub fn resolveSkillExec(allocator: std.mem.Allocator, skill_name: ?[]const u8, s
 
 /// Validate that a skill name is safe for path construction.
 /// Rejects names containing path separators, null bytes, control characters, or "..".
-fn validateSkillNameSafe(name: []const u8) !void {
+pub fn validateSkillNameSafe(name: []const u8) !void {
     if (name.len == 0 or std.mem.eql(u8, name, "..")) return error.UnsafeSkillName;
     for (name) |ch| {
         if (ch == '/' or ch == '\\' or ch == '"' or ch == 0 or ch < 0x20) return error.UnsafeSkillName;
@@ -1808,7 +1869,7 @@ fn validateSkillNameSafe(name: []const u8) !void {
 /// underscores, dots, forward slashes, @, and valid UTF-8 bytes (>=0x80).
 /// Shell metacharacters are all ASCII (<0x80), so multi-byte UTF-8
 /// sequences cannot form shell syntax. The input must be valid UTF-8.
-fn validateSkillArgsSafe(args: []const u8) !void {
+pub fn validateSkillArgsSafe(args: []const u8) !void {
     if (!std.unicode.utf8ValidateSlice(args)) return error.UnsafeSkillArgs;
     for (args) |ch| {
         switch (ch) {
@@ -1866,6 +1927,14 @@ pub fn resolveSkillExecFrom(
         break;
     }
     const raw_path = script_path orelse return error.NoScriptPath;
+
+    // Basic safety: reject obvious shell metacharacters in the script path itself.
+    for (raw_path) |ch| {
+        switch (ch) {
+            ';', '&', '|', '`', '$', '(', ')', '<', '>', '\n', '\r', '\t' => return error.UnsafeSkillScriptPath,
+            else => {},
+        }
+    }
 
     // Expand leading ~ to tilde_home.
     const expanded = if (std.mem.startsWith(u8, raw_path, "~/"))
@@ -3224,6 +3293,13 @@ fn cronJsonPathFromDir(allocator: std.mem.Allocator, config_dir: []const u8) ![]
 fn cronJsonPath(allocator: std.mem.Allocator) ![]const u8 {
     const dir = try config_paths.defaultConfigDir(allocator);
     defer allocator.free(dir);
+
+    if (builtin.is_test) {
+        const leaf = try std.fmt.allocPrint(allocator, "cron-{d}.json", .{std.Thread.getCurrentId()});
+        defer allocator.free(leaf);
+        return config_paths.pathFromConfigDir(allocator, dir, leaf);
+    }
+
     return cronJsonPathFromDir(allocator, dir);
 }
 
@@ -5142,9 +5218,26 @@ fn cliRunJobLegacy(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) 
 
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
+    var security_tracker_opt: ?security.RateTracker = null;
+    defer if (security_tracker_opt) |*tracker| tracker.deinit();
+    var security_policy_opt: ?security.SecurityPolicy = null;
     if (cfg_opt) |cfg| {
         scheduler.setShellCwd(cfg.workspace_dir);
         scheduler.setAgentTimeoutSecs(cfg.scheduler.agent_timeout_secs);
+        security_tracker_opt = security.RateTracker.init(allocator, cfg.autonomy.max_actions_per_hour);
+        security_policy_opt = .{
+            .autonomy = cfg.autonomy.level,
+            .workspace_dir = cfg.workspace_dir,
+            .workspace_only = cfg.autonomy.workspace_only,
+            .allowed_commands = security.resolveAllowedCommands(cfg.autonomy.level, cfg.autonomy.allowed_commands),
+            .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
+            .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
+            .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
+            .block_medium_risk_commands = cfg.autonomy.block_medium_risk_commands,
+            .allow_raw_url_chars = cfg.autonomy.allow_raw_url_chars,
+            .tracker = if (security_tracker_opt) |*tracker| tracker else null,
+        };
+        if (security_policy_opt) |*policy| scheduler.setSecurityPolicy(policy);
     }
     try loadJobs(&scheduler);
     const run_cwd = resolveRunnableCwd(scheduler.shell_cwd);
@@ -5166,6 +5259,25 @@ fn cliRunJobLegacy(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) 
             const resolved_cli_cmd = resolveSkillCommand(allocator, job.command) catch null;
             defer if (resolved_cli_cmd) |rc| allocator.free(rc);
             const effective_cli_cmd = resolved_cli_cmd orelse job.command;
+            switch (checkCronShellPolicy(scheduler.security_policy, effective_cli_cmd)) {
+                .allowed => {},
+                .blocked => |blocked| {
+                    job.last_run_secs = run_at;
+                    job.last_status = "error";
+                    if (job.last_stderr) |old| allocator.free(old);
+                    job.last_stderr = allocator.dupe(u8, blocked.failure_class) catch null;
+                    log.warn("Job '{s}' blocked by policy: {s}", .{ id, @errorName(blocked.err) });
+                    std.process.exit(CronRunExit.verification_failed);
+                },
+                .fail_closed => {
+                    job.last_run_secs = run_at;
+                    job.last_status = "error";
+                    if (job.last_stderr) |old| allocator.free(old);
+                    job.last_stderr = allocator.dupe(u8, "policy_denied") catch null;
+                    log.err("Security policy unavailable for shell job '{s}'", .{id});
+                    std.process.exit(CronRunExit.verification_failed);
+                },
+            }
             const result = std_compat.process.Child.run(.{
                 .allocator = allocator,
                 .argv = &.{ platform.getShell(), platform.getShellFlag(), effective_cli_cmd },
@@ -5298,6 +5410,25 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
     // Load workspace cwd from config (best-effort).
     var cfg_opt: ?Config = Config.load(allocator) catch null;
     defer if (cfg_opt) |*cfg| cfg.deinit();
+    var security_tracker_opt: ?security.RateTracker = null;
+    defer if (security_tracker_opt) |*tracker| tracker.deinit();
+    var security_policy_opt: ?security.SecurityPolicy = null;
+    if (cfg_opt) |cfg| {
+        security_tracker_opt = security.RateTracker.init(allocator, cfg.autonomy.max_actions_per_hour);
+        security_policy_opt = .{
+            .autonomy = cfg.autonomy.level,
+            .workspace_dir = cfg.workspace_dir,
+            .workspace_only = cfg.autonomy.workspace_only,
+            .allowed_commands = security.resolveAllowedCommands(cfg.autonomy.level, cfg.autonomy.allowed_commands),
+            .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
+            .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
+            .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
+            .block_medium_risk_commands = cfg.autonomy.block_medium_risk_commands,
+            .allow_raw_url_chars = cfg.autonomy.allow_raw_url_chars,
+            .tracker = if (security_tracker_opt) |*tracker| tracker else null,
+        };
+    }
+    const security_policy_ptr: ?*const security.SecurityPolicy = if (security_policy_opt) |*policy| policy else null;
     const run_cwd: ?[]const u8 = blk: {
         if (cfg_opt) |cfg| {
             const resolved = resolveRunnableCwd(cfg.workspace_dir);
@@ -5500,6 +5631,24 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             // matching the scheduler worker's behavior.
             const resolved_cmd = resolveSkillCommand(spec_alloc, spec.command) catch null;
             const effective_cmd: []const u8 = resolved_cmd orelse spec.command;
+            switch (checkCronShellPolicy(security_policy_ptr, effective_cmd)) {
+                .allowed => {},
+                .blocked => |blocked| {
+                    const m = std.fmt.bufPrint(&msg_buf, "error: shell blocked by policy: {s}\n", .{@errorName(blocked.err)}) catch "error: shell blocked by policy\n";
+                    stderr_h.writeAll(m) catch {};
+                    var bad_result = execErrorRunResult();
+                    bad_result.failure_class = blocked.failure_class;
+                    dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, bad_result, run_trace_id, true, "cron_manual_shell", blocked.failure_class) catch {};
+                    std.process.exit(CronRunExit.verification_failed);
+                },
+                .fail_closed => {
+                    stderr_h.writeAll("error: security policy unavailable for shell job\n") catch {};
+                    var bad_result = execErrorRunResult();
+                    bad_result.failure_class = "policy_denied";
+                    dbCompleteJob(db, spec.id, queue_row_id, std_compat.time.timestamp(), "error", null, false, bad_result, run_trace_id, true, "cron_manual_shell", "policy_denied") catch {};
+                    std.process.exit(CronRunExit.verification_failed);
+                },
+            }
             const result = std_compat.process.Child.run(.{
                 .allocator = spec_alloc,
                 .argv = &.{ platform.getShell(), platform.getShellFlag(), effective_cmd },
@@ -8662,6 +8811,23 @@ test "captureStderrTail keeps only trailing bytes when over cap" {
     try std.testing.expect(std.mem.count(u8, got, "X") < buf.items.len - marker.len);
 }
 
+fn resetCronStoreForTest(allocator: std.mem.Allocator) !void {
+    const path = try cronJsonPath(allocator);
+    defer allocator.free(path);
+
+    std_compat.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+    std_compat.fs.deleteFileAbsolute(tmp_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
 test "parseDuration minutes" {
     try std.testing.expectEqual(@as(i64, 1800), try parseDuration("30m"));
 }
@@ -8979,6 +9145,7 @@ test "db upsert and load roundtrip" {
 }
 
 test "load agent job without command field falls back to prompt" {
+
     // Seed an isolated DB with an agent job that has NULL command but a prompt.
     // loadJobsStrict must populate command from the prompt field.
     var tmp = std.testing.tmpDir(.{});
@@ -9445,6 +9612,54 @@ test "addRun prunes history" {
     try std.testing.expect(runs.len <= 3);
 }
 
+const TestCronShellPolicyFixture = struct {
+    allocator: std.mem.Allocator,
+    tracker_ptr: *security.RateTracker,
+    policy_ptr: *security.SecurityPolicy,
+
+    fn init(allocator: std.mem.Allocator, scheduler: *CronScheduler) !TestCronShellPolicyFixture {
+        const tracker_ptr = try allocator.create(security.RateTracker);
+        errdefer allocator.destroy(tracker_ptr);
+        tracker_ptr.* = security.RateTracker.init(allocator, 100);
+
+        const policy_ptr = try allocator.create(security.SecurityPolicy);
+        errdefer {
+            tracker_ptr.deinit();
+            allocator.destroy(tracker_ptr);
+        }
+        errdefer allocator.destroy(policy_ptr);
+        policy_ptr.* = .{
+            .autonomy = .full,
+            .allowed_commands = &.{"*"},
+            .block_medium_risk_commands = false,
+            .block_high_risk_commands = false,
+            .tracker = tracker_ptr,
+        };
+        scheduler.setSecurityPolicy(policy_ptr);
+
+        return .{
+            .allocator = allocator,
+            .tracker_ptr = tracker_ptr,
+            .policy_ptr = policy_ptr,
+        };
+    }
+
+    fn deinit(self: *TestCronShellPolicyFixture) void {
+        self.tracker_ptr.deinit();
+        self.allocator.destroy(self.tracker_ptr);
+        self.allocator.destroy(self.policy_ptr);
+    }
+};
+
+test "checkCronShellPolicy fails closed when policy missing" {
+    // Regression: test builds must not silently treat a missing scheduler
+    // SecurityPolicy as allowed; only I/O side effects may be bypassed in tests.
+    switch (checkCronShellPolicy(null, "echo no-policy")) {
+        .fail_closed => {},
+        else => return error.ExpectedFailClosed,
+    }
+}
+
 test "listRuns returns only matching job runs when interleaved" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
@@ -9701,6 +9916,8 @@ test "one-shot job deleted after tick execution" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
+    var policy_fixture = try TestCronShellPolicyFixture.init(allocator, &scheduler);
+    defer policy_fixture.deinit();
 
     const job = try scheduler.addOnce("1s", "echo oneshot");
     // Verify job was created
@@ -9727,8 +9944,10 @@ test "shell job uses configured cwd for relative output paths" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     scheduler.setShellCwd(workspace);
     defer scheduler.deinit();
+    var policy_fixture = try TestCronShellPolicyFixture.init(std.testing.allocator, &scheduler);
+    defer policy_fixture.deinit();
 
-    _ = try scheduler.addOnce("1s", "echo cwd_ok > cwd_proof.txt");
+    _ = try scheduler.addOnce("1s", "touch cwd_proof.txt");
     scheduler.jobs.items[0].next_run_secs = 0;
 
     _ = scheduler.tick(std_compat.time.timestamp(), null);
@@ -9741,6 +9960,8 @@ test "shell job delivers stdout via bus" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
+    var policy_fixture = try TestCronShellPolicyFixture.init(allocator, &scheduler);
+    defer policy_fixture.deinit();
 
     var test_bus = bus.Bus.init();
     defer test_bus.close();
@@ -9866,6 +10087,8 @@ test "tick without bus still executes jobs" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
+    var policy_fixture = try TestCronShellPolicyFixture.init(allocator, &scheduler);
+    defer policy_fixture.deinit();
 
     _ = try scheduler.addJob("* * * * *", "echo silent");
     scheduler.jobs.items[0].next_run_secs = 0;
@@ -9876,6 +10099,37 @@ test "tick without bus still executes jobs" {
     // Job should have been executed and rescheduled
     try std.testing.expectEqualStrings("ok", scheduler.jobs.items[0].last_status.?);
     try std.testing.expect(scheduler.jobs.items[0].next_run_secs > 0);
+}
+
+test "CronScheduler tick blocks shell command when policy denies medium risk" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    const tracker_ptr = try allocator.create(security.RateTracker);
+    defer {
+        tracker_ptr.deinit();
+        allocator.destroy(tracker_ptr);
+    }
+    tracker_ptr.* = security.RateTracker.init(allocator, 20);
+
+    const policy_ptr = try allocator.create(security.SecurityPolicy);
+    defer allocator.destroy(policy_ptr);
+    policy_ptr.* = .{
+        .autonomy = .full,
+        .allowed_commands = &.{"curl"},
+        .block_medium_risk_commands = true,
+        .tracker = tracker_ptr,
+    };
+    scheduler.setSecurityPolicy(policy_ptr);
+
+    _ = try scheduler.addJob("* * * * *", "curl https://example.com");
+    scheduler.jobs.items[0].next_run_secs = 0;
+
+    _ = scheduler.tick(0, null);
+
+    try std.testing.expectEqualStrings("error", scheduler.jobs.items[0].last_status.?);
+    try std.testing.expectEqualStrings("policy_medium_blocked", scheduler.jobs.items[0].last_stderr.?);
 }
 
 test "tick records cron start delivery attribution" {
@@ -9926,6 +10180,8 @@ test "tick records cron start delivery attribution" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
+    var policy_fixture = try TestCronShellPolicyFixture.init(allocator, &scheduler);
+    defer policy_fixture.deinit();
 
     var observer = RecordingObserver{};
     scheduler.observer = observer.observer();
@@ -9947,6 +10203,8 @@ test "tick reschedules recurring job using cron expression" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
+    var policy_fixture = try TestCronShellPolicyFixture.init(allocator, &scheduler);
+    defer policy_fixture.deinit();
 
     _ = try scheduler.addJob("*/10 * * * *", "echo periodic");
     scheduler.jobs.items[0].next_run_secs = 0;
@@ -9959,6 +10217,8 @@ test "tick reschedules anchored recurring job using cron expression" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
+    var policy_fixture = try TestCronShellPolicyFixture.init(allocator, &scheduler);
+    defer policy_fixture.deinit();
 
     _ = try scheduler.addJob("8/25 * * * *", "echo anchored");
     scheduler.jobs.items[0].next_run_secs = 480;
@@ -11880,4 +12140,100 @@ test "buildSchedulerStatusJson reports scheduler summary" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"job_count\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"active_jobs\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"paused_jobs\":1") != null);
+}
+
+test "cron register + cancel leaks zero bytes for every job kind" {
+    // Uses the leak-detecting GPA (std.testing.allocator). Any allocation
+    // in addJob / addOnce / addAgentJob / addAgentOnce that is not freed
+    // by removeJob will be reported as a leak when the test runner tears
+    // down the allocator.
+    //
+    // The agent-job path is the most leak-prone — it allocates id,
+    // expression, command, prompt, model (optional), delivery.channel,
+    // delivery.account_id, delivery.to, delivery.peer_id, and
+    // delivery.thread_id, each behind its own _owned flag in freeJobOwned.
+    // The original new test only covered addJob + addOnce and would have
+    // missed a regression in any of those agent-only fields.
+    const alloc = std.testing.allocator;
+
+    var sched = CronScheduler.init(alloc, 10, true);
+    defer sched.deinit();
+
+    // Recurring shell job.
+    const recurring = try sched.addJob("*/5 * * * *", "echo recurring");
+    // dupe the id because removeJob takes ownership of (frees) the matched
+    // job's heap-owned id; passing the original `recurring.id` slice would
+    // be a use-after-free pattern.
+    const recurring_id = try alloc.dupe(u8, recurring.id);
+    defer alloc.free(recurring_id);
+    try std.testing.expect(sched.removeJob(recurring_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // One-shot shell job: extra `@once:<delay>` expression allocation.
+    const once = try sched.addOnce("10m", "echo once");
+    const once_id = try alloc.dupe(u8, once.id);
+    defer alloc.free(once_id);
+    try std.testing.expect(sched.removeJob(once_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // Recurring agent job: every delivery field non-null to exercise the
+    // full _owned-flag matrix in freeJobOwned.
+    const agent_recurring = try sched.addAgentJob("*/15 * * * *", "be helpful", "claude-sonnet", .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "main",
+        .to = "12345",
+        .peer_kind = .direct,
+        .peer_id = "user-99",
+        .thread_id = "topic-7",
+        .best_effort = false,
+    });
+    const agent_recurring_id = try alloc.dupe(u8, agent_recurring.id);
+    defer alloc.free(agent_recurring_id);
+    try std.testing.expect(sched.removeJob(agent_recurring_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // One-shot agent job: same field matrix, plus the `@once:<delay>` expr.
+    // Pass `null` for model to exercise the optional-skip path.
+    const agent_once = try sched.addAgentOnce("5m", "remind me", null, .{
+        .mode = .on_success,
+        .channel = "discord",
+        .account_id = "guild-42",
+        .to = "channel-7",
+        .peer_kind = .group,
+        .peer_id = "guild-42",
+        .thread_id = null,
+        .best_effort = true,
+    });
+    const agent_once_id = try alloc.dupe(u8, agent_once.id);
+    defer alloc.free(agent_once_id);
+    try std.testing.expect(sched.removeJob(agent_once_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // removeJob on an unknown id must return false without leaking or
+    // crashing, regardless of whether jobs are present.
+    try std.testing.expect(!sched.removeJob("nonexistent-id"));
+}
+
+test "cron rejects obviously malformed expressions" {
+    // Each input exercises a distinct branch in parseCronExpression /
+    // parseCronField. Note: "* * * * * * *" (7 fields) is valid per the
+    // spec and is excluded.
+    const malformed = [_][]const u8{
+        "", // empty
+        "garbage", // single non-cron token
+        "* * *", // wrong field count (3, not 5/6/7)
+        "60 * * * *", // minute out of range
+        "* 24 * * *", // hour out of range
+        "* * 32 * *", // day-of-month out of range
+        "* * * 13 *", // month out of range
+        "* * * * 8", // day-of-week out of range (allow_sunday_7 caps at 7)
+        "*/0 * * * *", // step = 0 — divide-by-zero classic
+        "5-3 * * * *", // reversed range (start > end)
+        "abc * * * *", // alphabetic in numeric field
+    };
+    for (malformed) |input| {
+        const result = nextRunForCronExpression(input, 0);
+        try std.testing.expect(std.meta.isError(result));
+    }
 }

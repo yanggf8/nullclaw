@@ -15,6 +15,7 @@ const build_options = @import("build_options");
 const root = @import("root.zig");
 const types = @import("types.zig");
 const cron = @import("../cron.zig");
+const security = @import("../security/policy.zig");
 
 const sqlite_mod = if (build_options.enable_sqlite)
     @import("../memory/engines/sqlite.zig")
@@ -1336,6 +1337,123 @@ test "DbCronBackend complete deletes delete_after_run job and records run" {
     _ = c.sqlite3_bind_text(stmt, 1, job.id.ptr, @intCast(job.id.len), SQLITE_STATIC);
     try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(stmt));
     try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 0));
+}
+
+test "DbCronBackend policy block on shell job records failure_class" {
+    // Regression: DB-direct shell dispatch must persist the policy failure class
+    // when SecurityPolicy blocks before spawn.
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/policy_block.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    var backend = try DbCronBackend.init(allocator, db_path_z);
+    defer backend.deinit();
+    const be = backend.backend();
+
+    const job = try be.add(allocator, .{
+        .expression = "* * * * *",
+        .command = "curl https://example.com",
+        .job_type = .shell,
+    });
+    defer {
+        allocator.free(job.id);
+        allocator.free(job.expression);
+        allocator.free(job.command);
+    }
+
+    try be.enqueue(job.id, 1000);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const dequeued = (try be.dequeue(arena.allocator())).?;
+
+    const tracker_ptr = try allocator.create(security.RateTracker);
+    defer {
+        tracker_ptr.deinit();
+        allocator.destroy(tracker_ptr);
+    }
+    tracker_ptr.* = security.RateTracker.init(allocator, 20);
+
+    const policy_ptr = try allocator.create(security.SecurityPolicy);
+    defer allocator.destroy(policy_ptr);
+    policy_ptr.* = .{
+        .autonomy = .full,
+        .allowed_commands = &.{"curl"},
+        .block_medium_risk_commands = true,
+        .tracker = tracker_ptr,
+    };
+
+    const decision = cron.checkCronShellPolicy(policy_ptr, dequeued.spec.command);
+    const blocked = switch (decision) {
+        .blocked => |b| b,
+        .allowed => return error.ExpectedPolicyBlock,
+        .fail_closed => return error.ExpectedPolicyBlock,
+    };
+    try std.testing.expectEqual(error.MediumRiskBlocked, blocked.err);
+    try std.testing.expectEqualStrings("policy_medium_blocked", blocked.failure_class);
+
+    var bad_result = cron.execErrorRunResult();
+    bad_result.failure_class = blocked.failure_class;
+
+    const db = try cron.openCronDbAtPath(db_path_z);
+    defer cron.closeCronDb(db);
+    try cron.ensureCronTable(db);
+    try cron.dbCompleteJob(
+        db,
+        dequeued.spec.id,
+        dequeued.queue_row_id,
+        1001,
+        "error",
+        null,
+        false,
+        bad_result,
+        "policy-block-test:1",
+        false,
+        "cron_scheduler_shell",
+        null,
+    );
+
+    var runs_json: std.ArrayListUnmanaged(u8) = .empty;
+    defer runs_json.deinit(allocator);
+    try cron.dbListRunsJson(db, job.id, 10, &runs_json, allocator);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, runs_json.items, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .array);
+
+    var found_run = false;
+    for (parsed.value.array.items) |run_value| {
+        if (run_value != .object) continue;
+        const obj = run_value.object;
+        const run_job_id = obj.get("job_id") orelse continue;
+        if (run_job_id != .string or !std.mem.eql(u8, run_job_id.string, job.id)) continue;
+
+        found_run = true;
+        const status = obj.get("status") orelse return error.MissingStatus;
+        try std.testing.expect(status == .string);
+        try std.testing.expectEqualStrings("error", status.string);
+
+        const failure_class = obj.get("failure_class") orelse return error.MissingFailureClass;
+        try std.testing.expect(failure_class == .string);
+        try std.testing.expectEqualStrings("policy_medium_blocked", failure_class.string);
+
+        const verified = obj.get("verified") orelse return error.MissingVerified;
+        try std.testing.expect(verified == .integer);
+        try std.testing.expect(verified.integer != 0);
+
+        const source = obj.get("source") orelse return error.MissingSource;
+        try std.testing.expect(source == .string);
+        try std.testing.expectEqualStrings("cron_scheduler_shell", source.string);
+    }
+    try std.testing.expect(found_run);
 }
 
 test "DbCronBackend tick enqueues due jobs" {

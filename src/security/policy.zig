@@ -51,12 +51,19 @@ pub const CommandRiskLevel = enum {
 };
 
 /// High-risk commands that are always blocked/require elevated approval.
+/// These are inherently destructive or system-level commands.
 const high_risk_commands = [_][]const u8{
     "rm",       "mkfs",         "dd",     "shutdown", "reboot", "halt",
     "poweroff", "sudo",         "su",     "chown",    "chmod",  "useradd",
     "userdel",  "usermod",      "passwd", "mount",    "umount", "iptables",
-    "ufw",      "firewall-cmd", "curl",   "wget",     "nc",     "ncat",
-    "netcat",   "scp",          "ssh",    "ftp",      "telnet",
+    "ufw",      "firewall-cmd", "ssh",
+};
+
+/// Medium-risk commands with network access or file transfer capability.
+/// Not inherently destructive, but can exfiltrate data or fetch remote content.
+const medium_risk_commands = [_][]const u8{
+    "curl", "wget", "nc",     "ncat", "netcat",
+    "scp",  "ftp",  "telnet",
 };
 
 /// Default allowed commands
@@ -83,10 +90,11 @@ pub fn resolveAllowedCommands(
 pub const PolicyGates = packed struct(u8) {
     command_not_allowed: bool = false,
     high_risk_blocked: bool = false,
+    medium_risk_blocked: bool = false,
     approval_required: bool = false,
     rate_limited: bool = false,
     autonomy_blocked: bool = false,
-    _pad: u3 = 0,
+    _pad: u2 = 0,
 };
 
 /// Structured audit entry emitted for every policy decision.
@@ -111,6 +119,10 @@ pub const SecurityPolicy = struct {
     max_actions_per_hour: u32 = 20,
     require_approval_for_medium_risk: bool = true,
     block_high_risk_commands: bool = true,
+    /// When true, block medium-risk commands. This includes network/transfer
+    /// commands (curl, wget, nc, scp, ftp, telnet) and state-changing commands
+    /// classified by arguments (git commit, npm install, touch, mkdir, etc.).
+    block_medium_risk_commands: bool = true,
     /// When true, skip the single-`&` check entirely so that bare
     /// `&` in URLs (e.g. `curl https://...?a=1&b=2`) is permitted.
     allow_raw_url_chars: bool = false,
@@ -143,7 +155,7 @@ pub const SecurityPolicy = struct {
             const segment = std.mem.trim(u8, raw_segment, " \t");
             if (segment.len == 0) continue;
 
-            const cmd_part = skipEnvAssignments(segment);
+            const cmd_part = skipShellPrefixes(skipEnvAssignments(segment));
             var words = std.mem.tokenizeScalar(u8, cmd_part, ' ');
             const base_raw = words.next() orelse continue;
 
@@ -167,7 +179,13 @@ pub const SecurityPolicy = struct {
                 return .high;
             }
 
-            // Medium-risk commands
+            // Medium-risk commands (network/transfer capability)
+            if (isMediumRiskCommand(lower_base.slice())) {
+                saw_medium = true;
+                continue;
+            }
+
+            // Medium-risk commands (argument-based classification)
             const first_arg = words.next();
             const medium = classifyMedium(lower_base.slice(), first_arg);
             saw_medium = saw_medium or medium;
@@ -182,7 +200,7 @@ pub const SecurityPolicy = struct {
         self: *const SecurityPolicy,
         command: []const u8,
         approved: bool,
-    ) error{ CommandNotAllowed, HighRiskBlocked, ApprovalRequired }!CommandRiskLevel {
+    ) error{ CommandNotAllowed, HighRiskBlocked, MediumRiskBlocked, ApprovalRequired }!CommandRiskLevel {
         if (self.autonomy == .yolo) return .low;
         if (!self.isCommandAllowed(command)) {
             self.audit(.{
@@ -226,21 +244,36 @@ pub const SecurityPolicy = struct {
             }
         }
 
-        if (risk == .medium and
-            self.autonomy == .supervised and
-            self.require_approval_for_medium_risk and
-            !approved)
-        {
-            self.audit(.{
-                .timestamp_ns = std_compat.time.nanoTimestamp(),
-                .action_type = .command,
-                .command = command,
-                .risk_level = risk,
-                .gates_fired = .{ .approval_required = true },
-                .decision = .denied,
-                .denial_reason = "approval required for medium-risk command",
-            });
-            return error.ApprovalRequired;
+        // Upstream 3-tier + block_medium_risk_commands is the new ground truth (Rule 2).
+        // Integrated our explicit audit on the approval path for observability consistency with cron/shell jobs.
+        if (risk == .medium) {
+            if (self.block_medium_risk_commands) {
+                self.audit(.{
+                    .timestamp_ns = std_compat.time.nanoTimestamp(),
+                    .action_type = .command,
+                    .command = command,
+                    .risk_level = risk,
+                    .gates_fired = .{ .medium_risk_blocked = true },
+                    .decision = .denied,
+                    .denial_reason = "medium risk blocked",
+                });
+                return error.MediumRiskBlocked;
+            }
+            if (self.autonomy == .supervised and
+                self.require_approval_for_medium_risk and
+                !approved)
+            {
+                self.audit(.{
+                    .timestamp_ns = std_compat.time.nanoTimestamp(),
+                    .action_type = .command,
+                    .command = command,
+                    .risk_level = risk,
+                    .gates_fired = .{ .approval_required = true },
+                    .decision = .denied,
+                    .denial_reason = "approval required for medium-risk command",
+                });
+                return error.ApprovalRequired;
+            }
         }
 
         self.audit(.{
@@ -305,8 +338,9 @@ pub const SecurityPolicy = struct {
         while (iter.next()) |raw_segment| {
             const segment = std.mem.trim(u8, raw_segment, " \t");
             if (segment.len == 0) continue;
+            if (!envAssignmentPrefixesAllowed(segment)) return false;
 
-            const cmd_part = skipEnvAssignments(segment);
+            const cmd_part = skipShellPrefixes(skipEnvAssignments(segment));
             var words = std.mem.tokenizeScalar(u8, cmd_part, ' ');
             const first_word = words.next() orelse continue;
             if (first_word.len == 0) continue;
@@ -579,14 +613,101 @@ fn skipEnvAssignments(s: []const u8) []const u8 {
     }
 }
 
+fn envAssignmentPrefixesAllowed(s: []const u8) bool {
+    var rest = s;
+    while (true) {
+        const trimmed = std.mem.trim(u8, rest, " \t");
+        if (trimmed.len == 0) return true;
+
+        const word_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse trimmed.len;
+        const word = trimmed[0..word_end];
+        const eq = std.mem.indexOfScalar(u8, word, '=') orelse return true;
+        if (word.len == 0 or (!std.ascii.isAlphabetic(word[0]) and word[0] != '_')) return true;
+
+        const name = word[0..eq];
+        if (!isSafeTransparentEnvName(name)) return false;
+        rest = if (word_end < trimmed.len) trimmed[word_end..] else "";
+    }
+}
+
+fn isSafeTransparentEnvName(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "LANG")) return true;
+    if (std.mem.eql(u8, name, "LC_ALL")) return true;
+    if (std.mem.startsWith(u8, name, "LC_")) return true;
+    if (std.mem.eql(u8, name, "TZ")) return true;
+    if (std.mem.eql(u8, name, "TERM")) return true;
+    if (std.mem.eql(u8, name, "NO_COLOR")) return true;
+    if (std.mem.eql(u8, name, "CLICOLOR")) return true;
+    if (std.mem.eql(u8, name, "CLICOLOR_FORCE")) return true;
+    if (std.mem.eql(u8, name, "FORCE_COLOR")) return true;
+    if (std.mem.eql(u8, name, "COLORTERM")) return true;
+    return false;
+}
+
+/// Shell builtin prefixes that are transparent to the actual command.
+/// These are stripped before allowlist/risk checking so that
+/// `exec curl ...` is treated as `curl ...`.
+const shell_prefixes = [_][]const u8{
+    "exec", "time", "nice", "nohup",
+};
+
+/// Skip leading shell builtin prefixes (exec, time, nice, nohup).
+/// For `exec`, only strips when followed by a command (not fd operations
+/// like `exec 3< file` or `exec 3>&-`).
+fn skipShellPrefixes(s: []const u8) []const u8 {
+    var rest = s;
+    while (true) {
+        const trimmed = std.mem.trim(u8, rest, " \t");
+        if (trimmed.len == 0) return rest;
+
+        // Find end of first word
+        const word_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse trimmed.len;
+        const word = trimmed[0..word_end];
+
+        // Check if it's a known shell prefix
+        const lower_word = lowerBuf(word);
+        var is_prefix = false;
+        for (&shell_prefixes) |prefix| {
+            if (std.mem.eql(u8, lower_word.slice(), prefix)) {
+                is_prefix = true;
+                break;
+            }
+        }
+
+        if (!is_prefix) return trimmed;
+
+        // For exec, only strip if next token is NOT a digit (fd operation)
+        if (std.mem.eql(u8, lower_word.slice(), "exec") and word_end < trimmed.len) {
+            const after = std.mem.trim(u8, trimmed[word_end..], " \t");
+            if (after.len > 0 and std.ascii.isDigit(after[0])) {
+                // exec 3< file or exec 3>&- — fd operation, don't strip
+                return trimmed;
+            }
+        }
+
+        rest = if (word_end < trimmed.len) trimmed[word_end..] else "";
+    }
+}
+
 /// Extract basename from a path (everything after last separator)
 fn extractBasename(path: []const u8) []const u8 {
     return std_compat.fs.path.basename(path);
 }
 
-/// Check if a command basename is in the high-risk set
+/// Check if a command basename is in the high-risk set.
+/// Also catches mkfs.* variants (mkfs.ext4, mkfs.btrfs, mkfs.ntfs, etc.) which
+/// all format file systems and are equally destructive.
 fn isHighRiskCommand(base: []const u8) bool {
     for (&high_risk_commands) |cmd| {
+        if (std.mem.eql(u8, base, cmd)) return true;
+    }
+    if (std.mem.startsWith(u8, base, "mkfs.")) return true;
+    return false;
+}
+
+/// Check if a command basename is in the medium-risk set
+fn isMediumRiskCommand(base: []const u8) bool {
+    for (&medium_risk_commands) |cmd| {
         if (std.mem.eql(u8, base, cmd)) return true;
     }
     return false;
@@ -930,6 +1051,10 @@ test "empty command blocked" {
     const p = SecurityPolicy{};
     try std.testing.expect(!p.isCommandAllowed(""));
     try std.testing.expect(!p.isCommandAllowed("   "));
+    // Mixed whitespace (tab + newline) — newline gets normalized into a
+    // segment separator so segments-iterator yields empty entries that the
+    // `if (segment.len == 0) continue;` skip drops, leaving has_cmd = false.
+    try std.testing.expect(!p.isCommandAllowed("\t\n"));
 }
 
 test "command with pipes validates all segments" {
@@ -986,11 +1111,32 @@ test "command injection dollar brace blocked" {
     try std.testing.expect(!p.isCommandAllowed("echo ${IFS}cat${IFS}/etc/passwd"));
 }
 
-test "command env var prefix with allowed cmd" {
+test "command safe env var prefix with allowed cmd" {
     const p = SecurityPolicy{};
-    try std.testing.expect(p.isCommandAllowed("FOO=bar ls"));
     try std.testing.expect(p.isCommandAllowed("LANG=C grep pattern file"));
+    try std.testing.expect(p.isCommandAllowed("LC_ALL=C ls"));
     try std.testing.expect(!p.isCommandAllowed("FOO=bar rm -rf /"));
+}
+
+test "command unsafelisted env var prefix is denied" {
+    // Anything outside the safelist (LANG/LC_*/TZ/TERM/NO_COLOR/CLICOLOR*/
+    // FORCE_COLOR/COLORTERM) is denied per `envAssignmentPrefixesAllowed`.
+    // Each case here pairs the env prefix with `ls` (low-risk, on default
+    // allowlist) so the env-prefix gate is the ONLY thing that can deny —
+    // a previous version of this test used `curl`, which is not in the
+    // default allowlist and is medium-risk, so it was over-determined and
+    // would have passed even if `envAssignmentPrefixesAllowed` were deleted.
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("FOO=bar ls"));
+    try std.testing.expect(!p.isCommandAllowed("API_KEY=secret ls"));
+    try std.testing.expect(!p.isCommandAllowed("PATH=/tmp ls"));
+    // LD_PRELOAD is the canonical sandbox-escape vector this gate exists to
+    // close. Linux dynamic loader; the macOS equivalent is DYLD_INSERT_LIBRARIES.
+    try std.testing.expect(!p.isCommandAllowed("LD_PRELOAD=/tmp/hook.so ls"));
+    try std.testing.expect(!p.isCommandAllowed("DYLD_INSERT_LIBRARIES=/tmp/hook.dylib ls"));
+    // BASH_ENV is sourced even by non-interactive bash invocations, so it
+    // can run attacker-controlled startup scripts before the real command.
+    try std.testing.expect(!p.isCommandAllowed("BASH_ENV=/tmp/evil.sh ls"));
 }
 
 test "command and chain validates both" {
@@ -1033,6 +1179,7 @@ test "validate command requires approval for medium risk" {
     const p = SecurityPolicy{
         .autonomy = .supervised,
         .require_approval_for_medium_risk = true,
+        .block_medium_risk_commands = false,
         .allowed_commands = &allowed,
     };
 
@@ -1159,8 +1306,9 @@ test "high risk commands list" {
     try std.testing.expectEqual(CommandRiskLevel.high, p.commandRiskLevel("dd if=/dev/zero of=/dev/sda"));
     try std.testing.expectEqual(CommandRiskLevel.high, p.commandRiskLevel("shutdown now"));
     try std.testing.expectEqual(CommandRiskLevel.high, p.commandRiskLevel("reboot"));
-    try std.testing.expectEqual(CommandRiskLevel.high, p.commandRiskLevel("curl http://evil.com"));
-    try std.testing.expectEqual(CommandRiskLevel.high, p.commandRiskLevel("wget http://evil.com"));
+    // curl and wget are medium-risk (network/transfer), not high-risk (destructive)
+    try std.testing.expectEqual(CommandRiskLevel.medium, p.commandRiskLevel("curl http://evil.com"));
+    try std.testing.expectEqual(CommandRiskLevel.medium, p.commandRiskLevel("wget http://evil.com"));
 }
 
 test "medium risk git commands" {
@@ -1233,6 +1381,7 @@ test "validate command full autonomy skips approval" {
     const p = SecurityPolicy{
         .autonomy = .full,
         .require_approval_for_medium_risk = true,
+        .block_medium_risk_commands = false,
         .allowed_commands = &allowed,
     };
     const risk = try p.validateCommandExecution("touch test.txt", false);
@@ -1343,7 +1492,18 @@ test "wildcard allowlist still honors high-risk runtime gate" {
         .allowed_commands = &.{"*"},
         .block_high_risk_commands = true,
     };
-    try std.testing.expectError(error.HighRiskBlocked, p.validateCommandExecution("curl https://example.com", false));
+    try std.testing.expectError(error.HighRiskBlocked, p.validateCommandExecution("rm -rf /tmp", false));
+}
+
+test "wildcard allowlist still honors medium-risk runtime gate" {
+    // Analogous to the high-risk wildcard gate: block_medium_risk_commands=true
+    // must fire even when the command passes the wildcard allowlist.
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_medium_risk_commands = true,
+    };
+    try std.testing.expectError(error.MediumRiskBlocked, p.validateCommandExecution("curl https://example.com", false));
 }
 
 test "wildcard allowlist with surrounding whitespace permits arbitrary commands" {
@@ -1383,18 +1543,38 @@ test "allowlist command-star entries still enforce command-specific arg safety" 
 test "allowlist command-star entry reaches high-risk runtime gate" {
     var blocked = SecurityPolicy{
         .autonomy = .full,
-        .allowed_commands = &.{"curl *"},
+        .allowed_commands = &.{"rm *"},
         .block_high_risk_commands = true,
     };
-    try std.testing.expectError(error.HighRiskBlocked, blocked.validateCommandExecution("curl https://example.com", false));
+    try std.testing.expectError(error.HighRiskBlocked, blocked.validateCommandExecution("rm -rf /tmp", false));
+
+    var unblocked = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"rm *"},
+        .block_high_risk_commands = false,
+    };
+    const risk = try unblocked.validateCommandExecution("rm -rf /tmp", false);
+    try std.testing.expectEqual(CommandRiskLevel.high, risk);
+}
+
+test "allowlist command-star entry reaches medium-risk runtime gate" {
+    // Regression: curl was high-risk before 3-tier reclassification; after reclassification
+    // it must still be blocked by block_medium_risk_commands=true even if explicitly allowlisted.
+    var blocked = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"curl *"},
+        .block_medium_risk_commands = true,
+    };
+    try std.testing.expectError(error.MediumRiskBlocked, blocked.validateCommandExecution("curl https://example.com", false));
 
     var unblocked = SecurityPolicy{
         .autonomy = .full,
         .allowed_commands = &.{"curl *"},
-        .block_high_risk_commands = false,
+        .block_medium_risk_commands = false,
+        .require_approval_for_medium_risk = false,
     };
     const risk = try unblocked.validateCommandExecution("curl https://example.com", false);
-    try std.testing.expectEqual(CommandRiskLevel.high, risk);
+    try std.testing.expectEqual(CommandRiskLevel.medium, risk);
 }
 
 test "containsSingleAmpersand detects correctly" {
@@ -1710,11 +1890,12 @@ test "full autonomy wildcard end-to-end: validateCommandExecution passes" {
         .autonomy = .full,
         .allowed_commands = &.{"*"},
         .block_high_risk_commands = false,
+        .block_medium_risk_commands = false,
         .require_approval_for_medium_risk = false,
     };
-    // High-risk commands pass with full autonomy + wildcard + block_high_risk disabled
+    // curl is medium-risk (network/transfer) since the 3-tier reclassification
     const risk = try p.validateCommandExecution("curl https://example.com", false);
-    try std.testing.expectEqual(CommandRiskLevel.high, risk);
+    try std.testing.expectEqual(CommandRiskLevel.medium, risk);
 
     // Medium-risk commands pass
     const risk2 = try p.validateCommandExecution("npm install express", false);
@@ -1812,8 +1993,7 @@ test "yolo isRateLimited always false" {
     try std.testing.expect(p.isRateLimited() == false);
 }
 
-// ── Audit callback tests ─────────────────────────────────────────
-
+// ── Audit callback tests (preserved from feat/cron-subagent) ────────
 const TestAuditCapture = struct {
     entry: ?PolicyAuditEntry = null,
     count: usize = 0,
@@ -1827,17 +2007,15 @@ const TestAuditCapture = struct {
 
 test "audit callback fires on high_risk_blocked" {
     var cap = TestAuditCapture{};
-    // curl is in high_risk_commands; add it to allowed_commands so it passes isCommandAllowed
-    // but then hits the block_high_risk_commands gate.
+    // rm (and similar) remain high-risk under the upstream 3-tier model.
     const p = SecurityPolicy{
         .autonomy = .supervised,
-        .allowed_commands = &.{"curl"},
-        .allow_raw_url_chars = true,
+        .allowed_commands = &.{"rm"},
         .block_high_risk_commands = true,
         .audit_fn = TestAuditCapture.callback,
         .audit_ctx = &cap,
     };
-    _ = p.validateCommandExecution("curl https://example.com", false) catch {};
+    _ = p.validateCommandExecution("rm -rf /tmp", false) catch {};
     try std.testing.expectEqual(@as(usize, 1), cap.count);
     const e = cap.entry.?;
     try std.testing.expectEqual(e.decision, .denied);
@@ -1874,7 +2052,7 @@ test "audit callback fires allowed decision" {
 test "audit callback fires on rate_limited" {
     var tracker = RateTracker.init(std.testing.allocator, 1);
     defer tracker.deinit();
-    _ = try tracker.recordAction(); // fill the limit
+    _ = try tracker.recordAction();
     var cap = TestAuditCapture{};
     const p = SecurityPolicy{
         .autonomy = .supervised,
@@ -1887,4 +2065,147 @@ test "audit callback fires on rate_limited" {
     try std.testing.expectEqual(@as(usize, 1), cap.count);
     try std.testing.expect(cap.entry.?.gates_fired.rate_limited);
     try std.testing.expectEqual(cap.entry.?.decision, .denied);
+}
+
+// ── 3-tier risk classification + block_medium gate (from upstream) ─
+test "curl classified as medium risk not high" {
+    const p = SecurityPolicy{};
+    try std.testing.expectEqual(CommandRiskLevel.medium, p.commandRiskLevel("curl https://example.com"));
+}
+
+test "wget classified as medium risk not high" {
+    const p = SecurityPolicy{};
+    try std.testing.expectEqual(CommandRiskLevel.medium, p.commandRiskLevel("wget https://example.com/file.txt"));
+}
+
+test "nc classified as medium risk not high" {
+    const p = SecurityPolicy{};
+    try std.testing.expectEqual(CommandRiskLevel.medium, p.commandRiskLevel("nc -zv host 80"));
+}
+
+test "scp classified as medium risk not high" {
+    const p = SecurityPolicy{};
+    try std.testing.expectEqual(CommandRiskLevel.medium, p.commandRiskLevel("scp file user@host:/path"));
+}
+
+test "ftp classified as medium risk not high" {
+    const p = SecurityPolicy{};
+    try std.testing.expectEqual(CommandRiskLevel.medium, p.commandRiskLevel("ftp host"));
+}
+
+test "telnet classified as medium risk not high" {
+    const p = SecurityPolicy{};
+    try std.testing.expectEqual(CommandRiskLevel.medium, p.commandRiskLevel("telnet host 80"));
+}
+
+test "ncat classified as medium risk not high" {
+    const p = SecurityPolicy{};
+    try std.testing.expectEqual(CommandRiskLevel.medium, p.commandRiskLevel("ncat -zv host 80"));
+}
+
+test "netcat classified as medium risk not high" {
+    const p = SecurityPolicy{};
+    try std.testing.expectEqual(CommandRiskLevel.medium, p.commandRiskLevel("netcat -zv host 80"));
+}
+
+test "mkfs bare classified as high risk" {
+    const p = SecurityPolicy{};
+    try std.testing.expectEqual(CommandRiskLevel.high, p.commandRiskLevel("mkfs /dev/sda1"));
+}
+
+test "rm remains high risk" {
+    const p = SecurityPolicy{};
+    try std.testing.expectEqual(CommandRiskLevel.high, p.commandRiskLevel("rm -rf /tmp"));
+}
+
+test "sudo remains high risk" {
+    const p = SecurityPolicy{};
+    try std.testing.expectEqual(CommandRiskLevel.high, p.commandRiskLevel("sudo apt install foo"));
+}
+
+test "ssh remains high risk" {
+    const p = SecurityPolicy{};
+    try std.testing.expectEqual(CommandRiskLevel.high, p.commandRiskLevel("ssh user@host"));
+}
+
+test "mkfs remains high risk" {
+    const p = SecurityPolicy{};
+    try std.testing.expectEqual(CommandRiskLevel.high, p.commandRiskLevel("mkfs.ext4 /dev/sda1"));
+}
+
+test "medium risk blocked when block_medium_risk_commands true" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"curl"},
+        .block_medium_risk_commands = true,
+    };
+    try std.testing.expectError(error.MediumRiskBlocked, p.validateCommandExecution("curl https://example.com", false));
+}
+
+test "medium risk blocked emits audit with medium_risk_blocked gate" {
+    var cap = TestAuditCapture{};
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"curl"},
+        .block_medium_risk_commands = true,
+        .audit_fn = TestAuditCapture.callback,
+        .audit_ctx = &cap,
+    };
+    _ = p.validateCommandExecution("curl https://example.com", false) catch {};
+    try std.testing.expectEqual(@as(usize, 1), cap.count);
+    const e = cap.entry.?;
+    try std.testing.expectEqual(e.decision, .denied);
+    try std.testing.expect(e.gates_fired.medium_risk_blocked);
+    try std.testing.expectEqual(e.risk_level, CommandRiskLevel.medium);
+}
+
+test "medium risk allowed when block_medium_risk_commands false" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"curl"},
+        .block_medium_risk_commands = false,
+    };
+    const risk = try p.validateCommandExecution("curl https://example.com", false);
+    try std.testing.expectEqual(CommandRiskLevel.medium, risk);
+}
+
+test "high risk still blocked when only block_medium_risk_commands true" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"rm"},
+        .block_medium_risk_commands = true,
+        .block_high_risk_commands = false,
+    };
+    const risk = try p.validateCommandExecution("rm -rf /tmp", false);
+    try std.testing.expectEqual(CommandRiskLevel.high, risk);
+}
+
+test "high risk blocked when block_high_risk_commands true" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"rm"},
+        .block_high_risk_commands = true,
+    };
+    try std.testing.expectError(error.HighRiskBlocked, p.validateCommandExecution("rm -rf /tmp", false));
+}
+
+test "curl passes with block_medium_risk_commands false and block_high_risk_commands true" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"curl"},
+        .block_medium_risk_commands = false,
+        .block_high_risk_commands = true,
+    };
+    const risk = try p.validateCommandExecution("curl https://example.com", false);
+    try std.testing.expectEqual(CommandRiskLevel.medium, risk);
+}
+
+test "medium risk requires approval in supervised mode" {
+    var p = SecurityPolicy{
+        .autonomy = .supervised,
+        .allowed_commands = &.{"curl"},
+        .block_medium_risk_commands = false,
+        .require_approval_for_medium_risk = true,
+    };
+    try std.testing.expectError(error.ApprovalRequired, p.validateCommandExecution("curl https://example.com", false));
 }

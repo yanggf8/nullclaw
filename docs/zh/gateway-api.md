@@ -12,6 +12,7 @@
 
 | Endpoint | Method | 鑑權 | 說明 |
 |---|---|---|---|
+<<<<<<< HEAD
 | `/health` | GET | 無 | 健康檢查 |
 | `/pair` | POST | `X-Pairing-Code` | 用一次性配對碼換取 bearer token |
 | `/webhook` | POST | `Authorization: Bearer <token>` | 傳送訊息：`{"message":"..."}` |
@@ -26,6 +27,23 @@
 | `/max` | POST | `X-Max-Bot-Api-Secret`（設定後必填） | Max 入站 webhook |
 | `/.well-known/agent-card.json` | GET | 無 | A2A Agent Card 發現（公開） |
 | `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC 2.0 端點 |
+=======
+| `/health` | GET | 无 | 健康检查 |
+| `/pair` | POST | `X-Pairing-Code` | 用一次性配对码换取 bearer token（网关公开绑定时仅允许 loopback 客户端） |
+| `/webhook` | POST | `Authorization: Bearer <token>` | 发送消息：`{"message":"..."}` |
+| `/cron` | GET | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 查看运行中 daemon 的实时 scheduler 任务 |
+| `/cron/add` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 新增实时 cron 任务 |
+| `/cron/remove` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 按 `id` 删除实时 cron 任务 |
+| `/cron/pause` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 按 `id` 暂停实时 cron 任务 |
+| `/cron/resume` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 按 `id` 恢复实时 cron 任务 |
+| `/cron/update` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 部分更新实时 cron 任务 |
+| `/whatsapp` | GET | Query 参数 | Meta Webhook 验证 |
+| `/whatsapp` | POST | Meta 签名 | WhatsApp 入站消息 |
+| `/max` | POST | `X-Max-Bot-Api-Secret`（配置后必填） | Max 入站 webhook |
+| `/api/messages` | POST | `Authorization: Bearer <Bot Framework JWT>`，以及可选的 `X-Webhook-Secret` | Teams Bot Framework 入站 webhook |
+| `/.well-known/agent-card.json` | GET | 无 | A2A Agent Card 发现（公开） |
+| `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC 2.0 端点 |
+>>>>>>> origin/main
 
 ## 快速範例
 
@@ -39,7 +57,7 @@ curl http://127.0.0.1:3000/health
 
 ```bash
 curl -X POST \
-  -H "X-Pairing-Code: 123456" \
+  -H "X-Pairing-Code: PAIRING_CODE" \
   http://127.0.0.1:3000/pair
 ```
 
@@ -116,7 +134,18 @@ Max webhook 說明：
 - 如果 `channels.max[].webhook_secret` 已設定，header 必須存在且完全匹配。
 - Max 側設定的 webhook URL 必須使用 HTTPS。
 
+<<<<<<< HEAD
 ## A2A（Agent-to-Agent 協議）
+=======
+Teams webhook 说明：
+
+- `nullclaw` 会先用 Microsoft 发布的 OpenID metadata 和 signing keys 验证 Bot Framework bearer token，再接受该 activity。
+- token 的 issuer 必须是 `https://api.botframework.com`，audience 必须匹配配置中的 Teams `client_id`，并且 token 中的 `serviceUrl` 必须与 activity body 一致。
+- 会按 Bot Framework key metadata 中公布的 endorsement 校验 Teams `channelId`。
+- 如果配置了 `channels.teams[].webhook_secret`，还会额外要求 `X-Webhook-Secret` 精确匹配。
+
+## A2A（Agent-to-Agent 协议）
+>>>>>>> origin/main
 
 NullClaw 實作了 [Google A2A 協議 v0.3.0](https://github.com/google/A2A)，基於 JSON-RPC 2.0，支援與任何相容 A2A 的代理或客戶端互操作。
 
@@ -286,9 +315,17 @@ curl -X POST \
 ## 鑑權與安全建議
 
 1. 保持 `gateway.require_pairing = true`。
+<<<<<<< HEAD
 2. 網關優先綁定 `127.0.0.1`，外網存取通過 tunnel/反向代理。
 3. token 視為金鑰，不寫入公開倉庫或日誌。
 4. Max webhook secret 同理：每個帳號使用獨立隨機值，不跨 bot 複用。
+=======
+2. 网关优先绑定 `127.0.0.1`，外网访问通过 tunnel/反向代理。
+3. 如果你刻意绑定到非 loopback 地址，通用端点（`/webhook`、`/cron/*`、`/a2a`）即使关闭了交互式 pairing，也仍然要求已存储的 bearer token；如果不使用 `/pair`，请预先配置 `gateway.paired_tokens`。
+4. 如果是非 loopback 绑定，`/pair` 只接受 loopback 客户端；要么先在本机完成初始 pairing，要么在公开端口前预先配置 `gateway.paired_tokens`。
+5. token 视为密钥，不写入公开仓库或日志。
+6. Max webhook secret 同理：每个账号使用独立随机值，不跨 bot 复用。
+>>>>>>> origin/main
 
 ## 下一步
 
