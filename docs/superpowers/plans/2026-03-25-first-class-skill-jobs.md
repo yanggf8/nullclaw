@@ -536,7 +536,7 @@ Convert all 9 jobs from `skill:` prefix to proper `job_type: "skill"`:
   "expression": "20 23 * * 0,1,3",
   "job_type": "skill",
   "skill_name": "commute",
-  "skill_args": "--from 淡水安泰登峰 --to 小巨蛋 --location 新北市 --location 臺北市 --deliver-to 7972814626",
+  "skill_args": "--from 淡水安泰登峰 --to 小巨蛋 --location 新北市 --location 臺北市 --deliver-to 1234567890",
   "timeout_secs": 90,
   "delivery_mode": "none"
 }
@@ -548,7 +548,7 @@ Convert all 9 jobs from `skill:` prefix to proper `job_type: "skill"`:
   "expression": "30 0 * * 2-6",
   "job_type": "skill",
   "skill_name": "news",
-  "skill_args": "--deliver-to 7972814626",
+  "skill_args": "--deliver-to 1234567890",
   "timeout_secs": 180,
   "delivery_mode": "none"
 }
@@ -763,7 +763,7 @@ Expected: prints a news summary in the correct 3-section format with AI content.
 - [ ] **Step 4: Test with delivery**
 
 ```bash
-python3 ~/.claude/skills/news/run.py --deliver-to 7972814626
+python3 ~/.claude/skills/news/run.py --deliver-to 1234567890
 ```
 
 Expected: summary delivered to Telegram.

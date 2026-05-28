@@ -39,7 +39,7 @@ Typical skill job:
 
 ```bash
 nullclaw cron add-skill "0 8 * * *" oilcon \
-  --deliver-to 7972814626 \
+  --deliver-to 1234567890 \
   --account ping \
   --verify skill_contract \
   --repair alert_only \
@@ -120,7 +120,7 @@ To find jobs without piping JSON through `grep`, filter `cron list` directly. Fi
 
 ```bash
 nullclaw cron list --skill oilcon
-nullclaw cron list --channel telegram --to 7972814626
+nullclaw cron list --channel telegram --to 1234567890
 nullclaw cron list --status error
 nullclaw cron list --match oil --json
 ```
@@ -186,7 +186,7 @@ Add a skill job with Telegram delivery:
 
 ```bash
 nullclaw cron add-skill "0 8 * * *" oilcon \
-  --deliver-to 7972814626 \
+  --deliver-to 1234567890 \
   --account ping \
   --timeout 120 \
   --tz 8 \

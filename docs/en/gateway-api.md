@@ -95,7 +95,7 @@ Skill jobs can be added without a `command` or `prompt` field — only `skill_na
 ```bash
 curl -X POST \
   -H "Content-Type: application/json" \
-  -d '{"expression":"35 13 * * 1-5","job_type":"skill","skill_name":"cct2","skill_args":"--mode pre-market","delivery_channel":"telegram","delivery_to":"7972814626"}' \
+  -d '{"expression":"35 13 * * 1-5","job_type":"skill","skill_name":"cct2","skill_args":"--mode pre-market","delivery_channel":"telegram","delivery_to":"1234567890"}' \
   http://127.0.0.1:3000/cron/add
 ```
 

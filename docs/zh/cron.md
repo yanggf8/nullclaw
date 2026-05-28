@@ -39,7 +39,7 @@ NullClaw cron 有三種任務類型。請依照「誰負責執行」與「誰負
 
 ```bash
 nullclaw cron add-skill "0 8 * * *" oilcon \
-  --deliver-to 7972814626 \
+  --deliver-to 1234567890 \
   --account ping \
   --verify skill_contract \
   --repair alert_only \
@@ -120,7 +120,7 @@ nullclaw cron degraded --job <id> --hours 168
 
 ```bash
 nullclaw cron list --skill oilcon
-nullclaw cron list --channel telegram --to 7972814626
+nullclaw cron list --channel telegram --to 1234567890
 nullclaw cron list --status error
 nullclaw cron list --match oil --json
 ```
@@ -179,7 +179,7 @@ cron_queue: [<id>] skill completed (ok)
 
 ```bash
 nullclaw cron add-skill "0 8 * * *" oilcon \
-  --deliver-to 7972814626 \
+  --deliver-to 1234567890 \
   --account ping \
   --timeout 120 \
   --tz 8 \
