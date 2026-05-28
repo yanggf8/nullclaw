@@ -4749,6 +4749,21 @@ fn runQueueWorker(state: *GatewayState) void {
 
             switch (job_type) {
                 .shell => {
+                    // Enforce policy for legacy queued shell jobs too
+                    if (state.security_policy) |pol| {
+                        _ = pol.validateCommandExecution(command, false) catch |err| {
+                            log.warn("legacy queued shell job '{s}' blocked by policy: {s}", .{ id, @errorName(err) });
+                            state.scheduler_mutex.lock();
+                            if (sched.getMutableJob(id)) |j| {
+                                j.last_run_secs = now;
+                                j.last_status = "error";
+                                _ = cron_mod.dbUpsertAndVerify(sched, j) catch {};
+                            }
+                            state.scheduler_mutex.unlock();
+                            continue;
+                        };
+                    }
+
                     var shell_env = cron_mod.buildCronChildEnv(allocator, .{
                         .source = "cron_legacy_scheduler_shell",
                     }) catch |err| {
