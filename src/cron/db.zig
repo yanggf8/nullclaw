@@ -15,6 +15,7 @@ const build_options = @import("build_options");
 const root = @import("root.zig");
 const types = @import("types.zig");
 const cron = @import("../cron.zig");
+const security = @import("../security/policy.zig");
 
 const sqlite_mod = if (build_options.enable_sqlite)
     @import("../memory/engines/sqlite.zig")
@@ -1336,6 +1337,110 @@ test "DbCronBackend complete deletes delete_after_run job and records run" {
     _ = c.sqlite3_bind_text(stmt, 1, job.id.ptr, @intCast(job.id.len), SQLITE_STATIC);
     try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(stmt));
     try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 0));
+}
+
+test "DbCronBackend policy block on shell job records failure_class" {
+    // Regression: DB-direct shell dispatch must persist the policy failure class
+    // when SecurityPolicy blocks before spawn.
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/policy_block.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    var backend = try DbCronBackend.init(allocator, db_path_z);
+    defer backend.deinit();
+    const be = backend.backend();
+
+    const job = try be.add(allocator, .{
+        .expression = "* * * * *",
+        .command = "curl https://example.com",
+        .job_type = .shell,
+    });
+    defer {
+        allocator.free(job.id);
+        allocator.free(job.expression);
+        allocator.free(job.command);
+    }
+
+    try be.enqueue(job.id, 1000);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const dequeued = (try be.dequeue(arena.allocator())).?;
+
+    const tracker_ptr = try allocator.create(security.RateTracker);
+    defer {
+        tracker_ptr.deinit();
+        allocator.destroy(tracker_ptr);
+    }
+    tracker_ptr.* = security.RateTracker.init(allocator, 20);
+
+    const policy_ptr = try allocator.create(security.SecurityPolicy);
+    defer allocator.destroy(policy_ptr);
+    policy_ptr.* = .{
+        .autonomy = .full,
+        .allowed_commands = &.{"curl"},
+        .block_medium_risk_commands = true,
+        .tracker = tracker_ptr,
+    };
+
+    const decision = cron.checkCronShellPolicy(policy_ptr, dequeued.spec.command);
+    const blocked = switch (decision) {
+        .blocked => |b| b,
+        .allowed => return error.ExpectedPolicyBlock,
+        .fail_closed => return error.ExpectedPolicyBlock,
+    };
+    try std.testing.expectEqual(error.MediumRiskBlocked, blocked.err);
+    try std.testing.expectEqualStrings("policy_medium_blocked", blocked.failure_class);
+
+    var bad_result = cron.execErrorRunResult();
+    bad_result.failure_class = blocked.failure_class;
+
+    const db = try cron.openCronDbAtPath(db_path_z);
+    defer cron.closeCronDb(db);
+    try cron.ensureCronTable(db);
+    try cron.dbCompleteJob(
+        db,
+        dequeued.spec.id,
+        dequeued.queue_row_id,
+        1001,
+        "error",
+        null,
+        false,
+        bad_result,
+        "policy-block-test:1",
+        false,
+        "cron_scheduler_shell",
+        null,
+    );
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    const runs_sql = "SELECT status, failure_class, verified, source FROM cron_runs WHERE job_id=?1";
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_prepare_v2(db, runs_sql, -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, job.id.ptr, @intCast(job.id.len), SQLITE_STATIC);
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(stmt));
+
+    const status_ptr = c.sqlite3_column_text(stmt, 0).?;
+    const status_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    try std.testing.expectEqualStrings("error", status_ptr[0..status_len]);
+
+    const fc_ptr = c.sqlite3_column_text(stmt, 1).?;
+    const fc_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+    try std.testing.expectEqualStrings("policy_medium_blocked", fc_ptr[0..fc_len]);
+
+    try std.testing.expectEqual(@as(i32, 3), c.sqlite3_column_int(stmt, 2));
+
+    const source_ptr = c.sqlite3_column_text(stmt, 3).?;
+    const source_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 3));
+    try std.testing.expectEqualStrings("cron_scheduler_shell", source_ptr[0..source_len]);
 }
 
 test "DbCronBackend tick enqueues due jobs" {
