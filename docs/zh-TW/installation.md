@@ -206,7 +206,7 @@ $env:Path = "$env:Path;$bin"
 ### 直接使用下載的二進位檔案（Windows,Powershell)
 可將下載的nullclaw二進位檔案（.exe)改名為nullclaw.exe，再以系統管理員權限在Powershell中執行如下命令，將該檔案所在的路徑加入到windows系統變數PATH中：
 
-```Powershell 
+```Powershell
 $old = [Environment]::GetEnvironmentVariable("Path", "Machine")
 $new = "$old;x:\nullclaw二進位檔案所在目錄"
 [Environment]::SetEnvironmentVariable("Path", $new, "Machine")

@@ -210,7 +210,6 @@ Apply these naming rules consistently:
 - Add/update tests for failure modes and boundaries.
 - Keep observability useful but non-sensitive (no secrets in logs or errors).
 
-<<<<<<< HEAD
 ### 7.6 Cron Job Authoring and Skill Delivery
 
 #### Job types
@@ -402,8 +401,8 @@ Expected log sequence for a healthy skill run:
 3. `info(cron_queue): [<id>] skill completed (ok): Delivered to Telegram chat <id>` — script ran and delivered
 
 Scheduler liveness: `info(scheduler): alive, 0 jobs due (DbCronBackend)` appears every ~5 minutes when no jobs are due. Absence of this line for >10 minutes indicates the scheduler thread has stalled.
-=======
-### 7.6 Updating the Required Zig Version
+
+### 7.7 Updating the Required Zig Version
 
 Whenever a documentation or code change indicates that the required Zig
 toolchain version is changing (for example: `README.md`, `AGENTS.md`,
@@ -441,7 +440,6 @@ Required steps:
 Do not bump the Zig version pin in one place without sweeping all of the
 above. A partial bump leaves users following copy-paste instructions that
 download a tarball that no longer matches the pinned toolchain.
->>>>>>> origin/main
 
 ## 8) Validation Matrix
 
