@@ -12,6 +12,7 @@ const admin_output = @import("admin_output.zig");
 const agent_routing = @import("agent_routing.zig");
 const telegram = @import("channels/telegram.zig");
 const signal = @import("channels/signal.zig");
+const security = @import("security/policy.zig");
 const Config = @import("config.zig").Config;
 
 const sqlite_mod = if (build_options.enable_sqlite)
@@ -22,6 +23,31 @@ const c = sqlite_mod.c;
 const SQLITE_STATIC = sqlite_mod.SQLITE_STATIC;
 
 const log = std.log.scoped(.cron);
+
+pub const CronShellPolicyError = error{ CommandNotAllowed, HighRiskBlocked, MediumRiskBlocked, ApprovalRequired };
+
+pub const CronShellPolicyDecision = union(enum) {
+    allowed,
+    blocked: struct { err: CronShellPolicyError, failure_class: []const u8 },
+    fail_closed,
+};
+
+pub fn cronShellPolicyFailureClass(err: CronShellPolicyError) []const u8 {
+    return switch (err) {
+        error.MediumRiskBlocked => "policy_medium_blocked",
+        error.HighRiskBlocked => "policy_high_blocked",
+        error.CommandNotAllowed => "policy_denied",
+        error.ApprovalRequired => "policy_approval_required",
+    };
+}
+
+pub fn checkCronShellPolicy(pol_opt: ?*const security.SecurityPolicy, cmd: []const u8) CronShellPolicyDecision {
+    const pol = pol_opt orelse return .fail_closed;
+    _ = pol.validateCommandExecution(cmd, false) catch |err| {
+        return .{ .blocked = .{ .err = err, .failure_class = cronShellPolicyFailureClass(err) } };
+    };
+    return .allowed;
+}
 
 pub const JobType = enum {
     shell,

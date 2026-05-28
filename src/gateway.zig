@@ -4258,27 +4258,22 @@ fn runQueueWorker(state: *GatewayState) void {
                     defer if (resolved_cmd) |rc| arena.free(rc);
                     const shell_cmd = resolved_cmd orelse spec.command;
 
-                    // Enforce SecurityPolicy for cron shell jobs (addresses the bypass finding)
-                    if (state.security_policy) |pol| {
-                        _ = pol.validateCommandExecution(shell_cmd, false) catch |err| {
-                            log.warn("[{s}] shell blocked by policy: {s}", .{ spec.id, @errorName(err) });
+                    switch (cron_mod.checkCronShellPolicy(state.security_policy, shell_cmd)) {
+                        .allowed => {},
+                        .blocked => |blocked| {
+                            log.warn("[{s}] shell blocked by policy: {s}", .{ spec.id, @errorName(blocked.err) });
                             var bad_result = cron_mod.execErrorRunResult();
-                            bad_result.failure_class = switch (err) {
-                                error.MediumRiskBlocked => "policy_medium_blocked",
-                                error.HighRiskBlocked => "policy_high_blocked",
-                                error.CommandNotAllowed => "policy_denied",
-                                error.ApprovalRequired => "policy_approval_required",
-                            };
+                            bad_result.failure_class = blocked.failure_class;
                             complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, bad_result, run_trace_id, "cron_scheduler_shell");
                             continue;
-                        };
-                    } else {
-                        // Fail-closed if policy missing (addresses the review finding)
-                        log.err("[{s}] security policy not available for shell job - failing closed", .{spec.id});
-                        var bad_result = cron_mod.execErrorRunResult();
-                        bad_result.failure_class = "policy_denied";
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, bad_result, run_trace_id, "cron_scheduler_shell");
-                        continue;
+                        },
+                        .fail_closed => {
+                            log.err("[{s}] security policy not available for shell job - failing closed", .{spec.id});
+                            var bad_result = cron_mod.execErrorRunResult();
+                            bad_result.failure_class = "policy_denied";
+                            complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, bad_result, run_trace_id, "cron_scheduler_shell");
+                            continue;
+                        },
                     }
 
                     var shell_env = cron_mod.buildCronChildEnv(arena, .{
@@ -4749,10 +4744,10 @@ fn runQueueWorker(state: *GatewayState) void {
 
             switch (job_type) {
                 .shell => {
-                    // Enforce policy for legacy queued shell jobs too
-                    if (state.security_policy) |pol| {
-                        _ = pol.validateCommandExecution(command, false) catch |err| {
-                            log.warn("legacy queued shell job '{s}' blocked by policy: {s}", .{ id, @errorName(err) });
+                    switch (cron_mod.checkCronShellPolicy(state.security_policy, command)) {
+                        .allowed => {},
+                        .blocked => |blocked| {
+                            log.warn("legacy queued shell job '{s}' blocked by policy: {s}", .{ id, @errorName(blocked.err) });
                             state.scheduler_mutex.lock();
                             if (sched.getMutableJob(id)) |j| {
                                 j.last_run_secs = now;
@@ -4761,7 +4756,18 @@ fn runQueueWorker(state: *GatewayState) void {
                             }
                             state.scheduler_mutex.unlock();
                             continue;
-                        };
+                        },
+                        .fail_closed => {
+                            log.err("security policy not available for legacy queued shell job '{s}' - failing closed", .{id});
+                            state.scheduler_mutex.lock();
+                            if (sched.getMutableJob(id)) |j| {
+                                j.last_run_secs = now;
+                                j.last_status = "error";
+                                _ = cron_mod.dbUpsertAndVerify(sched, j) catch {};
+                            }
+                            state.scheduler_mutex.unlock();
+                            continue;
+                        },
                     }
 
                     var shell_env = cron_mod.buildCronChildEnv(allocator, .{
