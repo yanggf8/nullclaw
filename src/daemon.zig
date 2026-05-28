@@ -38,6 +38,7 @@ const thread_stacks = @import("thread_stacks.zig");
 const tunnel_mod = @import("tunnel.zig");
 const Atomic = @import("portable_atomic.zig").Atomic;
 const observability = @import("observability.zig");
+const security = @import("security/policy.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -594,6 +595,21 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     defer if (runtime_observer) |ro| ro.destroy();
 
     var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
+    var security_tracker = security.RateTracker.init(allocator, config.autonomy.max_actions_per_hour);
+    defer security_tracker.deinit();
+    const security_policy = security.SecurityPolicy{
+        .autonomy = config.autonomy.level,
+        .workspace_dir = config.workspace_dir,
+        .workspace_only = config.autonomy.workspace_only,
+        .allowed_commands = security.resolveAllowedCommands(config.autonomy.level, config.autonomy.allowed_commands),
+        .max_actions_per_hour = config.autonomy.max_actions_per_hour,
+        .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
+        .block_high_risk_commands = config.autonomy.block_high_risk_commands,
+        .block_medium_risk_commands = config.autonomy.block_medium_risk_commands,
+        .allow_raw_url_chars = config.autonomy.allow_raw_url_chars,
+        .tracker = &security_tracker,
+    };
+    scheduler.setSecurityPolicy(&security_policy);
     if (runtime_observer) |ro| {
         scheduler.observer = ro.observer();
     }
