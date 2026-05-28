@@ -2142,6 +2142,23 @@ test "medium risk blocked when block_medium_risk_commands true" {
     try std.testing.expectError(error.MediumRiskBlocked, p.validateCommandExecution("curl https://example.com", false));
 }
 
+test "medium risk blocked emits audit with medium_risk_blocked gate" {
+    var cap = TestAuditCapture{};
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"curl"},
+        .block_medium_risk_commands = true,
+        .audit_fn = TestAuditCapture.callback,
+        .audit_ctx = &cap,
+    };
+    _ = p.validateCommandExecution("curl https://example.com", false) catch {};
+    try std.testing.expectEqual(@as(usize, 1), cap.count);
+    const e = cap.entry.?;
+    try std.testing.expectEqual(e.decision, .denied);
+    try std.testing.expect(e.gates_fired.medium_risk_blocked);
+    try std.testing.expectEqual(e.risk_level, CommandRiskLevel.medium);
+}
+
 test "medium risk allowed when block_medium_risk_commands false" {
     var p = SecurityPolicy{
         .autonomy = .full,

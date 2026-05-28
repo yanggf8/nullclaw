@@ -533,6 +533,11 @@ pub const GatewayState = struct {
     allocator: std.mem.Allocator,
     rate_limiter: GatewayRateLimiter,
     idempotency: IdempotencyStore,
+    // Security policy for runtime enforcement (including cron shell jobs).
+    // Owned by GatewayState; freed in deinit().
+    security_policy: ?*security.SecurityPolicy = null,
+    // Heap-owned RateTracker backing the policy's sliding window. Must be deinit()+destroyed.
+    security_tracker: ?*security.RateTracker = null,
     whatsapp_verify_token: []const u8,
     whatsapp_app_secret: []const u8,
     whatsapp_access_token: []const u8,
@@ -657,6 +662,15 @@ pub const GatewayState = struct {
         self.teams_auth_cache.deinit(self.allocator);
         if (self.pairing_guard) |*guard| {
             guard.deinit();
+        }
+        // Free the heap-allocated security policy + its backing tracker (Issue A).
+        // The tracker owns an ArrayList that must be explicitly deinit()ed.
+        if (self.security_policy) |p| {
+            self.allocator.destroy(p);
+        }
+        if (self.security_tracker) |t| {
+            t.deinit();
+            self.allocator.destroy(t);
         }
     }
 };
@@ -4243,6 +4257,30 @@ fn runQueueWorker(state: *GatewayState) void {
                     const resolved_cmd = cron_mod.resolveSkillCommand(arena, spec.command) catch null;
                     defer if (resolved_cmd) |rc| arena.free(rc);
                     const shell_cmd = resolved_cmd orelse spec.command;
+
+                    // Enforce SecurityPolicy for cron shell jobs (addresses the bypass finding)
+                    if (state.security_policy) |pol| {
+                        _ = pol.validateCommandExecution(shell_cmd, false) catch |err| {
+                            log.warn("[{s}] shell blocked by policy: {s}", .{ spec.id, @errorName(err) });
+                            var bad_result = cron_mod.execErrorRunResult();
+                            bad_result.failure_class = switch (err) {
+                                error.MediumRiskBlocked => "policy_medium_blocked",
+                                error.HighRiskBlocked => "policy_high_blocked",
+                                error.CommandNotAllowed => "policy_denied",
+                                error.ApprovalRequired => "policy_approval_required",
+                            };
+                            complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, bad_result, run_trace_id, "cron_scheduler_shell");
+                            continue;
+                        };
+                    } else {
+                        // Fail-closed if policy missing (addresses the review finding)
+                        log.err("[{s}] security policy not available for shell job - failing closed", .{spec.id});
+                        var bad_result = cron_mod.execErrorRunResult();
+                        bad_result.failure_class = "policy_denied";
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, bad_result, run_trace_id, "cron_scheduler_shell");
+                        continue;
+                    }
+
                     var shell_env = cron_mod.buildCronChildEnv(arena, .{
                         .source = "cron_scheduler_shell",
                         .trace_id = run_trace_id,
@@ -7342,6 +7380,61 @@ pub fn run(
         }
     }
 
+    // Stack storage for audit logger. Declared early so it can be wired into the heap policy
+    // in the early-construction block (before startRunQueue). Lifetime covers the whole run()
+    // function (until gateway shutdown), which is sufficient for audit_ctx pointers stored in
+    // the long-lived heap policy.
+    var sec_audit_log_opt: ?audit_mod.AuditLogger = null;
+
+    // Security policy must be constructed *before* starting any shell-capable workers (DB-direct cron, etc.).
+    // Do not gate this on local-agent/A2A/webhook_sync — cron shell jobs need enforcement regardless of runtime mode.
+    if (config_ptr) |cfg| {
+        // Heap-allocate the RateTracker so it outlives this stack frame.
+        const tracker_ptr = allocator.create(security.RateTracker) catch null;
+        if (tracker_ptr) |t| {
+            t.* = security.RateTracker.init(allocator, cfg.autonomy.max_actions_per_hour);
+            state.security_tracker = t;
+
+            const pol = security.SecurityPolicy{
+                .autonomy = cfg.autonomy.level,
+                .workspace_dir = cfg.workspace_dir,
+                .workspace_only = cfg.autonomy.workspace_only,
+                .allowed_commands = security.resolveAllowedCommands(cfg.autonomy.level, cfg.autonomy.allowed_commands),
+                .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
+                .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
+                .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
+                .block_medium_risk_commands = cfg.autonomy.block_medium_risk_commands,
+                .allow_raw_url_chars = cfg.autonomy.allow_raw_url_chars,
+                .tracker = t,
+            };
+
+            // Heap-allocate the policy so the pointer we store on state is always valid.
+            const pol_ptr = allocator.create(security.SecurityPolicy) catch null;
+            if (pol_ptr) |p| {
+                p.* = pol;
+                state.security_policy = p;
+
+                // Wire audit logger into the *single* early heap policy if enabled.
+                // This ensures cron shell jobs (which go through state.security_policy)
+                // and agent/runtime code (which receives the same pointer) share one
+                // policy + one tracker + one audit sink. Previously audit was only on
+                // a second stack policy created later.
+                if (cfg.security.audit.enabled) {
+                    const audit_base = std.fs.path.dirname(cfg.config_path) orelse ".";
+                    if (audit_mod.AuditLogger.init(allocator, .{
+                        .enabled = true,
+                        .log_path = if (cfg.security.audit.log_path.len > 0) cfg.security.audit.log_path else "policy_audit.jsonl",
+                        .max_size_mb = cfg.security.audit.max_size_mb,
+                    }, audit_base)) |al| {
+                        sec_audit_log_opt = al;
+                        p.*.audit_fn = auditPolicyCallback;
+                        p.*.audit_ctx = &sec_audit_log_opt.?;
+                    } else |_| {}
+                }
+            }
+        }
+    }
+
     // Start the sequential job run queue worker thread.
     state.startRunQueue() catch |err| {
         std.log.scoped(.gateway).warn("failed to start run queue worker: {s}", .{@errorName(err)});
@@ -7382,9 +7475,6 @@ pub fn run(
     var mem_rt: ?memory_mod.MemoryRuntime = null;
     var bootstrap_provider_opt: ?bootstrap_mod.BootstrapProvider = null;
     var subagent_manager_opt: ?*subagent_mod.SubagentManager = null;
-    var sec_tracker_opt: ?security.RateTracker = null;
-    var sec_policy_opt: ?security.SecurityPolicy = null;
-    var sec_audit_log_opt: ?audit_mod.AuditLogger = null;
 
     // Local request-response agent runtime (from upstream, for lazy A2A/gateway init)
     var local_agent_runtime_opt: ?LocalAgentRuntime = null;
@@ -7472,37 +7562,9 @@ pub fn run(
         // Merged condition: support both our cron/subagent/A2A needs and upstream's webhook_sync_for_workers lazy runtime.
         // In daemon mode, inbound is usually on bus, but A2A + webhook_sync + our subagent/cron paths need the local runtime.
         if (needs_local_agent or cfg.a2a.enabled or cfg.gateway.webhook_sync_for_workers) {
-            // Our full security + cron + subagent initialization (Rule 1 — non-negotiable for feat/cron-subagent)
-            sec_tracker_opt = security.RateTracker.init(allocator, cfg.autonomy.max_actions_per_hour);
-            sec_policy_opt = .{
-                .autonomy = cfg.autonomy.level,
-                .workspace_dir = cfg.workspace_dir,
-                .workspace_only = cfg.autonomy.workspace_only,
-                .allowed_commands = security.resolveAllowedCommands(cfg.autonomy.level, cfg.autonomy.allowed_commands),
-                .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
-                .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
-                .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
-                .block_medium_risk_commands = cfg.autonomy.block_medium_risk_commands,
-                .allow_raw_url_chars = cfg.autonomy.allow_raw_url_chars,
-                .tracker = if (sec_tracker_opt) |*tracker| tracker else null,
-            };
-
-            // Wire policy audit log if enabled (our observability for cron/shell jobs)
-            if (cfg.security.audit.enabled) {
-                const audit_base = std.fs.path.dirname(cfg.config_path) orelse ".";
-                if (audit_mod.AuditLogger.init(allocator, .{
-                    .enabled = true,
-                    .log_path = if (cfg.security.audit.log_path.len > 0) cfg.security.audit.log_path else "policy_audit.jsonl",
-                    .max_size_mb = cfg.security.audit.max_size_mb,
-                }, audit_base)) |al| {
-                    sec_audit_log_opt = al;
-                    if (sec_policy_opt) |*pol| {
-                        pol.audit_fn = auditPolicyCallback;
-                        pol.audit_ctx = &sec_audit_log_opt.?;
-                    }
-                } else |_| {}
-            }
-
+            // Unified early heap policy (created before startRunQueue, with tracker + optional audit wiring)
+            // is the single source of truth for *all* paths: cron DB-direct shell jobs (via state.security_policy),
+            // legacy queued, and agent/runtime/session/tools (passed explicitly below). No second policy/tracker.
             provider_bundle_opt = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, cfg);
 
             if (provider_bundle_opt) |*bundle| {
@@ -7546,7 +7608,7 @@ pub fn run(
                     .fallback_api_key = resolved_api_key,
                     .allowed_paths = cfg.autonomy.allowed_paths,
                     .tools_config = cfg.tools,
-                    .policy = if (sec_policy_opt) |*policy| policy else null,
+                    .policy = state.security_policy,
                     .subagent_manager = subagent_manager_opt,
                     .bootstrap_provider = bootstrap_provider_opt,
                     .backend_name = cfg.memory.backend,
@@ -7555,7 +7617,7 @@ pub fn run(
                 }) catch &.{};
 
                 var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, runtime_observer.?.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
-                if (sec_policy_opt) |*policy| {
+                if (state.security_policy) |policy| {
                     sm.policy = policy;
                 }
                 if (mem_rt) |*rt| {
@@ -7598,7 +7660,6 @@ pub fn run(
     };
     defer if (tools_slice.len > 0) tools_mod.deinitTools(allocator, tools_slice);
     defer if (session_mgr_opt) |*sm| sm.deinit();
-    defer if (sec_tracker_opt) |*tracker| tracker.deinit();
     defer if (sec_audit_log_opt) |*al| al.deinit();
 
     // Cleanup for upstream lazy runtime (if initialized)
