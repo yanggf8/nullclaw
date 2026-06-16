@@ -3859,6 +3859,7 @@ pub const CronListStatusFilter = enum {
 pub const CronListFilter = struct {
     skill: ?[]const u8 = null,
     channel: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
     to: ?[]const u8 = null,
     status: ?CronListStatusFilter = null,
     match_text: ?[]const u8 = null,
@@ -3866,6 +3867,7 @@ pub const CronListFilter = struct {
     pub fn hasAny(self: CronListFilter) bool {
         return self.skill != null or
             self.channel != null or
+            self.account_id != null or
             self.to != null or
             self.status != null or
             self.match_text != null;
@@ -3895,6 +3897,7 @@ pub fn cronListFilterSummary(allocator: std.mem.Allocator, filter: CronListFilte
 
     if (filter.skill) |v| try Writer.appendPart(&buf, allocator, &first, "skill", v);
     if (filter.channel) |v| try Writer.appendPart(&buf, allocator, &first, "channel", v);
+    if (filter.account_id) |v| try Writer.appendPart(&buf, allocator, &first, "account", v);
     if (filter.to) |v| try Writer.appendPart(&buf, allocator, &first, "to", v);
     if (filter.status) |v| try Writer.appendPart(&buf, allocator, &first, "status", v.asStr());
     if (filter.match_text) |v| try Writer.appendPart(&buf, allocator, &first, "match", v);
@@ -8252,6 +8255,9 @@ fn appendCronListFromWhereSql(buf: *std.ArrayListUnmanaged(u8), allocator: std.m
     if (filter.channel != null) {
         try buf.appendSlice(allocator, " AND j.delivery_channel=?");
     }
+    if (filter.account_id != null) {
+        try buf.appendSlice(allocator, " AND j.delivery_account_id=?");
+    }
     if (filter.to != null) {
         try buf.appendSlice(allocator, " AND j.delivery_to=?");
     }
@@ -8282,6 +8288,10 @@ fn bindCronListFilter(stmt: *c.sqlite3_stmt, filter: CronListFilter) c_int {
         idx += 1;
     }
     if (filter.channel) |value| {
+        _ = c.sqlite3_bind_text(stmt, idx, value.ptr, @intCast(value.len), SQLITE_STATIC);
+        idx += 1;
+    }
+    if (filter.account_id) |value| {
         _ = c.sqlite3_bind_text(stmt, idx, value.ptr, @intCast(value.len), SQLITE_STATIC);
         idx += 1;
     }
@@ -11325,12 +11335,12 @@ test "dbListJobsJson respects limit parameter" {
 fn seedCronListFilterFixture(db: *c.sqlite3) !void {
     try ensureCronTable(db);
     const sql =
-        "INSERT INTO cron_jobs(id, expression, command, prompt, next_run_secs, job_type, paused, enabled, delivery_mode, delivery_channel, delivery_to, skill_name, skill_args) VALUES" ++
-        "('job-oil', '0 8 * * *', NULL, NULL, 10, 'skill', 0, 1, 'always', 'telegram', 'chat-1', 'oilcon', '--market WTI')," ++
-        "('job-dough', '0 9 * * *', NULL, NULL, 20, 'skill', 0, 1, 'always', 'telegram', 'chat-2', 'doughcon', '--region TW')," ++
-        "('job-shell', '*/5 * * * *', 'Echo Mixed Case', NULL, 30, 'shell', 0, 1, 'none', NULL, NULL, NULL, NULL)," ++
-        "('job-agent', '15 * * * *', NULL, 'Prompt about weather', 40, 'agent', 0, 1, 'always', 'slack', 'team-1', NULL, NULL)," ++
-        "('job-paused', '30 * * * *', 'echo paused', NULL, 50, 'shell', 1, 1, 'none', NULL, NULL, NULL, NULL);";
+        "INSERT INTO cron_jobs(id, expression, command, prompt, next_run_secs, job_type, paused, enabled, delivery_mode, delivery_channel, delivery_account_id, delivery_to, skill_name, skill_args) VALUES" ++
+        "('job-oil', '0 8 * * *', NULL, NULL, 10, 'skill', 0, 1, 'always', 'telegram', 'main', 'chat-1', 'oilcon', '--market WTI')," ++
+        "('job-dough', '0 9 * * *', NULL, NULL, 20, 'skill', 0, 1, 'always', 'telegram', 'nunu', 'chat-2', 'doughcon', '--region TW')," ++
+        "('job-shell', '*/5 * * * *', 'Echo Mixed Case', NULL, 30, 'shell', 0, 1, 'none', NULL, NULL, NULL, NULL, NULL)," ++
+        "('job-agent', '15 * * * *', NULL, 'Prompt about weather', 40, 'agent', 0, 1, 'always', 'slack', NULL, 'team-1', NULL, NULL)," ++
+        "('job-paused', '30 * * * *', 'echo paused', NULL, 50, 'shell', 1, 1, 'none', NULL, NULL, NULL, NULL, NULL);";
     if (c.sqlite3_exec(db, sql, null, null, null) != c.SQLITE_OK) return error.InsertFailed;
 
     const runs_sql =
@@ -11388,6 +11398,12 @@ test "dbListJobsJsonFiltered applies individual filters" {
     defer std.testing.allocator.free(by_to);
     try std.testing.expectEqual(@as(usize, 1), jsonObjectCount(by_to));
     try expectJsonContainsId(by_to, "job-dough", true);
+
+    const by_account = try listJobsJsonForTest(db, .{ .account_id = "nunu" }, 0);
+    defer std.testing.allocator.free(by_account);
+    try std.testing.expectEqual(@as(usize, 1), jsonObjectCount(by_account));
+    try expectJsonContainsId(by_account, "job-dough", true);
+    try expectJsonContainsId(by_account, "job-oil", false);
 }
 
 test "dbListJobsJsonFiltered combines filters with AND semantics" {

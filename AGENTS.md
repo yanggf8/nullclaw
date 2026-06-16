@@ -380,7 +380,7 @@ CLI access (all inspection commands open the DB read-only via `openCronDbReadOnl
 - `nullclaw cron runs <id> [--limit N] [--json]` — per-job history (last 50 by default); shows `src=` and `trace=` columns
 - `nullclaw cron show <id> [--runs N]` — spec + recent runs; displays `(auto-paused)` suffix when the last run recorded `repair_action=paused_job`, plus `fc=`/`ra=` per run. On a failing run, also shows `Last stderr:` (tail of the child process's stderr, capped at ~1KB) — useful for catching pre-skill failures like `FileNotFoundError` (PATH gap), `EACCES`, missing Python modules, etc.
 - `nullclaw cron job-status [--json]` — last known status per job, sorted by recency
-- `nullclaw cron list [--limit N] [--json]` — all jobs as JSON array (stdout)
+- `nullclaw cron list [--limit N] [--json]` — all jobs as JSON array (stdout); supports `--skill`/`--channel`/`--account`/`--to`/`--status`/`--match` filters (ANDed)
 - `nullclaw cron schedule [--hours N] [--all] [--today] [--json]` — upcoming fires as JSON array
 - `nullclaw cron run <id>` — manual trigger; prints `[manual run] job='<id>' trace=<trace_id>` on startup for log correlation
 - `nullclaw cron unpause <id>` — alias for `resume`, aligned with the `pause_on_fail` repair policy terminology

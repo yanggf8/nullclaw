@@ -121,6 +121,7 @@ nullclaw cron degraded --job <id> --hours 168
 ```bash
 nullclaw cron list --skill oilcon
 nullclaw cron list --channel telegram --to 1234567890
+nullclaw cron list --account nunu --skill weather
 nullclaw cron list --status error
 nullclaw cron list --match oil --json
 ```
