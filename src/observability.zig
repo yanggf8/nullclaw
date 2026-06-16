@@ -666,6 +666,11 @@ pub const OtelObserver = struct {
 
     const max_batch_size: usize = 10;
 
+    // Bound the OTLP export so a slow or unreachable collector can never block
+    // the agent's flush path indefinitely. Export is best-effort: spans are
+    // cleared whether or not delivery succeeds.
+    const export_max_time_secs: []const u8 = "5";
+
     const vtable_impl = Observer.VTable{
         .record_event = otelRecordEvent,
         .record_metric = otelRecordMetric,
@@ -1153,8 +1158,8 @@ pub const OtelObserver = struct {
         const url_buf = std.fmt.allocPrint(self.allocator, "{s}/v1/traces", .{self.endpoint}) catch return;
         defer self.allocator.free(url_buf);
 
-        // Best-effort send; free response if successful
-        if (http_util.curlPost(self.allocator, url_buf, payload, self.headers)) |curl_resp| {
+        // Best-effort send with a bounded timeout; free response if successful.
+        if (http_util.curlPostWithProxy(self.allocator, url_buf, payload, self.headers, null, export_max_time_secs)) |curl_resp| {
             self.allocator.free(curl_resp);
         } else |_| {}
 
