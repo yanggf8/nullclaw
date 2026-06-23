@@ -93,10 +93,11 @@ not inspect binary image contents, OCR text, or EXIF metadata.
 
 ## Channel Allowlists
 
-- `allow_from` behavior is channel-specific; do not assume `[]` is a deny-by-default switch across every runtime.
-- Some channels, including WeChat and Discord, treat an omitted or empty `allow_from` as "no filtering", so set explicit user IDs/OpenIDs when you want a private bot.
-- `allow_from: ["*"]`: allow all sources (high-risk).
-- Otherwise: expect exact-match allowlists or channel-specific fallback/group-policy behavior.
+- **Fail-closed by default (breaking change):** an empty or omitted `allow_from` now **denies all inbound senders** on every channel. A channel with no populated `allow_from` goes silent until you list trusted IDs. This replaces the earlier behavior where some channels treated `[]` as "no filtering".
+- `allow_from: ["*"]`: allow all sources (high-risk). Use this explicit wildcard when you intentionally want an open bot — an empty list no longer does this.
+- Otherwise: expect exact-match allowlists or channel-specific group-policy behavior.
+- This applies uniformly across all inbound paths: gateway webhooks (Telegram, LINE, WeChat, WeCom) and direct channels (Discord, IRC, MaixCam, OneBot, WhatsApp, Weixin).
+- Telegram webhook deliveries can additionally be authenticated with a `webhook_secret` (echoed by Telegram in the `X-Telegram-Bot-Api-Secret-Token` header); when set, requests without a matching secret are rejected.
 
 ## Pairing and Webhook Auth Boundaries
 

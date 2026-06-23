@@ -354,11 +354,14 @@ fn extractStreamUsage(json_str: []const u8) ?root.TokenUsage {
 /// Returns owned DeltaContent or null if no content found.
 pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !?DeltaContent {
     if (verbose.isVerbose()) {
-        log.debug("SSE JSON: {s}", .{json_str});
+        // NOTE: No unit test for this log path; it depends on global verbose
+        // logging state. Keep payload bytes out of logs because SSE chunks can
+        // contain user prompts, tool results, or model output.
+        log.debug("SSE JSON payload received: len={d}", .{json_str.len});
     }
 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch |err| {
-        if (verbose.isVerbose()) log.err("Failed to parse SSE JSON: {s} | Error: {s}", .{ json_str, @errorName(err) });
+        if (verbose.isVerbose()) log.err("Failed to parse SSE JSON payload: len={d} error={s}", .{ json_str.len, @errorName(err) });
         return error.InvalidSseJson;
     };
     defer parsed.deinit();
@@ -565,7 +568,7 @@ pub fn curlStream(
         total_stdout += n;
 
         if (log_enabled) {
-            debug_log.info("stdout read {d} bytes: {s}", .{ n, read_buf[0..n] });
+            debug_log.info("stdout read {d} bytes", .{n});
         }
 
         // Check if this is JSON (starts with '{')
@@ -589,14 +592,14 @@ pub fn curlStream(
 
             // Return a meaningful error
             _ = child.wait() catch {};
-            debug_log.err("Server returned JSON error: {s}", .{json_response});
+            debug_log.err("Server returned JSON error payload: len={d}", .{json_response.len});
             return error.ServerError;
         }
 
         for (read_buf[0..n]) |byte| {
             if (byte == '\n') {
                 if (log_enabled) {
-                    debug_log.info("parsing SSE line: {s}", .{line_buf.items});
+                    debug_log.info("parsing SSE line: len={d}", .{line_buf.items.len});
                 }
                 const result = parseSseLine(allocator, line_buf.items) catch {
                     line_buf.clearRetainingCapacity();

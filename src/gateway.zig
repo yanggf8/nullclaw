@@ -545,6 +545,7 @@ pub const GatewayState = struct {
     telegram_bot_token: []const u8,
     telegram_account_id: []const u8 = "default",
     telegram_allow_from: []const []const u8 = &.{},
+    telegram_webhook_secret: ?[]const u8 = null,
     whatsapp_allow_from: []const []const u8 = &.{},
     whatsapp_group_allow_from: []const []const u8 = &.{},
     whatsapp_groups: []const []const u8 = &.{},
@@ -2038,8 +2039,22 @@ fn telegramChatIsGroup(allocator: std.mem.Allocator, body: []const u8) bool {
         std.mem.eql(u8, type_val.string, "channel");
 }
 
+/// Validate the inbound Telegram webhook request against the configured secret.
+/// Telegram echoes the configured secret in the X-Telegram-Bot-Api-Secret-Token
+/// header on every webhook delivery (set via setWebhook secret_token).
+/// Fail-closed: a missing/empty configured secret or a missing/mismatched header
+/// rejects the request. Comparison is constant-time to avoid timing leaks.
+fn telegramWebhookSecretMatches(raw_request: []const u8, configured_secret: ?[]const u8) bool {
+    const secret = configured_secret orelse return false;
+    if (secret.len == 0) return false;
+    const header = extractHeader(raw_request, "X-Telegram-Bot-Api-Secret-Token") orelse return false;
+    const trimmed = std.mem.trim(u8, header, " \t\r\n");
+    return constantTimeEq(trimmed, secret);
+}
+
 fn telegramSenderAllowed(allocator: std.mem.Allocator, allow_from: []const []const u8, body: []const u8) bool {
-    if (allow_from.len == 0) return true;
+    // Fail-closed: an empty allow_from denies all inbound senders.
+    if (allow_from.len == 0) return false;
 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
     defer parsed.deinit();
@@ -5117,10 +5132,18 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
         var tg_bot_token = ctx.state.telegram_bot_token;
         var tg_allow_from = ctx.state.telegram_allow_from;
         var tg_account_id = ctx.state.telegram_account_id;
+        var tg_webhook_secret = ctx.state.telegram_webhook_secret;
         if (selectTelegramConfig(ctx.config_opt, ctx.target)) |tg_cfg| {
             tg_bot_token = tg_cfg.bot_token;
             tg_allow_from = tg_cfg.allow_from;
             tg_account_id = tg_cfg.account_id;
+            tg_webhook_secret = tg_cfg.webhook_secret;
+        }
+
+        if (!telegramWebhookSecretMatches(ctx.raw_request, tg_webhook_secret)) {
+            ctx.response_status = "401 Unauthorized";
+            ctx.response_body = "{\"error\":\"unauthorized\"}";
+            return;
         }
 
         const msg_text = jsonStringField(b, "text");
@@ -5856,17 +5879,21 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
             return;
         };
         for (events) |evt| {
-            if (line_allow_from.len > 0) {
-                if (evt.user_id) |uid| {
-                    if (!channels.isAllowed(line_allow_from, uid)) continue;
-                } else continue;
-            }
+            // Fail-closed: an empty allow_from denies all inbound events.
+            if (evt.user_id) |uid| {
+                if (!channels.isAllowed(line_allow_from, uid)) continue;
+            } else continue;
             if (evt.message_text) |text| {
                 var kb: [128]u8 = undefined;
                 const line_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
                 const sk = lineSessionKeyRouted(ctx.req_allocator, &kb, evt, line_cfg_opt, line_account_id);
                 const uid = evt.user_id orelse "unknown";
                 const line_target = lineReplyTarget(evt);
+                if (evt.reply_token) |rt| {
+                    if (!std.mem.eql(u8, line_target, "unknown")) {
+                        channels.line.cacheReplyToken(line_target, rt);
+                    }
+                }
                 var peer_buf: [160]u8 = undefined;
                 const line_peer = linePeerMetadata(evt, &peer_buf);
 
@@ -6229,7 +6256,8 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
     };
     defer inbound.deinit(ctx.req_allocator);
 
-    if (wechat_allow_from.len > 0 and !channels.isAllowed(wechat_allow_from, inbound.from_user)) {
+    // Fail-closed: an empty allow_from denies all inbound senders.
+    if (!channels.isAllowed(wechat_allow_from, inbound.from_user)) {
         setPlainTextResponse(ctx, "success");
         return;
     }
@@ -6432,7 +6460,8 @@ fn handleWeComWebhookRoute(ctx: *WebhookHandlerContext) void {
     };
     defer inbound.deinit(ctx.req_allocator);
 
-    if (wecom_allow_from.len > 0 and !channels.isAllowed(wecom_allow_from, inbound.sender)) {
+    // Fail-closed: an empty allow_from denies all inbound senders.
+    if (!channels.isAllowed(wecom_allow_from, inbound.sender)) {
         ctx.response_body = "{\"status\":\"unauthorized\"}";
         return;
     }
@@ -7551,6 +7580,7 @@ pub fn run(
             state.telegram_bot_token = tg_cfg.bot_token;
             state.telegram_allow_from = tg_cfg.allow_from;
             state.telegram_account_id = tg_cfg.account_id;
+            state.telegram_webhook_secret = tg_cfg.webhook_secret;
         }
         if (cfg.channels.whatsappPrimary()) |wa_cfg| {
             state.whatsapp_verify_token = wa_cfg.verify_token;
@@ -10235,12 +10265,105 @@ test "whatsappSessionKey builds group key when group id exists" {
     try std.testing.expectEqualStrings("whatsapp:group:1203630@g.us:15550001111", key);
 }
 
-test "telegramSenderAllowed permits when allow_from is empty" {
+test "telegramSenderAllowed denies when allow_from is empty" {
     const allocator = std.testing.allocator;
     const body =
         \\{"message":{"from":{"id":12345,"username":"alice"}}}
     ;
-    try std.testing.expect(telegramSenderAllowed(allocator, &.{}, body));
+    try std.testing.expect(!telegramSenderAllowed(allocator, &.{}, body));
+}
+
+test "telegramSenderAllowed wildcard explicitly permits all senders" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"message":{"from":{"id":12345,"username":"alice"}}}
+    ;
+    const allow_from = [_][]const u8{"*"};
+    try std.testing.expect(telegramSenderAllowed(allocator, &allow_from, body));
+}
+
+test "telegramWebhookSecretMatches requires configured secret header" {
+    const raw =
+        "POST /telegram HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "X-Telegram-Bot-Api-Secret-Token: test-secret\r\n" ++
+        "\r\n{}";
+    try std.testing.expect(telegramWebhookSecretMatches(raw, "test-secret"));
+    try std.testing.expect(!telegramWebhookSecretMatches(raw, "wrong-secret"));
+    try std.testing.expect(!telegramWebhookSecretMatches(raw, null));
+}
+
+test "telegramWebhookSecretMatches denies when header missing" {
+    const raw =
+        "POST /telegram HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n{}";
+    try std.testing.expect(!telegramWebhookSecretMatches(raw, "test-secret"));
+}
+
+test "line webhook caches reply token only after sender allowlist passes" {
+    if (!build_options.enable_channel_line) return error.SkipZigTest;
+
+    channels.line.resetReplyTokenCacheForTest();
+    defer channels.line.resetReplyTokenCacheForTest();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const allowed_id = "U" ++ ("1" ** 32);
+    const blocked_id = "U" ++ ("2" ** 32);
+    const allow_from = [_][]const u8{allowed_id};
+    state.line_allow_from = &allow_from;
+    state.line_access_token = "test-token";
+
+    const blocked_body =
+        \\{"events":[{"type":"message","replyToken":"blocked_reply_token","source":{"type":"user","userId":"
+    ++ blocked_id ++
+        \\"},"timestamp":1700000000000,"message":{"id":"m1","type":"text","text":"blocked"}}]}
+    ;
+    const blocked_raw = "POST /line HTTP/1.1\r\nHost: localhost\r\n\r\n" ++ blocked_body;
+    var blocked_ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = blocked_raw,
+        .method = "POST",
+        .target = "/line",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+        .client_identifier = "blocked-line-test",
+    };
+    handleLineWebhookRoute(&blocked_ctx);
+
+    var token_buf: [512]u8 = undefined;
+    try std.testing.expect(channels.line.takeReplyToken(blocked_id, &token_buf) == null);
+
+    const allowed_body =
+        \\{"events":[{"type":"message","replyToken":"allowed_reply_token","source":{"type":"user","userId":"
+    ++ allowed_id ++
+        \\"},"timestamp":1700000000000,"message":{"id":"m2","type":"text","text":"allowed"}}]}
+    ;
+    const allowed_raw = "POST /line HTTP/1.1\r\nHost: localhost\r\n\r\n" ++ allowed_body;
+    var allowed_ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = allowed_raw,
+        .method = "POST",
+        .target = "/line",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+        .client_identifier = "allowed-line-test",
+    };
+    handleLineWebhookRoute(&allowed_ctx);
+
+    const cached = channels.line.takeReplyToken(allowed_id, &token_buf) orelse return error.TestExpectedEqual;
+    // Regression: disallowed LINE events must not populate the async reply-token cache.
+    try std.testing.expectEqualStrings("allowed_reply_token", cached);
 }
 
 test "telegramChatId extracts nested message.chat.id" {

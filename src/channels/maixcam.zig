@@ -68,9 +68,8 @@ pub const MaixCamChannel = struct {
     // ── Device Allowlist ──────────────────────────────────────────
 
     /// Check if a device_id is permitted by the allowlist.
-    /// If the allowlist is empty, all devices are allowed.
+    /// Fail-closed: an empty allowlist denies all devices. Use "*" to allow all.
     pub fn isDeviceAllowed(self: *const MaixCamChannel, device_id: []const u8) bool {
-        if (self.config.allow_from.len == 0) return true;
         var matched = false;
         var wildcard_seen = false;
         for (self.config.allow_from) |allowed| {
@@ -497,11 +496,11 @@ test "maixcam health check true when running" {
 
 // ── Allowlist Tests ──────────────────────────────────────────────
 
-test "maixcam allowlist empty allows all" {
+test "maixcam allowlist empty denies all" {
     const ch = MaixCamChannel.init(std.testing.allocator, .{});
-    try std.testing.expect(ch.isDeviceAllowed("anything"));
-    try std.testing.expect(ch.isDeviceAllowed("cam-01"));
-    try std.testing.expect(ch.isDeviceAllowed(""));
+    try std.testing.expect(!ch.isDeviceAllowed("anything"));
+    try std.testing.expect(!ch.isDeviceAllowed("cam-01"));
+    try std.testing.expect(!ch.isDeviceAllowed(""));
 }
 
 test "maixcam allowlist permits listed devices" {

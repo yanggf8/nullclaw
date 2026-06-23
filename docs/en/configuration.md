@@ -520,7 +520,7 @@ WeChat notes:
 - `callback_token` is required for signature verification.
 - `encoding_aes_key` is optional but required when your WeChat callback is configured for `encrypt_type=aes`.
 - `app_id` and `app_secret` are optional unless you want outbound active-message delivery through the WeChat custom message API.
-- `allow_from` should list trusted OpenIDs. Keep it explicit; do not rely on an empty allowlist for privacy.
+- `allow_from` should list trusted OpenIDs. An empty allowlist now denies all inbound senders (fail-closed), so populate it explicitly to receive messages.
 - Build with `-Dchannels=wechat` (or `-Dchannels=all`) if your binary was compiled without the WeChat channel.
 
 Telegram forum topics:
@@ -710,8 +710,8 @@ Effect on delivery:
 
 Rules:
 
-- Empty `allow_from` behavior is channel-specific. Some channels, including WeChat and Discord, treat an omitted or empty list as "no filtering" rather than "deny all", so set explicit IDs/OpenIDs for a private bot.
-- `allow_from: ["*"]` allows all sources on allowlist-based channels; use it only when you intentionally want an open bot.
+- An empty or omitted `allow_from` now denies all inbound senders (fail-closed) on every channel, so set explicit IDs/OpenIDs to receive messages. A channel with no populated `allow_from` stays silent.
+- `allow_from: ["*"]` allows all sources on allowlist-based channels; use it only when you intentionally want an open bot. An empty list no longer means "allow all".
 - Teams inbound webhooks are authenticated with Bot Framework JWT bearer tokens against Microsoft's OpenID metadata. `channels.teams[].webhook_secret` is optional and, when set, acts as an additional `X-Webhook-Secret` check.
 
 Max example:

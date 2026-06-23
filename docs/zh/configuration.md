@@ -460,13 +460,13 @@ WeChat 说明：
 - `callback_token` 是签名校验必填项。
 - `encoding_aes_key` 是可选项；当 WeChat 回调配置为 `encrypt_type=aes` 时必须提供。
 - `app_id` 和 `app_secret` 只有在需要通过 WeChat custom message API 主动发送消息时才需要。
-- `allow_from` 应显式列出可信 OpenID，不要依赖空 allowlist 来实现隐私隔离。
+- `allow_from` 應顯式列出可信 OpenID；空的 allowlist 現在會拒絕所有入站發送者（fail-closed），請顯式填寫才能收到訊息。
 - 如果当前二进制未编译 WeChat channel，请使用 `-Dchannels=wechat`（或 `-Dchannels=all`）重新构建。
 
 规则说明：
 
-- 空 `allow_from` 的行为因渠道而异。有些渠道（例如 WeChat 和 Discord）会把省略或留空视为“关闭过滤”，而不是“拒绝所有”；如果要做私有机器人，请显式填写 ID/OpenID。
-- `allow_from: ["*"]` 会在基于 allowlist 的渠道上允许所有来源，仅在你明确接受风险时使用。
+- 空的或省略的 `allow_from` 現在會在每個頻道拒絕所有入站發送者（fail-closed）；未填寫時頻道會保持靜默，請顯式填寫 ID/OpenID 才能收到訊息。
+- `allow_from: ["*"]` 會在基於 allowlist 的頻道上允許所有來源，僅在你明確接受風險時使用；空清單已不再代表「允許全部」。
 - Teams 入站 webhook 现在会使用 Bot Framework JWT bearer token 并对照 Microsoft OpenID metadata 做认证。`channels.teams[].webhook_secret` 变为可选项；如果配置，会额外要求 `X-Webhook-Secret` 匹配。
 
 Telegram forum topics：

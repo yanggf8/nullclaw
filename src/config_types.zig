@@ -374,7 +374,11 @@ pub const ToolFilterGroup = struct {
 };
 
 pub const AgentConfig = struct {
-    compact_context: bool = false,
+    /// When true (default), history is auto-compacted once it crosses the
+    /// token / message thresholds. Set to false to leave history untouched
+    /// and manage context yourself. Default is true to preserve the
+    /// historical always-compact behavior.
+    compact_context: bool = true,
     max_tool_iterations: u32 = 1000,
     max_history_messages: u32 = 100,
     parallel_tools: bool = false,
@@ -600,6 +604,14 @@ pub const TelegramConfig = struct {
     /// Publish Telegram slash-command menu:
     /// off = clear it, flat = one global list, scoped = separate private/group menus.
     commands_menu_mode: TelegramCommandsMenuMode = .flat,
+    /// Optional secret token validated against Telegram's
+    /// X-Telegram-Bot-Api-Secret-Token header on inbound webhook requests.
+    /// When set, requests with a missing or mismatched token are rejected.
+    webhook_secret: ?[]const u8 = null,
+
+    pub fn isValidWebhookSecret(raw: []const u8) bool {
+        return WebConfig.isValidAuthToken(raw);
+    }
 };
 
 pub const DiscordConfig = struct {

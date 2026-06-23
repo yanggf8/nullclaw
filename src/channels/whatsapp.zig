@@ -141,7 +141,8 @@ pub const WhatsAppChannel = struct {
                         false;
 
                     if (!is_group_msg) {
-                        if (self.allow_from.len > 0 and !self.isNumberAllowed(normalized)) continue;
+                        // Fail-closed: empty allow_from denies all direct senders.
+                        if (!self.isNumberAllowed(normalized)) continue;
                     } else {
                         if (std.mem.eql(u8, self.group_policy, "disabled")) continue;
                         if (!std.mem.eql(u8, self.group_policy, "open")) {
@@ -433,6 +434,19 @@ test "whatsapp parse unauthorized number filtered" {
 
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"9999999999","timestamp":"1","type":"text","text":{"body":"Spam"}}]}}]}]}
+    ;
+
+    const msgs = try ch.parseWebhookPayload(allocator, payload);
+    defer allocator.free(msgs);
+    try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
+test "whatsapp direct empty allow_from denies inbound" {
+    const allocator = std.testing.allocator;
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &.{}, &.{}, "allowlist");
+
+    const payload =
+        \\{"entry":[{"changes":[{"value":{"messages":[{"from":"9999999999","timestamp":"1","type":"text","text":{"body":"Hi"}}]}}]}]}
     ;
 
     const msgs = try ch.parseWebhookPayload(allocator, payload);

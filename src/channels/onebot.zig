@@ -266,8 +266,8 @@ pub const OneBotChannel = struct {
         var user_buf: [32]u8 = undefined;
         const user_str = std.fmt.bufPrint(&user_buf, "{d}", .{user_id}) catch return;
 
-        // Allowlist check
-        if (self.config.allow_from.len > 0 and !root.isAllowedScoped("onebot channel", self.config.allow_from, user_str)) return;
+        // Allowlist check. Fail-closed: empty allow_from denies all.
+        if (!root.isAllowedScoped("onebot channel", self.config.allow_from, user_str)) return;
 
         // Extract chat_id (group_id for group messages, user_id for private)
         const chat_id_int = if (is_group) getJsonInt(val, "group_id") orelse return else user_id;
@@ -949,7 +949,7 @@ test "handleEvent private message" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = OneBotChannel.init(alloc, .{ .account_id = "onebot-main" });
+    var ch = OneBotChannel.init(alloc, .{ .account_id = "onebot-main", .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
 
@@ -977,6 +977,7 @@ test "handleEvent group message with prefix" {
 
     var ch = OneBotChannel.init(alloc, .{
         .group_trigger_prefix = "/bot",
+        .allow_from = &.{"*"},
     });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
@@ -1021,7 +1022,7 @@ test "handleEvent deduplication" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = OneBotChannel.init(alloc, .{});
+    var ch = OneBotChannel.init(alloc, .{ .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
 
@@ -1074,7 +1075,7 @@ test "handleEvent with CQ tags in message" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = OneBotChannel.init(alloc, .{});
+    var ch = OneBotChannel.init(alloc, .{ .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
 
     const event_json =
@@ -1097,6 +1098,7 @@ test "handleEvent group message with mention passes prefix check" {
 
     var ch = OneBotChannel.init(alloc, .{
         .group_trigger_prefix = "/bot",
+        .allow_from = &.{"*"},
     });
     ch.setBus(&event_bus_inst);
 
@@ -1155,7 +1157,7 @@ test "handleEvent allow_from permits listed user" {
     try std.testing.expectEqualStrings("allowed user", msg.content);
 }
 
-test "handleEvent allow_from empty allows all" {
+test "handleEvent allow_from empty denies all" {
     const alloc = std.testing.allocator;
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
@@ -1166,6 +1168,24 @@ test "handleEvent allow_from empty allows all" {
 
     const event_json =
         \\{"post_type":"message","message_type":"private","message_id":6003,
+        \\"user_id":12345,"raw_message":"anyone allowed","time":1700000000}
+    ;
+    try ch.handleEvent(event_json);
+
+    try std.testing.expectEqual(@as(usize, 0), event_bus_inst.inboundDepth());
+}
+
+test "handleEvent allow_from wildcard permits all" {
+    const alloc = std.testing.allocator;
+    var event_bus_inst = bus.Bus.init();
+    defer event_bus_inst.close();
+
+    var ch = OneBotChannel.init(alloc, .{ .allow_from = &.{"*"} });
+    ch.setBus(&event_bus_inst);
+    ch.running.store(true, .release);
+
+    const event_json =
+        \\{"post_type":"message","message_type":"private","message_id":6004,
         \\"user_id":12345,"raw_message":"anyone allowed","time":1700000000}
     ;
     try ch.handleEvent(event_json);

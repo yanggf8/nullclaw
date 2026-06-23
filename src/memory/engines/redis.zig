@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const std_compat = @import("compat");
 const root = @import("../root.zig");
 const Memory = root.Memory;
@@ -1056,6 +1057,12 @@ test "formatCommand roundtrip with parseResp" {
 
 // Integration tests — guarded by Redis availability
 fn canConnectToRedis() bool {
+    // Only probe when the Redis engine is actually compiled in. This module is
+    // imported unconditionally from memory/root.zig, so without this gate the
+    // probe (and its blocking connect) would run on every test build, including
+    // -Dengines=base,sqlite where Redis is never used.
+    if (!build_options.enable_memory_redis) return false;
+
     // Windows CI does not provide Redis, and Zig 0.16's AFD connect path can
     // emit noisy unexpected NTSTATUS traces for a simple connection-refused
     // probe before the error is caught here.

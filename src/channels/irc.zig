@@ -241,7 +241,8 @@ pub const IrcChannel = struct {
 
         const sender_nick = parsed.nick() orelse return;
         if (IrcChannel.isServiceBot(sender_nick)) return;
-        if (self.allow_from.len > 0 and !self.isUserAllowed(sender_nick)) return;
+        // Fail-closed: empty allow_from denies all senders.
+        if (!self.isUserAllowed(sender_nick)) return;
 
         const target = parsed.params[0];
         const text = std.mem.trim(u8, parsed.params[parsed.params.len - 1], " \t\r\n");
@@ -1019,6 +1020,36 @@ test "irc handleInboundLine drops disallowed sender" {
     try ch.handleInboundLine(":mallory!u@h PRIVMSG #general :hello team\r\n");
     eb.close();
     try std.testing.expect(eb.consumeInbound() == null);
+}
+
+test "irc handleInboundLine empty allow_from denies inbound" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    var ch = IrcChannel.init(alloc, "irc.test", 6667, "mybot", null, &.{}, &.{}, null, null, null, false);
+    ch.account_id = "irc-main";
+    ch.setBus(&eb);
+
+    try ch.handleInboundLine(":alice!u@h PRIVMSG #general :hello team\r\n");
+    eb.close();
+    try std.testing.expect(eb.consumeInbound() == null);
+}
+
+test "irc handleInboundLine wildcard allow_from permits inbound" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    var ch = IrcChannel.init(alloc, "irc.test", 6667, "mybot", null, &.{}, &.{"*"}, null, null, null, false);
+    ch.account_id = "irc-main";
+    ch.setBus(&eb);
+
+    try ch.handleInboundLine(":alice!u@h PRIVMSG #general :hello team\r\n");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("alice", msg.sender_id);
 }
 
 test "irc max nick retries constant" {

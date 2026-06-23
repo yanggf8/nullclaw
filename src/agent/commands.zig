@@ -498,7 +498,8 @@ fn renderInteractiveModelMenu(self: anytype, provider_name: []const u8, page_num
     defer if (cfg_opt) |*cfg| cfg.deinit();
 
     const api_key = if (cfg_opt) |*cfg| cfg.getProviderKey(provider_name) else null;
-    const models = onboard.fetchModels(self.allocator, provider_name, api_key) catch return null;
+    const base_url = if (cfg_opt) |*cfg| cfg.getProviderBaseUrl(provider_name) else null;
+    const models = onboard.fetchModels(self.allocator, provider_name, api_key, base_url) catch return null;
     defer freeOwnedStringSlice(self.allocator, models);
 
     return renderInteractiveModelMenuFromModels(
@@ -5736,7 +5737,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
             return try std.fmt.allocPrint(self.allocator, "Unknown option for /memory list: {s}", .{tok});
         }
 
-        const entries = mem_rt.memory.list(self.allocator, category_opt, self.memory_session_id) catch |err| {
+        const entries = mem_rt.memory.list(self.allocator, category_opt, null) catch |err| {
             return try std.fmt.allocPrint(self.allocator, "Memory list failed: {s}", .{@errorName(err)});
         };
         defer memory_mod.freeEntries(self.allocator, entries);

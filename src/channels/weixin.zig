@@ -680,7 +680,8 @@ fn parseGetUpdatesResponse(
     for (inbound_messages) |message| {
         const sender = message.from_user_id orelse continue;
         if (sender.len == 0) continue;
-        if (allow_from.len > 0 and !root.isAllowedExactScoped("weixin channel", allow_from, sender)) {
+        // Fail-closed: empty allow_from denies all senders.
+        if (!root.isAllowedExactScoped("weixin channel", allow_from, sender)) {
             continue;
         }
 
@@ -841,7 +842,7 @@ test "parseGetUpdatesResponse extracts text message and context token" {
         \\{"ret":0,"msgs":[{"message_id":42,"from_user_id":"user-123","create_time_ms":1712345678901,"context_token":"ctx-456","item_list":[{"type":1,"text_item":{"text":"hello from weixin"}}]}],"get_updates_buf":"next-buf"}
     ;
 
-    var parsed = try parseGetUpdatesResponse(std.testing.allocator, json, &.{});
+    var parsed = try parseGetUpdatesResponse(std.testing.allocator, json, &.{"*"});
     defer parsed.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), parsed.messages.len);
@@ -864,6 +865,17 @@ test "parseGetUpdatesResponse filters allow_from when configured" {
 
     try std.testing.expectEqual(@as(usize, 1), parsed.messages.len);
     try std.testing.expectEqualStrings("allowed", parsed.messages[0].sender);
+}
+
+test "parseGetUpdatesResponse empty allow_from denies all" {
+    const json =
+        \\{"ret":0,"msgs":[{"from_user_id":"user-123","item_list":[{"type":1,"text_item":{"text":"hello"}}]}]}
+    ;
+
+    var parsed = try parseGetUpdatesResponse(std.testing.allocator, json, &.{});
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), parsed.messages.len);
 }
 
 test "weixin channel stores latest context token per user" {

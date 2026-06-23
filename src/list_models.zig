@@ -18,6 +18,7 @@ fn writeModelsJson(out: *std.Io.Writer, models: []const []const u8) !void {
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var provider: ?[]const u8 = null;
     var api_key: ?[]const u8 = null;
+    var base_url: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -26,6 +27,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--api-key") and i + 1 < args.len) {
             api_key = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--base-url") and i + 1 < args.len) {
+            base_url = args[i + 1];
             i += 1;
         }
     }
@@ -41,7 +45,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
 
     // Use onboard's fetchModels (handles caching, fallbacks, API calls)
-    const models = onboard.fetchModels(allocator, provider_info.key, api_key) catch |err| {
+    const models = onboard.fetchModels(allocator, provider_info.key, api_key, base_url) catch |err| {
         std.debug.print("error fetching models: {}\n", .{err});
         std_compat.process.exit(1);
     };
