@@ -9193,6 +9193,7 @@ test "load agent job without command field falls back to prompt" {
         ;
         const path = try cronJsonPath(std.testing.allocator);
         defer std.testing.allocator.free(path);
+        try ensureCronDir(std.testing.allocator); // config dir not guaranteed on Windows
         const file = try std.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(json);
@@ -9244,6 +9245,7 @@ test "load agent job without prompt field falls back to command" {
         ;
         const path = try cronJsonPath(std.testing.allocator);
         defer std.testing.allocator.free(path);
+        try ensureCronDir(std.testing.allocator); // config dir not guaranteed on Windows
         const file = try std.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(json);
@@ -9385,6 +9387,11 @@ test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
 
     const path = try cronJsonPath(std.testing.allocator);
     defer std.testing.allocator.free(path);
+    // The config dir is not guaranteed to exist (it does ambiently on Linux CI
+    // but not on Windows), so createFileAbsolute would fail with FileNotFound /
+    // OBJECT_PATH_NOT_FOUND. Ensure the parent dir exists first, as production
+    // cron-write paths do.
+    try ensureCronDir(std.testing.allocator);
     const bad_file = try std_compat.fs.createFileAbsolute(path, .{});
     defer bad_file.close();
     try bad_file.writeAll("{bad-json");
