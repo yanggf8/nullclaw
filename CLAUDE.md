@@ -158,6 +158,15 @@ CalVer format: `YYYY.M.D` (e.g., `v2026.2.26`). Defined in `build.zig.zon`.
 
 Tests run on Ubuntu (x86_64), macOS (aarch64), and Windows (x86_64). Release builds target 7 platforms including linux-riscv64. Docker images published to ghcr.io (linux/amd64, linux/arm64).
 
+## Fork workflow (this repo)
+
+This is a divergent fork of `nullclaw/nullclaw`. Practical workflow:
+
+- **Trunk is `main`** (`.github/workflows/ci.yml` runs on push/PR to `main`). Develop on `main`.
+- **Release is tag-driven**: push a CalVer `v*` tag → `release.yml` (reusable `nullbuilder@v1`) builds binaries for ~12 platforms and publishes a GitHub release. The version is embedded via `-Dversion=<tag>` (build.zig), NOT from `build.zig.zon`. The ghcr docker leg is currently skipped by the reusable workflow — binaries still publish.
+- **Deploy** = rebuild the local binary at the tag (`zig build -Dversion=v<tag> -Doptimize=ReleaseSmall`) and restart the systemd user service: `systemctl --user restart nullclaw` (ExecStart runs `zig-out/bin/nullclaw gateway`).
+- **Upstream** (`origin`, READ-only): we do NOT merge/sync; selectively cherry-pick fixes. Run `scripts/upstream-check.sh` to list back-port candidates (non-merge commits upstream has that `main` lacks) + ahead/behind.
+
 ## Docker
 
 Multi-stage build: Alpine builder with Zig, then minimal Alpine runtime. Runs as non-root (uid 65534) by default. Use `--target release-root` for root access.
