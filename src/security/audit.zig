@@ -71,10 +71,17 @@ pub const AuditEvent = struct {
 
     /// Global counter for unique event IDs
     var next_id: u64 = 0;
+    /// Guards next_id. A mutex (not @atomicRmw) because 32-bit targets such as
+    /// arm-linux-androideabi (armv7) lack native 64-bit atomics, and event_id
+    /// must stay u64.
+    var next_id_mutex: std_compat.sync.Mutex = .{};
 
     /// Create a new audit event with current timestamp and unique ID
     pub fn init(event_type: AuditEventType) AuditEvent {
-        const id = @atomicRmw(u64, &next_id, .Add, 1, .monotonic);
+        next_id_mutex.lock();
+        const id = next_id;
+        next_id += 1;
+        next_id_mutex.unlock();
         return .{
             .timestamp_s = std_compat.time.timestamp(),
             .event_id = id,
