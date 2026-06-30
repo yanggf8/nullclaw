@@ -690,6 +690,33 @@ Max 说明：
 
 **注意**：`markdown_only` 内存配置文件会自动启用混合检索和时间衰减（半衰期 30 天），以实现最佳的相关性评分。这确保了对纯 markdown 文件的时间感知能力。
 
+#### OKF 知识包导入（markdown 后端）
+
+`markdown` 后端还能将 [Open Knowledge Format](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing)（OKF）知识包作为**只读**上下文导入并用于召回。在 agent 工作区下放置一个 OKF 概念文件目录：
+
+```
+<workspace>/okf/
+├── metrics/wau.md
+├── datasets/orders.md
+└── runbooks/oncall.md
+```
+
+每个 `.md` 文件是一个概念，带有 YAML frontmatter：
+
+```markdown
+---
+type: note
+title: Weekly Active Users
+timestamp: 1700000000
+---
+WAU 按滚动 7 天窗口计算。
+```
+
+- 目录会被递归遍历（支持嵌套子目录，深度上限 8；不跟随符号链接）。
+- `type` 是唯一必填字段；可识别 `title`、`description`、`timestamp`。`tags`/`resource` 及其他字段会被忽略。frontmatter 起始行必须恰好是 `---`。
+- `type` 映射到记忆类别（`core`/`daily`/`conversation`，其余为自定义类别）；`title` 作为条目键（缺省时回退为文件路径）；正文（正文为空时取 `description`）作为内容；`timestamp` 缺省时回退为文件 mtime。
+- 知识包**永不会被写入**——nullclaw 只读取 OKF 概念，仅写入自身的 `MEMORY.md` / 每日日志。缺少 `type`、无 frontmatter 或超过 1 MiB 的文件会被静默跳过。
+
 ### `gateway`
 
 - 默认推荐：
