@@ -10447,6 +10447,9 @@ test "ensureCronTable is idempotent" {
 
 test "openCronDbForReadAtPath falls back to immutable read-only when schema migration is blocked" {
     if (!build_options.enable_sqlite) return error.SkipZigTest;
+    // Read-only fallback is exercised by chmod'ing the dir to 0o555 via fchmodat,
+    // which the compat shim only implements on Linux. Skip elsewhere.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10483,6 +10486,8 @@ test "openCronDbForReadAtPath falls back to immutable read-only when schema migr
 
 test "loadJobsForRead loads jobs from read-only cron DB" {
     if (!build_options.enable_sqlite) return error.SkipZigTest;
+    // Uses fchmodat (Linux-only in the compat shim) to make the dir read-only.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
