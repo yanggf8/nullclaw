@@ -236,6 +236,16 @@ pub const MarkdownMemory = struct {
     // we map a concept onto a single MemoryEntry. `tags`/`resource` are not
     // modelled (no MemoryEntry field) and are deliberately ignored.
 
+    // True if a frontmatter value is a YAML block-scalar indicator: `|` or `>`,
+    // optionally followed by a single chomping/indentation modifier (`-`, `+`,
+    // or a digit). We do not parse block scalars; this just detects them.
+    fn isBlockScalarIndicator(value: []const u8) bool {
+        if (value.len == 0 or value.len > 2) return false;
+        if (value[0] != '|' and value[0] != '>') return false;
+        if (value.len == 1) return true;
+        return value[1] == '-' or value[1] == '+' or std.ascii.isDigit(value[1]);
+    }
+
     // Strip surrounding matching single/double quotes from a frontmatter value.
     fn stripQuotes(value: []const u8) []const u8 {
         if (value.len >= 2) {
@@ -283,6 +293,11 @@ pub const MarkdownMemory = struct {
         // Byte offset where the body (post-frontmatter) begins.
         var body_start: usize = body_text.len;
 
+        // When a recognized field uses a YAML block scalar (`key: |` / `key: >`),
+        // its value spans following indented lines. We do not parse block
+        // scalars; we skip those continuation lines so they are not misread as
+        // further `key: value` pairs (which would corrupt other fields).
+        var skipping_block = false;
         while (line_it.next()) |raw_line| {
             const line = std.mem.trimEnd(u8, raw_line, "\r");
             if (std.mem.eql(u8, line, "---")) {
@@ -293,6 +308,13 @@ pub const MarkdownMemory = struct {
                 break;
             }
 
+            // Inside a block scalar: indented (or blank) lines are continuation
+            // and are skipped; the first non-indented, non-blank line ends it.
+            if (skipping_block) {
+                if (line.len == 0 or line[0] == ' ' or line[0] == '\t') continue;
+                skipping_block = false;
+            }
+
             const trimmed = std.mem.trim(u8, line, " \t");
             if (trimmed.len == 0 or trimmed[0] == '#') continue;
 
@@ -300,6 +322,14 @@ pub const MarkdownMemory = struct {
             const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
             const key = std.mem.trim(u8, trimmed[0..colon], " \t");
             const value = stripQuotes(std.mem.trim(u8, trimmed[colon + 1 ..], " \t"));
+
+            // Bare `|` / `>` (optionally with a chomping `+`/`-`) is a block
+            // scalar indicator, not a real value. Treat the field as absent and
+            // skip its indented block rather than capturing the literal "|".
+            if (isBlockScalarIndicator(value)) {
+                skipping_block = true;
+                continue;
+            }
 
             if (std.mem.eql(u8, key, "type")) {
                 type_val = value;
@@ -325,9 +355,19 @@ pub const MarkdownMemory = struct {
             return null;
         }
 
-        // Choose content: body after the closing `---`, else `description`.
+        // Choose content: body after the closing `---`, else `description`,
+        // else the title, else the type. An OKF concept always carries SOME
+        // text so it stays reachable by keyword recall (which scans content
+        // only); a content-less entry would occupy a slot it can never match.
         const raw_body = std.mem.trim(u8, body_text[body_start..], " \t\r\n");
-        const content_src = if (raw_body.len > 0) raw_body else (description_val orelse "");
+        const content_src = if (raw_body.len > 0)
+            raw_body
+        else if (description_val) |d|
+            d
+        else if (title_val) |t|
+            t
+        else
+            type_str;
 
         // Build the entry with strict ownership: every returned slice is duped
         // so it survives the input `text`/`rel_path` buffers being freed, and is
@@ -342,17 +382,24 @@ pub const MarkdownMemory = struct {
         const content = try allocator.dupe(u8, content_src);
         errdefer allocator.free(content);
 
-        const timestamp = if (timestamp_val) |ts|
-            try allocator.dupe(u8, ts)
-        else
-            try std.fmt.allocPrint(allocator, "{d}", .{file_mtime_secs});
+        // Downstream retrieval does parseInt(timestamp) catch 0, so a non-integer
+        // OKF timestamp (e.g. ISO-8601, which OKF permits) would silently sort as
+        // epoch 0. Only honor an integer `timestamp`; otherwise fall back to mtime.
+        const timestamp = blk: {
+            if (timestamp_val) |ts| {
+                if (std.fmt.parseInt(i64, ts, 10)) |_| {
+                    break :blk try allocator.dupe(u8, ts);
+                } else |_| {}
+            }
+            break :blk try std.fmt.allocPrint(allocator, "{d}", .{file_mtime_secs});
+        };
         errdefer allocator.free(timestamp);
 
-        // fromString returns a `.custom` variant pointing INTO `type_str` (no
-        // dupe). Builtin variants carry no payload. Dupe only the custom name.
-        const category = switch (MemoryCategory.fromString(type_str)) {
-            .custom => |name| MemoryCategory{ .custom = try allocator.dupe(u8, name) },
-            else => |c| c,
+        // OKF concepts are always a namespaced custom category: an OKF
+        // `type: daily` must NOT alias the runtime's builtin .daily memory, so
+        // it never collides with the agent's own MEMORY.md / daily logs.
+        const category = MemoryCategory{
+            .custom = try std.fmt.allocPrint(allocator, "okf:{s}", .{type_str}),
         };
 
         return MemoryEntry{
@@ -388,43 +435,57 @@ pub const MarkdownMemory = struct {
         defer dir.close();
 
         var it = dir.iterate();
-        while (try it.next()) |entry| {
+        // A bad bundle file must never sink the whole memory read; iteration
+        // errors end this directory rather than propagating out of readAllEntries.
+        while (it.next() catch null) |entry| {
             // `entry.name` is only valid until the next it.next(); any path we
             // keep must be built (and duped) before continuing the loop.
-            switch (entry.kind) {
-                .directory => {
-                    const child_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ abs_dir, entry.name });
-                    defer allocator.free(child_abs);
-                    const child_rel = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_prefix, entry.name });
-                    defer allocator.free(child_rel);
-                    try self.ingestOkfDir(allocator, out, child_abs, child_rel, depth + 1);
-                },
-                .file => {
-                    if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
+            //
+            // Some filesystems (NFS/overlay) report .unknown for every dirent;
+            // treat .unknown as "could be either" and let the open/stat below
+            // sort it out, mirroring the daily-log loop's tolerance.
+            const kind = entry.kind;
+            const maybe_dir = kind == .directory or kind == .unknown;
+            const maybe_file = kind == .file or kind == .unknown;
 
-                    const fpath = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ abs_dir, entry.name });
-                    defer allocator.free(fpath);
+            if (maybe_dir) {
+                const child_abs = std.fmt.allocPrint(allocator, "{s}/{s}", .{ abs_dir, entry.name }) catch continue;
+                defer allocator.free(child_abs);
+                const child_rel = std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_prefix, entry.name }) catch continue;
+                defer allocator.free(child_rel);
+                // openDirPath inside the recursive call returns/`catch`es on a
+                // non-directory, so an .unknown regular file is harmlessly a no-op
+                // here and is then handled by the maybe_file branch below.
+                self.ingestOkfDir(allocator, out, child_abs, child_rel, depth + 1) catch {};
+            }
 
-                    const file = fs_compat.openPath(fpath, .{}) catch continue;
-                    defer file.close();
-                    const st = fs_compat.stat(file) catch continue;
-                    // readToEndAlloc raises StreamTooLong (never truncates) past
-                    // the cap; `catch continue` skips oversize/unreadable files.
-                    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch continue;
-                    defer allocator.free(content);
+            if (maybe_file) {
+                if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
 
-                    const rel_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_prefix, entry.name });
-                    defer allocator.free(rel_path);
+                const fpath = std.fmt.allocPrint(allocator, "{s}/{s}", .{ abs_dir, entry.name }) catch continue;
+                defer allocator.free(fpath);
 
-                    const mtime_secs: i64 = @intCast(@divTrunc(st.mtime, std.time.ns_per_s));
-                    if (try parseOkfConcept(content, rel_path, allocator, mtime_secs)) |okf_entry| {
-                        // Own the entry until it is safely handed to `out`; if the
-                        // append fails (OOM) the caller's errdefer won't see it.
-                        errdefer okf_entry.deinit(allocator);
-                        try out.append(allocator, okf_entry);
-                    }
-                },
-                else => continue,
+                const file = fs_compat.openPath(fpath, .{}) catch continue;
+                defer file.close();
+                const st = fs_compat.stat(file) catch continue;
+                // readToEndAlloc raises StreamTooLong (never truncates) past
+                // the cap; `catch continue` skips oversize/unreadable files.
+                const content = file.readToEndAlloc(allocator, 1024 * 1024) catch continue;
+                defer allocator.free(content);
+
+                const rel_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_prefix, entry.name }) catch continue;
+                defer allocator.free(rel_path);
+
+                const mtime_secs: i64 = @intCast(@divTrunc(st.mtime, std.time.ns_per_s));
+                const parsed = parseOkfConcept(content, rel_path, allocator, mtime_secs) catch continue;
+                if (parsed) |okf_entry| {
+                    // append owns the entry on success; free it if append fails
+                    // (OOM) so it is not leaked.
+                    out.append(allocator, okf_entry) catch {
+                        okf_entry.deinit(allocator);
+                        continue;
+                    };
+                }
             }
         }
     }
@@ -1041,7 +1102,7 @@ test "parseOkfConcept maps full frontmatter to entry fields" {
     try std.testing.expectEqualStrings("Weekly Active Users", entry.key);
     try std.testing.expectEqualStrings("WAU is computed over a rolling 7-day window.", entry.content);
     try std.testing.expectEqualStrings("1700000000", entry.timestamp);
-    try std.testing.expect(entry.category.eql(.{ .custom = "note" }));
+    try std.testing.expect(entry.category.eql(.{ .custom = "okf:note" }));
 }
 
 test "parseOkfConcept returns null without frontmatter" {
@@ -1084,8 +1145,8 @@ test "parseOkfConcept only-type fills defaults" {
     defer entry.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("okf/bare.md", entry.key); // title falls back to rel_path
-    try std.testing.expect(entry.category.eql(.{ .custom = "note" }));
-    try std.testing.expectEqualStrings("", entry.content); // empty body, no description
+    try std.testing.expect(entry.category.eql(.{ .custom = "okf:note" }));
+    try std.testing.expectEqualStrings("note", entry.content); // no body/description/title -> falls back to type
     try std.testing.expectEqualStrings("99", entry.timestamp); // mtime fallback
 }
 
@@ -1099,7 +1160,7 @@ test "parseOkfConcept dupes custom category name" {
     defer entry.deinit(std.testing.allocator);
 
     try std.testing.expect(entry.category == .custom);
-    try std.testing.expectEqualStrings("runbook", entry.category.custom);
+    try std.testing.expectEqualStrings("okf:runbook", entry.category.custom); // namespaced
     // The custom name must be a fresh allocation, not a slice into `text`.
     try expectNotAliased(entry.category.custom, text);
 }
@@ -1172,7 +1233,7 @@ test "parseOkfConcept ignores comments blanks tags and resource" {
     try std.testing.expectEqualStrings("Clean", entry.key);
     try std.testing.expectEqualStrings("real body", entry.content);
     try std.testing.expectEqualStrings("7", entry.timestamp);
-    try std.testing.expect(entry.category.eql(.{ .custom = "note" }));
+    try std.testing.expect(entry.category.eql(.{ .custom = "okf:note" }));
     // tags/resource values must not leak into content.
     try std.testing.expect(std.mem.indexOf(u8, entry.content, "alpha") == null);
     try std.testing.expect(std.mem.indexOf(u8, entry.content, "example.com") == null);
@@ -1184,14 +1245,49 @@ test "parseOkfConcept recognizes BOM and CRLF frontmatter" {
     defer entry.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("T", entry.key);
     try std.testing.expectEqualStrings("body line", entry.content);
-    try std.testing.expect(entry.category.eql(.{ .custom = "note" }));
+    try std.testing.expect(entry.category.eql(.{ .custom = "okf:note" }));
 }
 
-test "parseOkfConcept keeps builtin type without dupe path" {
+test "parseOkfConcept namespaces type to avoid builtin collision" {
+    // An OKF `type: core` must NOT become the runtime's builtin .core category —
+    // it is namespaced as okf:core so external concepts never merge with the
+    // agent's own MEMORY.md / daily logs.
     const text = "---\ntype: core\n---\nbody\n";
     var entry = (try MarkdownMemory.parseOkfConcept(text, "okf/core.md", std.testing.allocator, 0)).?;
     defer entry.deinit(std.testing.allocator);
-    try std.testing.expect(entry.category.eql(.core));
+    try std.testing.expect(!entry.category.eql(.core));
+    try std.testing.expect(entry.category.eql(.{ .custom = "okf:core" }));
+}
+
+test "parseOkfConcept empty concept gets nonempty content" {
+    // type-only concept (no body/description/title) must still carry text so
+    // keyword recall can match it; content falls back to the type.
+    const text = "---\ntype: note\n---\n";
+    var entry = (try MarkdownMemory.parseOkfConcept(text, "okf/empty.md", std.testing.allocator, 0)).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expect(entry.content.len > 0);
+    try std.testing.expectEqualStrings("note", entry.content);
+}
+
+test "parseOkfConcept skips block scalar without corrupting fields" {
+    // `description: |` block scalar: we don't parse it, but its indented
+    // continuation lines must not be misread as further keys, and `title` after
+    // it must still be captured.
+    const text = "---\ntype: note\ndescription: |\n  line one\n  line two\ntitle: Real Title\n---\nbody here\n";
+    var entry = (try MarkdownMemory.parseOkfConcept(text, "okf/block.md", std.testing.allocator, 0)).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Real Title", entry.key);
+    try std.testing.expectEqualStrings("body here", entry.content);
+    try std.testing.expect(entry.category.eql(.{ .custom = "okf:note" }));
+}
+
+test "parseOkfConcept ignores non-integer timestamp" {
+    // ISO-8601 timestamp is valid OKF but not a parseable integer; fall back to
+    // mtime rather than letting downstream parseInt-catch-0 sort it as epoch 0.
+    const text = "---\ntype: note\ntimestamp: 2026-06-30T12:00:00Z\n---\nbody\n";
+    var entry = (try MarkdownMemory.parseOkfConcept(text, "okf/iso.md", std.testing.allocator, 555)).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("555", entry.timestamp); // mtime fallback, not the ISO string
 }
 
 // ── OKF ingest (filesystem) tests ────────────────────────────────────
@@ -1220,7 +1316,7 @@ test "markdown ingests okf concept from bundle" {
     }
     try std.testing.expectEqual(@as(usize, 1), recalled.len);
     try std.testing.expect(std.mem.indexOf(u8, recalled[0].content, "rolling 7-day") != null);
-    try std.testing.expect(recalled[0].category.eql(.{ .custom = "note" }));
+    try std.testing.expect(recalled[0].category.eql(.{ .custom = "okf:note" }));
 }
 
 test "markdown ingests nested okf bundle dirs" {
