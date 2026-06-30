@@ -912,6 +912,10 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 
 /// Find gateway PID: try PID file first, then fall back to scanning /proc on Linux.
 fn findGatewayPid(allocator: std.mem.Allocator, cfg: *const yc.config.Config) u32 {
+    // Gateway PID management relies on std.posix.kill / /proc, both POSIX-only.
+    // comptime so the posix.kill body below is not analyzed on Windows (where
+    // pid_t is not an integer and @intCast would be a compile error).
+    if (comptime builtin.os.tag != .linux) return 0;
     // Try PID file first
     const pid = yc.daemon.readPidFile(allocator, cfg);
     if (pid != 0) {
@@ -1034,6 +1038,9 @@ fn systemctlUser(action: []const u8) bool {
 /// Send SIGTERM, wait up to 10s, then escalate to SIGKILL. Returns true if
 /// the process exited within the deadline.
 fn terminateAndWait(pid: u32) bool {
+    // SIGTERM/SIGKILL via std.posix.kill is POSIX-only; comptime guard so the
+    // body is not analyzed on Windows (pid_t there is not an integer).
+    if (comptime builtin.os.tag != .linux) return false;
     std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch |err| {
         std.debug.print("Failed to send SIGTERM to PID {d}: {s}\n", .{ pid, @errorName(err) });
         return false;
