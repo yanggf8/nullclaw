@@ -530,7 +530,23 @@ pub const Config = struct {
     }
 
     pub fn parseJson(self: *Config, content: []const u8) !void {
-        return config_parse.parseJson(self, content);
+        try config_parse.parseJson(self, content);
+        try self.parseAgentReflectionFields(content);
+    }
+
+    fn parseAgentReflectionFields(self: *Config, content: []const u8) !void {
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
+        defer parsed.deinit();
+        const root = parsed.value;
+        if (root != .object) return;
+        const ag = root.object.get("agent") orelse return;
+        if (ag != .object) return;
+        if (ag.object.get("reflect_after_turn")) |v| {
+            if (v == .bool) self.agent.reflect_after_turn = v.bool;
+        }
+        if (ag.object.get("reflect_model")) |v| {
+            if (v == .string) self.agent.reflect_model = try self.allocator.dupe(u8, v.string);
+        }
     }
 
     fn writeChannelFieldSeparator(w: *std.Io.Writer, wrote_any: bool) !void {
@@ -955,6 +971,12 @@ pub const Config = struct {
             defer self.allocator.free(val);
             self.gateway.allow_public_bind = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
         } else |_| {}
+
+        // Agent reflect_after_turn
+        if (std_compat.process.getEnvVarOwned(self.allocator, "NULLCLAW_AGENT_REFLECT_AFTER_TURN")) |val| {
+            defer self.allocator.free(val);
+            self.agent.reflect_after_turn = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+        } else |_| {}
     }
 
     /// Save config as JSON to the config_path.
@@ -1328,6 +1350,8 @@ pub const Config = struct {
             .compact_context = self.agent.compact_context,
             .max_tool_iterations = self.agent.max_tool_iterations,
             .max_history_messages = self.agent.max_history_messages,
+            .reflect_after_turn = self.agent.reflect_after_turn,
+            .reflect_model = self.agent.reflect_model,
             .parallel_tools = self.agent.parallel_tools,
             .tool_dispatcher = self.agent.tool_dispatcher,
             .session_idle_timeout_secs = self.agent.session_idle_timeout_secs,
@@ -7999,4 +8023,93 @@ test "Config parseJson rejects truncated JSON" {
     };
     const result = cfg.parseJson(malformed_json);
     try std.testing.expect(std.meta.isError(result));
+}
+
+// ── Reflection config (slice 1) tests ────────────────────────────────
+
+test "reflection_config_defaults_disabled" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = arena.allocator(),
+    };
+    try std.testing.expectEqual(false, cfg.agent.reflect_after_turn);
+    try std.testing.expect(cfg.agent.reflect_model == null);
+}
+
+test "reflection_config_parse_agent_fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const json =
+        \\{"agent": {"reflect_after_turn": true, "reflect_model": "openrouter/reflection-model"}}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = arena.allocator(),
+    };
+    try cfg.parseJson(json);
+    // RED until parseJson wires the two reflection fields.
+    try std.testing.expectEqual(true, cfg.agent.reflect_after_turn);
+    try std.testing.expect(cfg.agent.reflect_model != null);
+    try std.testing.expectEqualStrings("openrouter/reflection-model", cfg.agent.reflect_model.?);
+}
+
+test "reflection_config_env_reflect_after_turn" {
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const key_z = try allocator.dupeZ(u8, "NULLCLAW_AGENT_REFLECT_AFTER_TURN");
+    const value_z = try allocator.dupeZ(u8, "true");
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, value_z.ptr, 1));
+    defer _ = c.unsetenv(key_z.ptr);
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    cfg.applyEnvOverrides();
+    // RED until applyEnvOverrides reads NULLCLAW_AGENT_REFLECT_AFTER_TURN.
+    try std.testing.expectEqual(true, cfg.agent.reflect_after_turn);
+}
+
+test "reflection_config_save_roundtrip_preserves_fields" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.agent.reflect_after_turn = true;
+    cfg.agent.reflect_model = "openrouter/reflection-model";
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+    // RED until save serializes the reflection fields (and parse reads them).
+    try std.testing.expectEqual(true, loaded.agent.reflect_after_turn);
+    try std.testing.expect(loaded.agent.reflect_model != null);
+    try std.testing.expectEqualStrings("openrouter/reflection-model", loaded.agent.reflect_model.?);
 }

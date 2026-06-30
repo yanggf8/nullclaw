@@ -313,6 +313,11 @@ pub const Agent = struct {
     max_history_messages: u32,
     auto_save: bool,
     compact_context: bool = true,
+    /// After-turn reflection pass (opt-in). See AgentConfig.reflect_after_turn.
+    reflect_after_turn: bool = false,
+    reflect_model: ?[]const u8 = null,
+    /// Per-session count of reflection lessons saved (cap guard).
+    reflection_lessons_saved: usize = 0,
     token_limit: u64 = 0,
     token_limit_override: ?u64 = null,
     max_tokens: u32 = max_tokens_resolver.DEFAULT_MODEL_MAX_TOKENS,
@@ -636,6 +641,8 @@ pub const Agent = struct {
             .max_history_messages = cfg.agent.max_history_messages,
             .auto_save = cfg.memory.auto_save,
             .compact_context = cfg.agent.compact_context,
+            .reflect_after_turn = cfg.agent.reflect_after_turn,
+            .reflect_model = cfg.agent.reflect_model,
             .token_limit = resolved_token_limit,
             .token_limit_override = token_limit_override,
             .max_tokens = resolved_max_tokens,
