@@ -877,6 +877,33 @@ Common issues:
 
 **Note**: The `markdown_only` memory profile automatically enables hybrid retrieval with temporal decay (half-life 30 days) for optimal relevance scoring. This ensures temporal awareness even with plain markdown files.
 
+#### OKF bundle ingest (markdown backend)
+
+The `markdown` backend also ingests an optional [Open Knowledge Format](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing) (OKF) bundle as **read-only** recallable context. Drop a directory of OKF concept files under the agent workspace:
+
+```
+<workspace>/okf/
+├── metrics/wau.md
+├── datasets/orders.md
+└── runbooks/oncall.md
+```
+
+Each `.md` file is one concept with YAML frontmatter:
+
+```markdown
+---
+type: note
+title: Weekly Active Users
+timestamp: 1700000000
+---
+WAU is computed over a rolling 7-day window.
+```
+
+- The directory is walked recursively (nested folders supported, depth ≤ 8; symlinks are not followed).
+- `type` is the only required field; `title`, `description`, and `timestamp` are recognized. `tags`/`resource` and any other keys are ignored. The frontmatter opener must be a line that is exactly `---`.
+- `type` maps to the memory category (`core`/`daily`/`conversation`, otherwise a custom category); `title` becomes the entry key (falling back to the file path); the body (or `description` if the body is empty) becomes the content; `timestamp` falls back to the file mtime.
+- The bundle is **never written to** — nullclaw consumes OKF concepts but only writes its own `MEMORY.md` / daily logs. Files missing a `type`, with no frontmatter, or larger than 1 MiB are skipped silently.
+
 ### `gateway`
 
 Recommended defaults:
