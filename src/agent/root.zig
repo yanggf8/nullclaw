@@ -52,6 +52,8 @@ const ToolExecutionResult = dispatcher.ToolExecutionResult;
 /// Maximum agentic tool-use iterations per user message.
 const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 25;
 const MAX_MID_TURN_INJECTION_FOLLOWUPS: u32 = 8;
+const MAX_REFLECTION_TOOL_TRACE: usize = 32;
+const MAX_REFLECTION_TOOL_BRIEF_BYTES: usize = 120;
 
 /// Maximum non-system messages before trimming.
 const DEFAULT_MAX_HISTORY: u32 = 50;
@@ -319,6 +321,11 @@ pub const Agent = struct {
     reflect_model: ?[]const u8 = null,
     /// Per-session count of reflection lessons saved (cap guard).
     reflection_lessons_saved: usize = 0,
+    /// Per-turn bounded trace of tool outcomes, fed to the reflection pass.
+    turn_tool_trace: std.ArrayListUnmanaged(reflection.ToolSummary) = .empty,
+    turn_tool_failure_seen: bool = false,
+    /// Count of finishTurnReflection invocations (observability + tests).
+    reflection_turn_invocations: usize = 0,
     token_limit: u64 = 0,
     token_limit_override: ?u64 = null,
     max_tokens: u32 = max_tokens_resolver.DEFAULT_MODEL_MAX_TOKENS,
@@ -684,6 +691,7 @@ pub const Agent = struct {
         if (self.system_prompt_model_name) |model| self.allocator.free(model);
         if (self.last_route_trace) |trace| self.allocator.free(trace);
         if (self.last_recalled_top_key) |key| self.allocator.free(key);
+        self.resetTurnToolTrace();
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
         if (self.tts_provider_owned and self.tts_provider != null) self.allocator.free(self.tts_provider.?);
         if (self.pending_exec_command_owned and self.pending_exec_command != null) self.allocator.free(self.pending_exec_command.?);
@@ -1937,6 +1945,88 @@ pub const Agent = struct {
         return self.prioritizeToolSpecsForTurn(arena, try result.toOwnedSlice(arena), user_message);
     }
 
+    const TurnOutcome = enum { success, exhausted, degraded, @"error" };
+
+    fn resetTurnToolTrace(self: *Agent) void {
+        for (self.turn_tool_trace.items) |summary| {
+            self.allocator.free(summary.name);
+            self.allocator.free(summary.brief);
+        }
+        self.turn_tool_trace.deinit(self.allocator);
+        self.turn_tool_trace = .empty;
+        self.turn_tool_failure_seen = false;
+    }
+
+    fn captureTurnToolSummary(self: *Agent, name: []const u8, ok: bool, output: []const u8) void {
+        if (!ok) self.turn_tool_failure_seen = true;
+        if (self.turn_tool_trace.items.len >= MAX_REFLECTION_TOOL_TRACE) return;
+
+        const brief_src = output[0..@min(output.len, MAX_REFLECTION_TOOL_BRIEF_BYTES)];
+        const name_owned = self.allocator.dupe(u8, name) catch return;
+        const brief_owned = self.allocator.dupe(u8, brief_src) catch {
+            self.allocator.free(name_owned);
+            return;
+        };
+
+        self.turn_tool_trace.append(self.allocator, .{
+            .name = name_owned,
+            .ok = ok,
+            .brief = brief_owned,
+        }) catch {
+            self.allocator.free(name_owned);
+            self.allocator.free(brief_owned);
+        };
+    }
+
+    fn lastTurnUserGoalFromHistory(self: *const Agent) ?[]const u8 {
+        var i = self.history.items.len;
+        while (i > 0) {
+            i -= 1;
+            const msg = self.history.items[i];
+            if (msg.role != .user) continue;
+            if (std.mem.startsWith(u8, msg.content, "SYSTEM:")) continue;
+            return msg.content;
+        }
+        return null;
+    }
+
+    fn turnOutcomeFinalText(self: *const Agent, outcome: TurnOutcome) []const u8 {
+        var i = self.history.items.len;
+        while (i > 0) {
+            i -= 1;
+            const msg = self.history.items[i];
+            if (msg.role == .assistant) return msg.content;
+        }
+        return switch (outcome) {
+            .success => "success",
+            .exhausted => "exhausted",
+            .degraded => "degraded",
+            .@"error" => "error",
+        };
+    }
+
+    fn finishTurnReflection(self: *Agent, arena: std.mem.Allocator, outcome: TurnOutcome) void {
+        if (!self.reflect_after_turn) return;
+
+        self.reflection_turn_invocations += 1;
+
+        const has_learning_signal = self.turn_tool_failure_seen or
+            outcome == .exhausted or
+            self.last_recalled_top_key != null;
+        if (!has_learning_signal) return;
+
+        const user_goal = self.lastTurnUserGoalFromHistory() orelse "agent turn";
+        const ctx = reflection.ReflectionContext{
+            .user_goal = user_goal,
+            .tools = self.turn_tool_trace.items,
+            .final_text = self.turnOutcomeFinalText(outcome),
+            .iteration = self.turn_tool_trace.items.len,
+        };
+
+        const model = self.reflect_model orelse self.model_name;
+        _ = reflection.reflectOnTurn(arena, self.provider, model, ctx) catch return;
+    }
+
     fn traceTiming(self: *const Agent, stage: []const u8) void {
         if (!self.timing_trace) return;
         const start_ms = if (self.timing_trace_start_ms != 0) self.timing_trace_start_ms else std_compat.time.milliTimestamp();
@@ -1948,6 +2038,8 @@ pub const Agent = struct {
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
         self.traceTiming("entered");
+        self.resetTurnToolTrace();
+        defer self.resetTurnToolTrace();
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
 
@@ -2725,6 +2817,7 @@ pub const Agent = struct {
 
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
+                self.finishTurnReflection(arena, .success);
 
                 // Free provider response fields (content, tool_calls, model)
                 // All borrows have been duped into final_text and history at this point.
@@ -2862,6 +2955,7 @@ pub const Agent = struct {
                 } };
                 self.observer.recordEvent(&tool_event);
 
+                self.captureTurnToolSummary(call.name, result.success, result.output);
                 try results_buf.append(self.allocator, result);
             }
 
@@ -2907,6 +3001,7 @@ pub const Agent = struct {
             const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
+            self.finishTurnReflection(self.allocator, .degraded);
             return fallback;
         };
         defer self.allocator.free(summary_messages);
@@ -2945,6 +3040,7 @@ pub const Agent = struct {
             const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
+            self.finishTurnReflection(summary_arena.allocator(), .degraded);
             return fallback;
         };
         self.logLlmResponse(self.max_tool_iterations + 1, 1, &summary_response);
@@ -2991,6 +3087,7 @@ pub const Agent = struct {
 
         const complete_event = ObserverEvent{ .turn_complete = {} };
         self.observer.recordEvent(&complete_event);
+        self.finishTurnReflection(summary_arena.allocator(), .exhausted);
 
         return prefixed;
     }
@@ -10913,6 +11010,268 @@ fn redactionBaseConfig(allocator: std.mem.Allocator) Config {
         .default_model = "openrouter/test-model",
         .allocator = allocator,
     };
+}
+
+// ── reflection turn-integration (slice 3) tests ──────────────────────
+
+const ReflectionTurnProviderMode = enum {
+    final_only,
+    failed_tool_then_final,
+    loop_tool_then_summary,
+};
+
+const ReflectionTurnProvider = struct {
+    const Self = @This();
+
+    mode: ReflectionTurnProviderMode,
+    capture_alloc: std.mem.Allocator,
+    chat_calls: usize = 0,
+    reflection_calls: usize = 0,
+    captured_reflection_prompt: ?[]u8 = null,
+
+    fn deinitState(self: *Self) void {
+        if (self.captured_reflection_prompt) |prompt_text| self.capture_alloc.free(prompt_text);
+        self.captured_reflection_prompt = null;
+    }
+
+    fn provider(self: *Self) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn finalResponse(allocator: std.mem.Allocator, model: []const u8, text: []const u8) !providers.ChatResponse {
+        return .{
+            .content = try allocator.dupe(u8, text),
+            .tool_calls = &.{},
+            .usage = .{},
+            .model = try allocator.dupe(u8, model),
+        };
+    }
+
+    fn toolResponse(allocator: std.mem.Allocator, model: []const u8, tool_name: []const u8) !providers.ChatResponse {
+        const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+        tool_calls[0] = .{
+            .id = try allocator.dupe(u8, "reflection-turn-call-1"),
+            .name = try allocator.dupe(u8, tool_name),
+            .arguments = try allocator.dupe(u8, "{}"),
+        };
+        return .{
+            .content = try allocator.dupe(u8, "calling tool"),
+            .tool_calls = tool_calls,
+            .usage = .{},
+            .model = try allocator.dupe(u8, model),
+        };
+    }
+
+    fn chatWithSystem(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: ?[]const u8,
+        message: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.reflection_calls += 1;
+        if (self.captured_reflection_prompt) |old| self.capture_alloc.free(old);
+        self.captured_reflection_prompt = try self.capture_alloc.dupe(u8, message);
+        return allocator.dupe(u8,
+            \\{"worth_saving":true,"lesson":"Use the failed tool result to choose a safer next step.","failure_class":"logic"}
+        );
+    }
+
+    fn chat(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: providers.ChatRequest,
+        model: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.chat_calls += 1;
+
+        return switch (self.mode) {
+            .final_only => try finalResponse(allocator, model, "ok"),
+            .failed_tool_then_final => if (self.chat_calls == 1)
+                try toolResponse(allocator, model, "reflection_fail_probe")
+            else
+                try finalResponse(allocator, model, "done after failed tool"),
+            .loop_tool_then_summary => if (self.chat_calls == 1)
+                try toolResponse(allocator, model, "reflection_noop_probe")
+            else
+                try finalResponse(allocator, model, "summary after exhaustion"),
+        };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "reflection-turn-provider";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinitFn,
+    };
+};
+
+const ReflectionFailureTool = struct {
+    const Self = @This();
+    pub const tool_name = "reflection_fail_probe";
+    pub const tool_description = "Fails for reflection turn trace tests.";
+    pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+    pub const vtable = tools_mod.ToolVTable(Self);
+
+    fn tool(self: *Self) Tool {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+        return .{
+            .success = false,
+            .output = try allocator.dupe(u8, "forced reflection failure"),
+        };
+    }
+};
+
+const ReflectionNoopTool = struct {
+    const Self = @This();
+    pub const tool_name = "reflection_noop_probe";
+    pub const tool_description = "Succeeds while keeping the provider in the tool loop.";
+    pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+    pub const vtable = tools_mod.ToolVTable(Self);
+
+    fn tool(self: *Self) Tool {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+        return .{
+            .success = true,
+            .output = try allocator.dupe(u8, "ok"),
+        };
+    }
+};
+
+fn reflectionTurnConfig(allocator: std.mem.Allocator, reflect_after_turn: bool, max_tool_iterations: u32) Config {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_provider = "openrouter",
+        .default_model = "test-model",
+        .allocator = allocator,
+    };
+    cfg.memory.backend = "none";
+    cfg.memory.auto_save = false;
+    cfg.agent.enable_pii_redaction = false;
+    cfg.agent.reflect_after_turn = reflect_after_turn;
+    cfg.agent.max_tool_iterations = max_tool_iterations;
+    return cfg;
+}
+
+test "reflection_turn_helper_called_signature_compiles" {
+    const allocator = std.testing.allocator;
+    var provider_state = ReflectionTurnProvider{ .mode = .final_only, .capture_alloc = allocator };
+    defer provider_state.deinitState();
+
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var cfg = reflectionTurnConfig(allocator, true, 4);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, mem, noop.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("ok", response);
+    // RED: finishTurnReflection is a stub and does not record invocations yet.
+    try std.testing.expect(agent.reflection_turn_invocations > 0);
+}
+
+test "reflection_turn_trace_records_failed_tool" {
+    const allocator = std.testing.allocator;
+    var provider_state = ReflectionTurnProvider{ .mode = .failed_tool_then_final, .capture_alloc = allocator };
+    defer provider_state.deinitState();
+
+    var failure_tool = ReflectionFailureTool{};
+    const tool_list = [_]Tool{failure_tool.tool()};
+
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var cfg = reflectionTurnConfig(allocator, true, 4);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), tool_list[0..], mem, noop.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("run the failing probe");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("done after failed tool", response);
+    // RED: finishTurnReflection is a stub, so the captured trace is not handed to reflection.
+    try std.testing.expect(provider_state.captured_reflection_prompt != null);
+    const prompt_text = provider_state.captured_reflection_prompt.?;
+    try std.testing.expect(std.mem.indexOf(u8, prompt_text, "reflection_fail_probe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt_text, "fail") != null);
+}
+
+test "reflection_turn_disabled_no_effect" {
+    const allocator = std.testing.allocator;
+    var provider_state = ReflectionTurnProvider{ .mode = .final_only, .capture_alloc = allocator };
+    defer provider_state.deinitState();
+
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var cfg = reflectionTurnConfig(allocator, false, 4);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, mem, noop.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("ok", response);
+    try std.testing.expectEqual(@as(usize, 0), agent.reflection_lessons_saved);
+    try std.testing.expectEqual(@as(usize, 0), agent.reflection_turn_invocations);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.reflection_calls);
+}
+
+test "reflection_turn_covers_all_exits" {
+    const allocator = std.testing.allocator;
+    var provider_state = ReflectionTurnProvider{ .mode = .loop_tool_then_summary, .capture_alloc = allocator };
+    defer provider_state.deinitState();
+
+    var noop_tool = ReflectionNoopTool{};
+    const tool_list = [_]Tool{noop_tool.tool()};
+
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var cfg = reflectionTurnConfig(allocator, true, 1);
+    var observer = RecordingObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), tool_list[0..], mem, observer.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("force the exhausted summary path");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("[Tool iteration limit: 1/1]\n\nsummary after exhaustion", response);
+    try std.testing.expectEqual(@as(usize, 1), observer.turn_complete_count);
+    // RED: finishTurnReflection is a stub and does not record the exhausted exit yet.
+    try std.testing.expect(agent.reflection_turn_invocations > 0);
 }
 
 fn redactionFromConfigAllocationTest(allocator: std.mem.Allocator) !void {
