@@ -8042,6 +8042,9 @@ test "reflection_config_parse_agent_fields" {
 }
 
 test "reflection_config_env_reflect_after_turn" {
+    // setenv/unsetenv are POSIX-only; Windows has no cimport member for them.
+    // Matches the guard on the other env-override tests (see config.zig HOME test).
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const c = @cImport({
         @cInclude("stdlib.h");
     });
