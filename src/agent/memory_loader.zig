@@ -66,6 +66,40 @@ fn isArchiveConversationCandidate(cand: memory_mod.RetrievalCandidate) bool {
     return false;
 }
 
+fn isLessonKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "lesson:");
+}
+
+fn isLessonEntry(entry: MemoryEntry) bool {
+    if (isLessonKey(entry.key)) return true;
+    if (extractMarkdownMemoryKey(entry.content)) |extracted| {
+        return isLessonKey(extracted);
+    }
+    return false;
+}
+
+fn isLessonCandidate(cand: memory_mod.RetrievalCandidate) bool {
+    if (isLessonKey(cand.key)) return true;
+    if (extractMarkdownMemoryKey(cand.snippet)) |extracted| {
+        return isLessonKey(extracted);
+    }
+    return false;
+}
+
+const Tier = enum { normal, lesson, archive };
+
+fn entryTier(entry: MemoryEntry) Tier {
+    if (isArchiveConversationEntry(entry)) return .archive;
+    if (isLessonEntry(entry)) return .lesson;
+    return .normal;
+}
+
+fn candidateTier(cand: memory_mod.RetrievalCandidate) Tier {
+    if (isArchiveConversationCandidate(cand)) return .archive;
+    if (isLessonCandidate(cand)) return .lesson;
+    return .normal;
+}
+
 fn sanitizeMemoryText(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
     // Strip inline image markers from recalled snippets so stale
     // [IMAGE:...] references do not accidentally trigger multimodal mode.
@@ -103,12 +137,12 @@ pub fn loadContext(
     var appended: usize = 0;
     var wrote_header = false;
 
-    // Prefer scoped high-signal entries first. Archived conversation chunks are
-    // still allowed, but only after non-archived matches from the same scope.
-    for ([_]bool{ false, true }) |include_archived| {
+    // Prefer scoped high-signal entries first. Lessons follow normal entries;
+    // archived conversation chunks come last within the same scope.
+    for ([_]Tier{ .normal, .lesson, .archive }) |tier| {
         for (scoped_entries) |entry| {
             if (isInternalMemoryEntry(entry)) continue;
-            if (isArchiveConversationEntry(entry) != include_archived) continue;
+            if (entryTier(entry) != tier) continue;
             if (!wrote_header) {
                 try w.writeAll("[Memory context]\n");
                 wrote_header = true;
@@ -191,13 +225,13 @@ pub fn loadContextWithRuntime(
     var appended: usize = 0;
     var wrote_header = false;
 
-    for ([_]bool{ false, true }) |include_archived| {
+    for ([_]Tier{ .normal, .lesson, .archive }) |tier| {
         for (scoped_candidates) |cand| {
             if (isInternalMemoryKey(cand.key)) continue;
             if (extractMarkdownMemoryKey(cand.snippet)) |extracted| {
                 if (isInternalMemoryKey(extracted)) continue;
             }
-            if (isArchiveConversationCandidate(cand) != include_archived) continue;
+            if (candidateTier(cand) != tier) continue;
             if (!wrote_header) {
                 try w.writeAll("[Memory context]\n");
                 wrote_header = true;
@@ -214,7 +248,7 @@ pub fn loadContextWithRuntime(
                 for (entries) |entry| {
                     if (containsCandidateKey(scoped_candidates, entry.key)) continue;
                     if (isInternalMemoryEntry(entry)) continue;
-                    if (isArchiveConversationEntry(entry) != include_archived) continue;
+                    if (entryTier(entry) != tier) continue;
                     if (!wrote_header) {
                         try w.writeAll("[Memory context]\n");
                         wrote_header = true;
@@ -716,6 +750,296 @@ test "enrichMessageWithSensorium with all-zero data returns copy of message" {
     defer allocator.free(enriched);
 
     try std.testing.expectEqualStrings("unchanged", enriched);
+}
+
+const OrderedMemory = struct {
+    entries: []const Entry,
+
+    const Entry = struct {
+        key: []const u8,
+        content: []const u8,
+        category: memory_mod.MemoryCategory,
+        session_id: ?[]const u8 = "sess-a",
+    };
+
+    fn memory(self: *OrderedMemory) Memory {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = Memory.VTable{
+        .name = name,
+        .store = store,
+        .recall = recall,
+        .get = get,
+        .list = list,
+        .forget = forget,
+        .count = count,
+        .healthCheck = healthCheck,
+        .deinit = deinit,
+    };
+
+    fn selfFrom(ptr: *anyopaque) *OrderedMemory {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn name(ptr: *anyopaque) []const u8 {
+        _ = ptr;
+        return "ordered-test";
+    }
+
+    fn store(ptr: *anyopaque, key: []const u8, content: []const u8, category: memory_mod.MemoryCategory, session_id: ?[]const u8) anyerror!void {
+        _ = ptr;
+        _ = key;
+        _ = content;
+        _ = category;
+        _ = session_id;
+        return error.NotSupported;
+    }
+
+    fn recall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]MemoryEntry {
+        _ = query;
+        return selfFrom(ptr).copyEntries(allocator, limit, null, session_id);
+    }
+
+    fn get(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry {
+        const self = selfFrom(ptr);
+        for (self.entries) |entry| {
+            if (std.mem.eql(u8, entry.key, key)) {
+                return try dupeEntry(allocator, entry);
+            }
+        }
+        return null;
+    }
+
+    fn list(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?memory_mod.MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
+        const self = selfFrom(ptr);
+        return self.copyEntries(allocator, self.entries.len, category, session_id);
+    }
+
+    fn forget(ptr: *anyopaque, key: []const u8) anyerror!bool {
+        _ = ptr;
+        _ = key;
+        return false;
+    }
+
+    fn count(ptr: *anyopaque) anyerror!usize {
+        return selfFrom(ptr).entries.len;
+    }
+
+    fn healthCheck(ptr: *anyopaque) bool {
+        _ = ptr;
+        return true;
+    }
+
+    fn deinit(ptr: *anyopaque) void {
+        _ = ptr;
+    }
+
+    fn copyEntries(
+        self: *OrderedMemory,
+        allocator: std.mem.Allocator,
+        limit: usize,
+        category_filter: ?memory_mod.MemoryCategory,
+        session_id: ?[]const u8,
+    ) ![]MemoryEntry {
+        var out_len: usize = 0;
+        for (self.entries) |entry| {
+            if (out_len >= limit) break;
+            if (category_filter) |filter| {
+                if (!memory_mod.MemoryCategory.eql(entry.category, filter)) continue;
+            }
+            if (!sessionMatches(entry.session_id, session_id)) continue;
+            out_len += 1;
+        }
+
+        var result = try allocator.alloc(MemoryEntry, out_len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |*entry| entry.deinit(allocator);
+            allocator.free(result);
+        }
+
+        for (self.entries) |entry| {
+            if (initialized >= out_len) break;
+            if (category_filter) |filter| {
+                if (!memory_mod.MemoryCategory.eql(entry.category, filter)) continue;
+            }
+            if (!sessionMatches(entry.session_id, session_id)) continue;
+            result[initialized] = try dupeEntry(allocator, entry);
+            initialized += 1;
+        }
+
+        return result;
+    }
+
+    fn sessionMatches(entry_session_id: ?[]const u8, requested_session_id: ?[]const u8) bool {
+        if (requested_session_id) |requested| {
+            return entry_session_id != null and std.mem.eql(u8, entry_session_id.?, requested);
+        }
+        return entry_session_id == null;
+    }
+
+    fn dupeEntry(allocator: std.mem.Allocator, entry: Entry) !MemoryEntry {
+        const id = try allocator.dupe(u8, entry.key);
+        errdefer allocator.free(id);
+
+        const key = try allocator.dupe(u8, entry.key);
+        errdefer allocator.free(key);
+
+        const content = try allocator.dupe(u8, entry.content);
+        errdefer allocator.free(content);
+
+        const timestamp = try allocator.dupe(u8, "1970-01-01T00:00:00Z");
+        errdefer allocator.free(timestamp);
+
+        const category: memory_mod.MemoryCategory = switch (entry.category) {
+            .custom => |name_value| .{ .custom = try allocator.dupe(u8, name_value) },
+            else => entry.category,
+        };
+        errdefer switch (category) {
+            .custom => |name_value| allocator.free(name_value),
+            else => {},
+        };
+
+        const session_id = if (entry.session_id) |sid| try allocator.dupe(u8, sid) else null;
+        errdefer if (session_id) |sid| allocator.free(sid);
+
+        return .{
+            .id = id,
+            .key = key,
+            .content = content,
+            .category = category,
+            .timestamp = timestamp,
+            .session_id = session_id,
+        };
+    }
+};
+
+test "reflection_recall_load_context_orders_core_then_lessons_then_archive" {
+    const allocator = std.testing.allocator;
+
+    const ordered_entries = [_]OrderedMemory.Entry{
+        .{
+            .key = "archive:conversation:x:chunk:0",
+            .content = "needle archive",
+            .category = .{ .custom = "archive" },
+        },
+        .{
+            .key = "lesson:abc",
+            .content = "needle lesson",
+            .category = .{ .custom = "lesson" },
+        },
+        .{
+            .key = "core_fact",
+            .content = "needle core",
+            .category = .core,
+        },
+    };
+    var ordered_mem = OrderedMemory{ .entries = &ordered_entries };
+    const mem = ordered_mem.memory();
+
+    const context = try loadContext(allocator, mem, "needle", "sess-a");
+    defer allocator.free(context);
+
+    const core_pos = std.mem.indexOf(u8, context, "core_fact") orelse return error.TestUnexpectedResult;
+    const lesson_pos = std.mem.indexOf(u8, context, "lesson:abc") orelse return error.TestUnexpectedResult;
+    const archive_pos = std.mem.indexOf(u8, context, "archive:conversation:") orelse return error.TestUnexpectedResult;
+
+    // RED: the current two-pass archive-only walk keeps lessons in hostile recall order with normal entries.
+    try std.testing.expect(core_pos < lesson_pos);
+    try std.testing.expect(lesson_pos < archive_pos);
+}
+
+test "reflection_recall_load_context_with_runtime_orders_core_then_lessons" {
+    const allocator = std.testing.allocator;
+
+    const ordered_entries = [_]OrderedMemory.Entry{
+        .{
+            .key = "archive:conversation:x:chunk:0",
+            .content = "needle archive",
+            .category = .{ .custom = "archive" },
+        },
+        .{
+            .key = "lesson:abc",
+            .content = "needle lesson",
+            .category = .{ .custom = "lesson" },
+        },
+        .{
+            .key = "core_fact",
+            .content = "needle core",
+            .category = .core,
+        },
+    };
+    var ordered_mem = OrderedMemory{ .entries = &ordered_entries };
+    const mem = ordered_mem.memory();
+
+    const resolved = memory_mod.ResolvedConfig{
+        .primary_backend = "test",
+        .retrieval_mode = "keyword",
+        .vector_mode = "none",
+        .embedding_provider = "none",
+        .rollout_mode = "off",
+        .vector_sync_mode = "best_effort",
+        .hygiene_enabled = false,
+        .snapshot_enabled = false,
+        .cache_enabled = false,
+        .semantic_cache_enabled = false,
+        .summarizer_enabled = false,
+        .source_count = 0,
+        .fallback_policy = "degrade",
+    };
+    var rt = memory_mod.MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = resolved,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+    };
+
+    const context = try loadContextWithRuntime(allocator, &rt, "needle", "sess-a");
+    defer allocator.free(context);
+
+    const core_pos = std.mem.indexOf(u8, context, "core_fact") orelse return error.TestUnexpectedResult;
+    const lesson_pos = std.mem.indexOf(u8, context, "lesson:abc") orelse return error.TestUnexpectedResult;
+    const archive_pos = std.mem.indexOf(u8, context, "archive:conversation:") orelse return error.TestUnexpectedResult;
+
+    // RED: runtime candidates still use the current two-pass archive-only ordering.
+    try std.testing.expect(core_pos < lesson_pos);
+    try std.testing.expect(lesson_pos < archive_pos);
+}
+
+test "reflection_recall_lesson_entries_are_not_internal_filtered" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expect(isLessonKey("lesson:abc"));
+    try std.testing.expect(!isInternalMemoryKey("lesson:abc"));
+    try std.testing.expect(!memory_mod.isInternalMemoryEntryKeyOrContent("lesson:abc", "needle lesson"));
+
+    const ordered_entries = [_]OrderedMemory.Entry{
+        .{
+            .key = "lesson:abc",
+            .content = "needle lesson",
+            .category = .{ .custom = "lesson" },
+        },
+    };
+    var ordered_mem = OrderedMemory{ .entries = &ordered_entries };
+    const mem = ordered_mem.memory();
+
+    const context = try loadContext(allocator, mem, "needle", "sess-a");
+    defer allocator.free(context);
+
+    // RED condition for later implementation: lesson tiering must not become lesson filtering.
+    try std.testing.expect(std.mem.indexOf(u8, context, "lesson:abc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "needle lesson") != null);
 }
 
 test "loadContext skips globally preserved archive conversation entries" {
