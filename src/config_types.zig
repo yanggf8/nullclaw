@@ -381,6 +381,13 @@ pub const AgentConfig = struct {
     compact_context: bool = true,
     max_tool_iterations: u32 = 1000,
     max_history_messages: u32 = 100,
+    /// When true, run an after-turn reflection pass that may save a reusable
+    /// "lesson" to memory and adjust success attribution. Opt-in (off by
+    /// default; adds one small LLM call per learning-signal turn).
+    reflect_after_turn: bool = false,
+    /// Optional cheaper model (same provider) used for the reflection verdict;
+    /// falls back to the turn model when null.
+    reflect_model: ?[]const u8 = null,
     parallel_tools: bool = false,
     tool_dispatcher: []const u8 = "auto",
     token_limit: u64 = DEFAULT_AGENT_TOKEN_LIMIT,
