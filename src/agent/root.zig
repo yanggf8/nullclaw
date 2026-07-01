@@ -36,6 +36,7 @@ const cost_mod = @import("../cost.zig");
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
 pub const compaction = @import("compaction.zig");
+pub const reflection = @import("reflection.zig");
 pub const context_tokens = @import("context_tokens.zig");
 pub const max_tokens_resolver = @import("max_tokens.zig");
 pub const prompt = @import("prompt.zig");
@@ -4225,6 +4226,7 @@ test "memory_loader module reexport" {
 test {
     _ = dispatcher;
     _ = compaction;
+    _ = reflection;
     _ = cli;
     _ = prompt;
     _ = memory_loader;
