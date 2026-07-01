@@ -531,22 +531,6 @@ pub const Config = struct {
 
     pub fn parseJson(self: *Config, content: []const u8) !void {
         try config_parse.parseJson(self, content);
-        try self.parseAgentReflectionFields(content);
-    }
-
-    fn parseAgentReflectionFields(self: *Config, content: []const u8) !void {
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
-        defer parsed.deinit();
-        const root = parsed.value;
-        if (root != .object) return;
-        const ag = root.object.get("agent") orelse return;
-        if (ag != .object) return;
-        if (ag.object.get("reflect_after_turn")) |v| {
-            if (v == .bool) self.agent.reflect_after_turn = v.bool;
-        }
-        if (ag.object.get("reflect_model")) |v| {
-            if (v == .string) self.agent.reflect_model = try self.allocator.dupe(u8, v.string);
-        }
     }
 
     fn writeChannelFieldSeparator(w: *std.Io.Writer, wrote_any: bool) !void {
