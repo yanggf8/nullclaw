@@ -14,6 +14,8 @@ pub const ReflectionResult = struct {
     worth_saving: bool,
     lesson: []const u8,
     failure_class: FailureClass,
+    goal_achieved: bool = true,
+    continue_reason: []const u8 = "",
 };
 
 pub const ToolSummary = struct {
@@ -64,11 +66,30 @@ pub fn parseReflectionResult(arena: std.mem.Allocator, json_bytes: []const u8) ?
 
     const failure_class = std.meta.stringToEnum(FailureClass, fc_raw) orelse return null;
 
+    var goal_achieved: bool = true;
+    if (obj.get("goal_achieved")) |goal_v| {
+        goal_achieved = switch (goal_v) {
+            .bool => |b| b,
+            else => return null,
+        };
+    }
+
+    var continue_reason_raw: []const u8 = "";
+    if (obj.get("continue_reason")) |reason_v| {
+        continue_reason_raw = switch (reason_v) {
+            .string => |s| if (s.len > MAX_LESSON_BYTES) s[0..MAX_LESSON_BYTES] else s,
+            else => return null,
+        };
+    }
+
     const lesson = arena.dupe(u8, lesson_raw) catch return null;
+    const continue_reason = arena.dupe(u8, continue_reason_raw) catch return null;
     return ReflectionResult{
         .worth_saving = worth_saving,
         .lesson = lesson,
         .failure_class = failure_class,
+        .goal_achieved = goal_achieved,
+        .continue_reason = continue_reason,
     };
 }
 
@@ -95,6 +116,14 @@ pub fn lessonPassesQualityGate(lesson: []const u8) bool {
 }
 
 pub fn buildReflectionPrompt(arena: std.mem.Allocator, ctx: ReflectionContext) ![]const u8 {
+    return buildReflectionPromptForJudge(arena, ctx, false);
+}
+
+pub fn buildReflectionPromptForJudge(
+    arena: std.mem.Allocator,
+    ctx: ReflectionContext,
+    want_completion_judge: bool,
+) ![]const u8 {
     var list: std.ArrayListUnmanaged(u8) = .empty;
     errdefer list.deinit(arena);
 
@@ -121,6 +150,10 @@ pub fn buildReflectionPrompt(arena: std.mem.Allocator, ctx: ReflectionContext) !
     }
     try list.appendSlice(arena, "\n\nReply ONLY with this exact JSON shape (no extra text):\n");
     try list.appendSlice(arena, "{\"worth_saving\": <true|false>, \"lesson\": \"<brief lesson>\", \"failure_class\": \"none|policy|transient|logic|user_input\"}\n");
+    if (want_completion_judge) {
+        try list.appendSlice(arena, "Also judge whether the final answer fully achieves the user's stated goal.\n");
+        try list.appendSlice(arena, "Include \"goal_achieved\" (boolean) and \"continue_reason\" (string, only meaningful when goal_achieved is false) in your JSON response.\n");
+    }
 
     const final_slice = if (list.items.len > MAX_PROMPT_BYTES) list.items[0..MAX_PROMPT_BYTES] else list.items;
     const owned = try arena.dupe(u8, final_slice);
@@ -247,6 +280,78 @@ test "reflection_module_malformed_json_returns_null" {
     try std.testing.expect(parseReflectionResult(arena.allocator(), "{not-json") == null);
 }
 
+test "parseReflectionResult goal_achieved absent defaults true" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result_opt = parseReflectionResult(arena.allocator(), valid_verdict);
+    try std.testing.expect(result_opt != null);
+
+    try std.testing.expect(result_opt.?.goal_achieved);
+}
+
+test "parseReflectionResult goal_achieved false is honored" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result_opt = parseReflectionResult(arena.allocator(),
+        \\{"worth_saving":true,"lesson":"Prefer bounded retries for transient provider failures.","failure_class":"logic","goal_achieved":false}
+    );
+    try std.testing.expect(result_opt != null);
+
+    try std.testing.expect(!result_opt.?.goal_achieved);
+}
+
+test "parseReflectionResult goal_achieved wrong type is malformed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result_opt = parseReflectionResult(arena.allocator(),
+        \\{"worth_saving":true,"lesson":"Prefer bounded retries for transient provider failures.","failure_class":"logic","goal_achieved":"yes"}
+    );
+
+    // Regression: completion-judge fields must reject wrong JSON types instead of defaulting.
+    try std.testing.expect(result_opt == null);
+}
+
+test "parseReflectionResult continue_reason absent defaults empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result_opt = parseReflectionResult(arena.allocator(), valid_verdict);
+    try std.testing.expect(result_opt != null);
+
+    try std.testing.expectEqual(@as(usize, 0), result_opt.?.continue_reason.len);
+}
+
+test "parseReflectionResult continue_reason present is carried" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const json = try arena.allocator().dupe(u8,
+        \\{"worth_saving":true,"lesson":"Prefer bounded retries for transient provider failures.","failure_class":"logic","continue_reason":"need more info"}
+    );
+
+    const result_opt = parseReflectionResult(arena.allocator(), json);
+    try std.testing.expect(result_opt != null);
+
+    const result = result_opt.?;
+    @memset(json, 'x');
+    try std.testing.expectEqualStrings("need more info", result.continue_reason);
+}
+
+test "parseReflectionResult continue_reason wrong type is malformed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result_opt = parseReflectionResult(arena.allocator(),
+        \\{"worth_saving":true,"lesson":"Prefer bounded retries for transient provider failures.","failure_class":"logic","continue_reason":123}
+    );
+
+    // Regression: completion-judge fields must reject wrong JSON types instead of defaulting.
+    try std.testing.expect(result_opt == null);
+}
+
 test "reflection_module_caps_and_sanitizes_lesson" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -296,6 +401,44 @@ test "reflection_module_build_prompt_is_compact" {
     // RED: buildReflectionPrompt is a stub and returns an empty string.
     try std.testing.expect(std.mem.indexOf(u8, prompt, ctx.user_goal) != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "shell") != null);
+}
+
+test "buildReflectionPromptForJudge without completion judge matches existing prompt" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tool_summaries = [_]ToolSummary{
+        .{ .name = "shell", .ok = true, .brief = "listed files" },
+    };
+    const ctx = ReflectionContext{
+        .user_goal = "finish the task",
+        .tools = tool_summaries[0..],
+        .final_text = "done",
+        .iteration = 1,
+    };
+
+    const existing = try buildReflectionPrompt(arena.allocator(), ctx);
+    const judge_off = try buildReflectionPromptForJudge(arena.allocator(), ctx, false);
+
+    try std.testing.expectEqualStrings(existing, judge_off);
+}
+
+test "buildReflectionPromptForJudge with completion judge asks for goal_achieved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const ctx = ReflectionContext{
+        .user_goal = "finish the task",
+        .tools = &.{},
+        .final_text = "done",
+        .iteration = 1,
+    };
+
+    const prompt = try buildReflectionPromptForJudge(arena.allocator(), ctx, true);
+
+    // Regression: completion-judge prompts must request both required verdict fields.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "goal_achieved") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "continue_reason") != null);
 }
 
 test "reflection_module_reflect_on_turn_parses_via_mock" {
