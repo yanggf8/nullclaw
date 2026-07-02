@@ -2005,6 +2005,32 @@ pub const Agent = struct {
         };
     }
 
+    fn applyReflectionVerdict(self: *Agent, arena: std.mem.Allocator, verdict: ?reflection.ReflectionResult, outcome: TurnOutcome) void {
+        if (verdict) |v| {
+            if (v.worth_saving) {
+                const sanitized = reflection.sanitizeLesson(arena, v.lesson) catch null;
+                if (sanitized) |sanitize| {
+                    if (reflection.lessonPassesQualityGate(sanitize) and
+                        self.reflection_lessons_saved < reflection.MAX_LESSONS_PER_SESSION and
+                        self.mem != null)
+                    {
+                        const key = std.fmt.allocPrint(arena, "lesson:{x}", .{std.hash.Wyhash.hash(0, sanitize)}) catch null;
+                        if (key) |lesson_key| {
+                            if (self.mem.?.store(lesson_key, sanitize, .{ .custom = reflection.LESSON_CATEGORY }, self.memory_session_id)) |_| {
+                                self.reflection_lessons_saved += 1;
+                            } else |_| {}
+                        }
+                    }
+                }
+            }
+        }
+
+        if (outcome == .success and self.last_recalled_top_key != null and self.mem_rt != null) {
+            const is_logic_fail = if (verdict) |v| v.failure_class == .logic else true;
+            if (!is_logic_fail) self.mem_rt.?.recordSuccess(self.last_recalled_top_key.?);
+        }
+    }
+
     fn finishTurnReflection(self: *Agent, arena: std.mem.Allocator, outcome: TurnOutcome) void {
         if (!self.reflect_after_turn) return;
 
@@ -2026,29 +2052,7 @@ pub const Agent = struct {
         const model = self.reflect_model orelse self.model_name;
         const verdict: ?reflection.ReflectionResult = reflection.reflectOnTurn(arena, self.provider, model, ctx) catch null;
 
-        if (verdict) |v| {
-            if (v.worth_saving) {
-                const sanitized = reflection.sanitizeLesson(arena, v.lesson) catch null;
-                if (sanitized) |sanitize| {
-                    if (reflection.lessonPassesQualityGate(sanitize) and
-                        self.reflection_lessons_saved < reflection.MAX_LESSONS_PER_SESSION and
-                        self.mem != null)
-                    {
-                        const key = std.fmt.allocPrint(arena, "lesson:{x}", .{std.hash.Wyhash.hash(0, sanitize)}) catch null;
-                        if (key) |lesson_key| {
-                            if (self.mem.?.store(lesson_key, sanitize, .{ .custom = reflection.LESSON_CATEGORY }, self.memory_session_id)) |_| {
-                                self.reflection_lessons_saved += 1;
-                            } else |_| {}
-                        }
-                    }
-                }
-            }
-        }
-
-        if (outcome == .success and self.last_recalled_top_key != null and self.mem_rt != null) {
-            const is_logic_fail = if (verdict) |v| v.failure_class == .logic else false;
-            if (!is_logic_fail) self.mem_rt.?.recordSuccess(self.last_recalled_top_key.?);
-        }
+        self.applyReflectionVerdict(arena, verdict, outcome);
     }
 
     fn traceTiming(self: *const Agent, stage: []const u8) void {
@@ -11725,7 +11729,7 @@ test "reflection_learning_logic_failure_withholds_success_credit" {
     try std.testing.expectEqual(@as(usize, 1), recorder.count);
 }
 
-test "reflection_learning_null_verdict_preserves_success_credit" {
+test "reflection_learning_null_verdict_withholds_success_credit" {
     const allocator = std.testing.allocator;
     var provider_state = ReflectionLearningProvider{ .fail_reflection = true };
     var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
@@ -11743,9 +11747,109 @@ test "reflection_learning_null_verdict_preserves_success_credit" {
 
     reflectionLearningFinish(allocator, &agent, .success);
 
-    // RED: null verdict is non-fatal but the stub still never performs deferred attribution.
+    try std.testing.expectEqual(@as(usize, 0), recorder.count);
+    try std.testing.expect(recorder.last_key == null);
+}
+
+test "reflection_turn_invocations_increments_per_gated_call" {
+    const allocator = std.testing.allocator;
+    var provider_state = ReflectionLearningProvider{};
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var agent = try reflectionLearningMakeAgent(allocator, provider_state.provider(), mem);
+    defer agent.deinit();
+    agent.turn_tool_failure_seen = true;
+
+    reflectionLearningFinish(allocator, &agent, .success);
+    reflectionLearningFinish(allocator, &agent, .success);
+    try std.testing.expectEqual(@as(usize, 2), agent.reflection_turn_invocations);
+
+    var disabled_agent = try reflectionLearningMakeAgent(allocator, provider_state.provider(), mem);
+    defer disabled_agent.deinit();
+    disabled_agent.reflect_after_turn = false;
+    disabled_agent.turn_tool_failure_seen = true;
+    reflectionLearningFinish(allocator, &disabled_agent, .success);
+    try std.testing.expectEqual(@as(usize, 0), disabled_agent.reflection_turn_invocations);
+}
+
+test "reflection_turn_invocations_increments_without_learning_signal" {
+    const allocator = std.testing.allocator;
+    var provider_state = ReflectionLearningProvider{};
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var agent = try reflectionLearningMakeAgent(allocator, provider_state.provider(), mem);
+    defer agent.deinit();
+    agent.turn_tool_failure_seen = false;
+    agent.last_recalled_top_key = null;
+
+    reflectionLearningFinish(allocator, &agent, .success);
+    try std.testing.expectEqual(@as(usize, 1), agent.reflection_turn_invocations);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.reflection_calls);
+}
+
+test "apply_reflection_verdict_null_verdict_is_no_op" {
+    const allocator = std.testing.allocator;
+    var store = ReflectionLearningStore.init(allocator);
+    defer store.deinit();
+
+    var recorder = ReflectionLearningSuccessRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+    var rt = reflectionLearningRuntime(allocator, store.memory(), &recorder);
+
+    var provider_state = ReflectionLearningProvider{};
+    var agent = try reflectionLearningMakeAgent(allocator, provider_state.provider(), store.memory());
+    defer agent.deinit();
+    agent.mem_rt = &rt;
+    try reflectionLearningSetLastRecalledKey(&agent, "memory:direct-null");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    agent.applyReflectionVerdict(arena.allocator(), null, .success);
+
+    try std.testing.expectEqual(@as(usize, 0), store.store_calls);
+    try std.testing.expectEqual(@as(usize, 0), agent.reflection_lessons_saved);
+    try std.testing.expectEqual(@as(usize, 0), recorder.count);
+    try std.testing.expect(recorder.last_key == null);
+}
+
+test "apply_reflection_verdict_stores_lesson_and_credits_success" {
+    const allocator = std.testing.allocator;
+    var store = ReflectionLearningStore.init(allocator);
+    defer store.deinit();
+
+    var recorder = ReflectionLearningSuccessRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+    var rt = reflectionLearningRuntime(allocator, store.memory(), &recorder);
+
+    var provider_state = ReflectionLearningProvider{};
+    var agent = try reflectionLearningMakeAgent(allocator, provider_state.provider(), store.memory());
+    defer agent.deinit();
+    agent.mem_rt = &rt;
+    try reflectionLearningSetLastRecalledKey(&agent, "memory:direct-verdict");
+
+    const verdict = reflection.ReflectionResult{
+        .worth_saving = true,
+        .lesson = "Prefer the narrower recovery path after a tool failure.",
+        .failure_class = .none,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    agent.applyReflectionVerdict(arena.allocator(), verdict, .success);
+
+    try std.testing.expectEqual(@as(usize, 1), store.store_calls);
+    try std.testing.expect(std.mem.startsWith(u8, store.keys[0].?, "lesson:"));
+    switch (store.categories[0].?) {
+        .custom => |name| try std.testing.expectEqualStrings(reflection.LESSON_CATEGORY, name),
+        else => return error.TestExpectedCustomLessonCategory,
+    }
+    try std.testing.expectEqual(@as(usize, 1), agent.reflection_lessons_saved);
     try std.testing.expectEqual(@as(usize, 1), recorder.count);
-    try std.testing.expectEqualStrings("memory:null-verdict", recorder.last_key.?);
+    try std.testing.expectEqualStrings("memory:direct-verdict", recorder.last_key.?);
 }
 
 test "reflection_learning_no_recalled_key_does_not_credit" {
