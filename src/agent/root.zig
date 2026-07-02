@@ -2062,6 +2062,108 @@ pub const Agent = struct {
         self.applyReflectionVerdict(arena, verdict, outcome);
     }
 
+    fn isStreamingTurn(self: *const Agent) bool {
+        return self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
+    }
+
+    fn judgeEnabledForCandidate(self: *const Agent, is_streaming: bool) bool {
+        return self.judge_after_turn and !is_streaming;
+    }
+
+    fn canJudgeContinueCandidate(self: *const Agent, iteration: u32, loop_limit: u32) bool {
+        return self.judge_continue_count < self.max_judge_continuations and
+            iteration + 1 < loop_limit;
+    }
+
+    fn buildReflectionContextForCandidate(self: *const Agent, candidate_text: []const u8) reflection.ReflectionContext {
+        const user_goal = self.lastTurnUserGoalFromHistory() orelse "agent turn";
+        return .{
+            .user_goal = user_goal,
+            .tools = self.turn_tool_trace.items,
+            .final_text = candidate_text,
+            .iteration = self.turn_tool_trace.items.len,
+        };
+    }
+
+    fn reflectOnTurnForJudge(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        ctx: reflection.ReflectionContext,
+        want_completion_judge: bool,
+    ) ?reflection.ReflectionResult {
+        self.reflection_turn_invocations += 1;
+
+        const reflection_prompt = reflection.buildReflectionPromptForJudge(arena, ctx, want_completion_judge) catch return null;
+        const model = self.reflect_model orelse self.model_name;
+        const response = self.provider.chatWithSystem(arena, null, reflection_prompt, model, 0.0) catch return null;
+        const capped_len = @min(response.len, reflection.MAX_RESPONSE_BYTES);
+        const capped = response[0..capped_len];
+        return reflection.parseReflectionResult(arena, capped);
+    }
+
+    fn candidateMadeProgressForJudge(self: *Agent, candidate_text: []const u8) bool {
+        const candidate_hash = std.hash.Wyhash.hash(0, candidate_text);
+        const tool_trace_len = self.turn_tool_trace.items.len;
+        if (candidate_hash == self.last_judged_candidate_hash and
+            tool_trace_len == self.last_judged_tool_trace_len)
+        {
+            return false;
+        }
+        self.last_judged_candidate_hash = candidate_hash;
+        self.last_judged_tool_trace_len = tool_trace_len;
+        return true;
+    }
+
+    fn appendJudgeContinuationMessages(
+        self: *Agent,
+        candidate_history_text: []const u8,
+        continue_reason: []const u8,
+    ) !void {
+        try self.appendOwnedHistoryMessage(.{
+            .role = .assistant,
+            .content = try self.dupeForHistory(candidate_history_text),
+        });
+
+        const base_msg =
+            "SYSTEM: The previous assistant candidate did not fully satisfy the user's goal. Continue this same turn now. Address what remains, using tools if needed. Do not repeat the same final answer.";
+        const system_msg = if (continue_reason.len > 0)
+            try std.fmt.allocPrint(self.allocator, "{s} Judge reason: {s}", .{ base_msg, continue_reason })
+        else
+            try self.allocator.dupe(u8, base_msg);
+        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = system_msg });
+        self.trimHistory();
+    }
+
+    fn applyReflectionVerdictWithLogicOverride(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        verdict: ?reflection.ReflectionResult,
+        outcome: TurnOutcome,
+        force_logic_failure: bool,
+    ) void {
+        if (!force_logic_failure) {
+            self.applyReflectionVerdict(arena, verdict, outcome);
+            return;
+        }
+
+        if (verdict) |v| {
+            var overridden = v;
+            overridden.failure_class = .logic;
+            overridden.goal_achieved = false;
+            self.applyReflectionVerdict(arena, overridden, outcome);
+            return;
+        }
+
+        const synthetic = reflection.ReflectionResult{
+            .worth_saving = false,
+            .lesson = "",
+            .failure_class = .logic,
+            .goal_achieved = false,
+            .continue_reason = "",
+        };
+        self.applyReflectionVerdict(arena, synthetic, outcome);
+    }
+
     fn traceTiming(self: *const Agent, stage: []const u8) void {
         if (!self.timing_trace) return;
         const start_ms = if (self.timing_trace_start_ms != 0) self.timing_trace_start_ms else std_compat.time.milliTimestamp();
@@ -2320,8 +2422,11 @@ pub const Agent = struct {
         self.last_system_prompt_bytes = sys_bytes;
         self.last_history_bytes = hist_bytes;
 
+        const turn_is_streaming = self.isStreamingTurn();
+        const judge_cache_bypass = self.judge_after_turn and !turn_is_streaming;
+
         // ── Response cache check ──
-        const response_cache_allowed = self.responseCacheSafeForTurn(safe_user_message);
+        const response_cache_allowed = !judge_cache_bypass and self.responseCacheSafeForTurn(safe_user_message);
         if (response_cache_allowed) {
             if (self.response_cache) |rc| {
                 var key_buf: [16]u8 = undefined;
@@ -2357,6 +2462,7 @@ pub const Agent = struct {
         var injection_followups: u32 = 0;
         var forced_follow_through_count: u32 = 0;
         var empty_response_retry_count: u32 = 0;
+        var last_judge_incomplete = false;
         var seen_tool_call_results: std.AutoHashMapUnmanaged(u64, CachedToolCallResult) = .empty;
         defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
         while (iteration < self.max_tool_iterations +| injection_followups) : (iteration += 1) {
@@ -2374,7 +2480,7 @@ pub const Agent = struct {
             const arena = iter_arena.allocator();
 
             const timer_start = std_compat.time.milliTimestamp();
-            const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
+            const is_streaming = turn_is_streaming;
             const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
             const include_reasoning = self.reasoning_mode != .off;
 
@@ -2797,14 +2903,52 @@ pub const Agent = struct {
                 }
 
                 // No tool calls — final response
-                const base_text = if (self.context_was_compacted) blk: {
-                    self.context_was_compacted = false;
-                    break :blk try std.fmt.allocPrint(self.allocator, "[Context compacted]\n\n{s}", .{display_text});
-                } else try self.allocator.dupe(u8, display_text);
+                const candidate_context_was_compacted = self.context_was_compacted;
+                const base_text = if (candidate_context_was_compacted)
+                    try std.fmt.allocPrint(self.allocator, "[Context compacted]\n\n{s}", .{display_text})
+                else
+                    try self.allocator.dupe(u8, display_text);
                 errdefer self.allocator.free(base_text);
 
                 const final_text = try self.composeFinalReply(base_text, response.reasoning_content, response.usage);
                 errdefer self.allocator.free(final_text);
+
+                const loop_limit = self.max_tool_iterations;
+                const judge_continue_eligible = self.canJudgeContinueCandidate(iteration, loop_limit);
+                const judge_enabled = self.judgeEnabledForCandidate(is_streaming);
+                const should_reflect_for_judge = judge_enabled and
+                    (self.judge_continue_count == 0 or judge_continue_eligible);
+
+                var judge_verdict_for_finalize: ?reflection.ReflectionResult = null;
+                var judge_force_logic_failure = false;
+
+                if (should_reflect_for_judge) {
+                    const ctx = self.buildReflectionContextForCandidate(final_text);
+                    judge_verdict_for_finalize = self.reflectOnTurnForJudge(arena, ctx, true);
+                    if (judge_verdict_for_finalize) |verdict| {
+                        if (!verdict.goal_achieved) {
+                            if (judge_continue_eligible) {
+                                if (self.candidateMadeProgressForJudge(final_text)) {
+                                    try self.appendJudgeContinuationMessages(display_text, verdict.continue_reason);
+                                    self.context_was_compacted = candidate_context_was_compacted;
+                                    self.allocator.free(final_text);
+                                    self.allocator.free(base_text);
+                                    self.freeResponseFields(&response);
+                                    self.judge_continue_count += 1;
+                                    last_judge_incomplete = true;
+                                    continue;
+                                }
+                                judge_force_logic_failure = true;
+                            } else {
+                                judge_force_logic_failure = true;
+                            }
+                        }
+                    }
+                } else if (judge_enabled and last_judge_incomplete) {
+                    judge_force_logic_failure = true;
+                }
+
+                self.context_was_compacted = false;
 
                 // Dupe from display_text directly (not from final_text) to avoid double-dupe
                 try self.history.append(self.allocator, .{
@@ -2855,7 +2999,11 @@ pub const Agent = struct {
 
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
-                self.finishTurnReflection(arena, .success);
+                if (judge_enabled and (should_reflect_for_judge or last_judge_incomplete)) {
+                    self.applyReflectionVerdictWithLogicOverride(arena, judge_verdict_for_finalize, .success, judge_force_logic_failure);
+                } else {
+                    self.finishTurnReflection(arena, .success);
+                }
 
                 // Free provider response fields (content, tool_calls, model)
                 // All borrows have been duped into final_text and history at this point.
@@ -11917,6 +12065,534 @@ test "reflection_learning_no_recalled_key_does_not_credit" {
     reflectionLearningFinish(allocator, &agent, .success);
 
     try std.testing.expectEqual(@as(usize, 1), recorder.count);
+}
+
+// ── judge-gated continuation loop (P4 RED) tests ─────────────────────
+
+const judge_verdict_achieved =
+    \\{"worth_saving":false,"lesson":"","failure_class":"none","goal_achieved":true}
+;
+
+const judge_verdict_incomplete =
+    \\{"worth_saving":false,"lesson":"","failure_class":"none","goal_achieved":false,"continue_reason":"needs more detail"}
+;
+
+const JudgeLoopProvider = struct {
+    const Self = @This();
+
+    capture_alloc: std.mem.Allocator,
+    chat_calls: usize = 0,
+    reflection_calls: usize = 0,
+    chat_responses: []const []const u8 = &.{ "candidate-1", "candidate-2", "candidate-3" },
+    reflection_responses: []const []const u8 = &.{},
+    captured_reflection_prompt: ?[]u8 = null,
+    capture_chat_messages_on_call: usize = 2,
+    captured_chat_message_count: usize = 0,
+    captured_chat_messages: [32]CapturedChatMessage = [_]CapturedChatMessage{.{}} ** 32,
+    agent_hook: ?*Agent = null,
+    set_context_compacted_on_chat_call: ?usize = null,
+    supports_streaming_flag: bool = false,
+
+    const CapturedChatMessage = struct {
+        role: providers.Role = .user,
+        content: ?[]u8 = null,
+    };
+
+    fn deinitState(self: *Self) void {
+        if (self.captured_reflection_prompt) |prompt_text| self.capture_alloc.free(prompt_text);
+        self.captured_reflection_prompt = null;
+        for (&self.captured_chat_messages) |*entry| {
+            if (entry.content) |owned| self.capture_alloc.free(owned);
+            entry.* = .{};
+        }
+        self.captured_chat_message_count = 0;
+    }
+
+    fn provider(self: *Self) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn chatResponseText(self: *const Self) []const u8 {
+        const idx = if (self.chat_calls == 0) 0 else self.chat_calls - 1;
+        if (idx < self.chat_responses.len) return self.chat_responses[idx];
+        return self.chat_responses[self.chat_responses.len - 1];
+    }
+
+    fn reflectionResponseText(self: *const Self) []const u8 {
+        const idx = if (self.reflection_calls == 0) 0 else self.reflection_calls - 1;
+        if (self.reflection_responses.len > 0 and idx < self.reflection_responses.len) {
+            return self.reflection_responses[idx];
+        }
+        return judge_verdict_achieved;
+    }
+
+    fn captureRequestMessages(self: *Self, request: providers.ChatRequest) !void {
+        for (&self.captured_chat_messages) |*entry| {
+            if (entry.content) |owned| self.capture_alloc.free(owned);
+            entry.* = .{};
+        }
+        self.captured_chat_message_count = @min(request.messages.len, self.captured_chat_messages.len);
+        var i: usize = 0;
+        while (i < self.captured_chat_message_count) : (i += 1) {
+            const msg = request.messages[i];
+            self.captured_chat_messages[i].role = msg.role;
+            self.captured_chat_messages[i].content = try self.capture_alloc.dupe(u8, msg.content);
+        }
+    }
+
+    fn chatWithSystem(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: ?[]const u8,
+        message: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.reflection_calls += 1;
+        if (self.captured_reflection_prompt) |old| self.capture_alloc.free(old);
+        self.captured_reflection_prompt = try self.capture_alloc.dupe(u8, message);
+        return allocator.dupe(u8, self.reflectionResponseText());
+    }
+
+    fn chat(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: providers.ChatRequest,
+        model: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.chat_calls += 1;
+        if (self.set_context_compacted_on_chat_call) |call_idx| {
+            if (self.chat_calls == call_idx) {
+                if (self.agent_hook) |agent| agent.context_was_compacted = true;
+            }
+        }
+        if (self.chat_calls == self.capture_chat_messages_on_call) {
+            try self.captureRequestMessages(request);
+        }
+        const text = self.chatResponseText();
+        return .{
+            .content = try allocator.dupe(u8, text),
+            .tool_calls = &.{},
+            .usage = .{},
+            .model = try allocator.dupe(u8, model),
+        };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn supportsStreaming(ptr: *anyopaque) bool {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.supports_streaming_flag;
+    }
+
+    fn streamChat(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: providers.ChatRequest,
+        model: []const u8,
+        _: f64,
+        callback: providers.StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!providers.StreamChatResult {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.chat_calls += 1;
+        if (self.chat_calls == self.capture_chat_messages_on_call) {
+            try self.captureRequestMessages(request);
+        }
+        const text = self.chatResponseText();
+        callback(callback_ctx, providers.StreamChunk.textDelta(text));
+        callback(callback_ctx, providers.StreamChunk.finalChunk());
+        return .{
+            .content = try allocator.dupe(u8, text),
+            .usage = .{},
+            .model = try allocator.dupe(u8, model),
+        };
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "judge-loop-provider";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinitFn,
+        .supports_streaming = supportsStreaming,
+        .stream_chat = streamChat,
+    };
+};
+
+fn judgeLoopConfig(
+    allocator: std.mem.Allocator,
+    judge_after_turn: bool,
+    max_tool_iterations: u32,
+    max_judge_continuations: u8,
+) Config {
+    var cfg = reflectionTurnConfig(allocator, false, max_tool_iterations);
+    cfg.agent.judge_after_turn = judge_after_turn;
+    cfg.agent.max_judge_continuations = max_judge_continuations;
+    return cfg;
+}
+
+test "judge_disabled_preserves_direct_final_behavior" {
+    const allocator = std.testing.allocator;
+    var provider_state = JudgeLoopProvider{ .capture_alloc = allocator };
+    defer provider_state.deinitState();
+
+    var response_cache = try cache.ResponseCache.init(":memory:", 60, 1000);
+    defer response_cache.deinit();
+
+    var cfg = judgeLoopConfig(allocator, false, 4, 1);
+    var observer = RecordingObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, null, observer.observer(), null);
+    agent.response_cache = &response_cache;
+    defer agent.deinit();
+
+    const first = try agent.turn("hello");
+    defer allocator.free(first);
+    try std.testing.expectEqualStrings("candidate-1", first);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.reflection_calls);
+    try std.testing.expectEqual(@as(usize, 1), observer.turn_complete_count);
+
+    agent.clearHistory();
+    const second = try agent.turn("hello");
+    defer allocator.free(second);
+    try std.testing.expectEqualStrings("candidate-1", second);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+}
+
+test "judge_finalize_uses_single_reflection_call" {
+    const allocator = std.testing.allocator;
+    var provider_state = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .reflection_responses = &.{judge_verdict_achieved},
+    };
+    defer provider_state.deinitState();
+
+    var cfg = judgeLoopConfig(allocator, true, 4, 1);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, null, noop.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("finish this turn");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("candidate-1", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.reflection_calls);
+    try std.testing.expect(provider_state.captured_reflection_prompt != null);
+    try std.testing.expect(std.mem.indexOf(u8, provider_state.captured_reflection_prompt.?, "goal_achieved") != null);
+}
+
+test "judge_continue_once_then_finalize" {
+    const allocator = std.testing.allocator;
+    var provider_state = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .reflection_responses = &.{ judge_verdict_incomplete, judge_verdict_achieved },
+    };
+    defer provider_state.deinitState();
+
+    var cfg = judgeLoopConfig(allocator, true, 4, 2);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, null, noop.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("continue once");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("candidate-2", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.chat_calls);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.reflection_calls);
+}
+
+test "judge_max_continuations_caps_followup" {
+    const allocator = std.testing.allocator;
+    var provider_state = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .reflection_responses = &.{judge_verdict_incomplete},
+    };
+    defer provider_state.deinitState();
+
+    var cfg = judgeLoopConfig(allocator, true, 4, 1);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, null, noop.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("cap continuations");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("candidate-2", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.chat_calls);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.reflection_calls);
+    try std.testing.expectEqual(@as(u8, 1), agent.judge_continue_count);
+}
+
+test "judge_no_progress_finalizes_incomplete" {
+    const allocator = std.testing.allocator;
+    const same_candidate = "same-final-answer";
+    var provider_state = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .chat_responses = &.{ same_candidate, same_candidate },
+        .reflection_responses = &.{ judge_verdict_incomplete, judge_verdict_incomplete },
+    };
+    defer provider_state.deinitState();
+
+    var cfg = judgeLoopConfig(allocator, true, 4, 2);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, null, noop.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("no progress");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings(same_candidate, response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.chat_calls);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.reflection_calls);
+    try std.testing.expectEqual(@as(u8, 1), agent.judge_continue_count);
+}
+
+test "judge_iteration_budget_guard_does_not_extend_loop" {
+    const allocator = std.testing.allocator;
+    var provider_state = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .reflection_responses = &.{judge_verdict_incomplete},
+    };
+    defer provider_state.deinitState();
+
+    var cfg = judgeLoopConfig(allocator, true, 1, 2);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, null, noop.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("iteration budget");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("candidate-1", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.reflection_calls);
+}
+
+test "judge_skips_response_cache_hit_and_store" {
+    const allocator = std.testing.allocator;
+    var provider_state = JudgeLoopProvider{ .capture_alloc = allocator };
+    defer provider_state.deinitState();
+
+    var response_cache = try cache.ResponseCache.init(":memory:", 60, 1000);
+    defer response_cache.deinit();
+
+    var cfg = judgeLoopConfig(allocator, true, 4, 1);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, null, noop.observer(), null);
+    agent.response_cache = &response_cache;
+    defer agent.deinit();
+
+    const first = try agent.turn("cache probe");
+    defer allocator.free(first);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+
+    agent.clearHistory();
+    const second = try agent.turn("cache probe");
+    defer allocator.free(second);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.chat_calls);
+}
+
+test "judge_streaming_turns_not_judged" {
+    const allocator = std.testing.allocator;
+    var provider_state = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .supports_streaming_flag = true,
+        .chat_responses = &.{"streamed-final"},
+    };
+    defer provider_state.deinitState();
+
+    var cfg = judgeLoopConfig(allocator, true, 4, 1);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, null, noop.observer(), null);
+    defer agent.deinit();
+
+    const StreamCollector = struct {
+        chunks: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn callback(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!chunk.is_final and chunk.delta.len > 0) {
+                self.chunks.appendSlice(std.testing.allocator, chunk.delta) catch unreachable;
+            }
+        }
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            self.chunks.deinit(alloc);
+        }
+    };
+
+    var collector = StreamCollector{};
+    defer collector.deinit(allocator);
+    agent.stream_callback = StreamCollector.callback;
+    agent.stream_ctx = @ptrCast(&collector);
+
+    const response = try agent.turn("stream without judge");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("streamed-final", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.reflection_calls);
+}
+
+test "judge_continued_candidate_has_no_final_side_effects" {
+    const allocator = std.testing.allocator;
+    var provider_state = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .reflection_responses = &.{ judge_verdict_incomplete, judge_verdict_achieved },
+    };
+    defer provider_state.deinitState();
+
+    var response_cache = try cache.ResponseCache.init(":memory:", 60, 1000);
+    defer response_cache.deinit();
+
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+    const autosave_before = mem.count() catch 0;
+
+    var cfg = judgeLoopConfig(allocator, true, 4, 2);
+    cfg.memory.auto_save = true;
+    var observer = RecordingObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, mem, observer.observer(), null);
+    agent.response_cache = &response_cache;
+    defer agent.deinit();
+
+    const response = try agent.turn("side effects");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("candidate-2", response);
+    try std.testing.expectEqual(@as(usize, 1), observer.turn_complete_count);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.chat_calls);
+    const autosave_after = mem.count() catch 0;
+    try std.testing.expect(autosave_after > autosave_before);
+}
+
+test "judge_continued_candidate_history_shape" {
+    const allocator = std.testing.allocator;
+    var provider_state = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .reflection_responses = &.{ judge_verdict_incomplete, judge_verdict_achieved },
+        .capture_chat_messages_on_call = 2,
+    };
+    defer provider_state.deinitState();
+
+    var cfg = judgeLoopConfig(allocator, true, 4, 2);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, null, noop.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("history shape");
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 2), provider_state.chat_calls);
+    try std.testing.expect(provider_state.captured_chat_message_count > 0);
+
+    var saw_candidate = false;
+    var saw_system_continuation = false;
+    var i: usize = 0;
+    while (i < provider_state.captured_chat_message_count) : (i += 1) {
+        const msg = provider_state.captured_chat_messages[i];
+        if (msg.content) |content| {
+            if (std.mem.eql(u8, content, "candidate-1")) saw_candidate = true;
+            if (msg.role == .user and std.mem.startsWith(u8, content, "SYSTEM: The previous assistant candidate did not fully satisfy")) {
+                saw_system_continuation = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_candidate);
+    try std.testing.expect(saw_system_continuation);
+}
+
+test "judge_reflection_turn_invocations_counts_single_judge_call" {
+    const allocator = std.testing.allocator;
+    var provider_state = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .reflection_responses = &.{judge_verdict_achieved},
+    };
+    defer provider_state.deinitState();
+
+    var cfg = judgeLoopConfig(allocator, true, 4, 1);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, null, noop.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("invocation count");
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 1), provider_state.reflection_calls);
+    try std.testing.expectEqual(@as(usize, 1), agent.reflection_turn_invocations);
+}
+
+test "judge_context_compacted_marker_survives_continuation" {
+    const allocator = std.testing.allocator;
+    var provider_state = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .reflection_responses = &.{ judge_verdict_incomplete, judge_verdict_achieved },
+        .set_context_compacted_on_chat_call = 1,
+    };
+    defer provider_state.deinitState();
+
+    var cfg = judgeLoopConfig(allocator, true, 4, 2);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, null, noop.observer(), null);
+    provider_state.agent_hook = &agent;
+    defer agent.deinit();
+
+    const response = try agent.turn("compacted marker");
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 2), provider_state.chat_calls);
+    try std.testing.expect(std.mem.startsWith(u8, response, "[Context compacted]\n\n"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, response, "[Context compacted]"));
+}
+
+test "judge_incomplete_withholds_success_attribution" {
+    const allocator = std.testing.allocator;
+    const benign_incomplete =
+        \\{"worth_saving":false,"lesson":"","failure_class":"none","goal_achieved":false,"continue_reason":"still incomplete"}
+    ;
+    var provider_state = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .reflection_responses = &.{benign_incomplete},
+    };
+    defer provider_state.deinitState();
+
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var recorder = ReflectionLearningSuccessRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+    var rt = reflectionLearningRuntime(allocator, mem, &recorder);
+
+    var cfg = judgeLoopConfig(allocator, true, 1, 0);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, mem, noop.observer(), null);
+    agent.mem_rt = &rt;
+    defer agent.deinit();
+    try reflectionLearningSetLastRecalledKey(&agent, "memory:judge-incomplete");
+
+    const response = try agent.turn("withhold success");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("candidate-1", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.reflection_calls);
+    try std.testing.expectEqual(@as(usize, 0), recorder.count);
+    try std.testing.expect(recorder.last_key == null);
 }
 
 fn redactionFromConfigAllocationTest(allocator: std.mem.Allocator) !void {
