@@ -1761,6 +1761,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("reflect_model")) |v| {
                 if (v == .string) self.agent.reflect_model = try self.allocator.dupe(u8, v.string);
             }
+            if (ag.object.get("judge_after_turn")) |v| {
+                if (v == .bool) self.agent.judge_after_turn = v.bool;
+            }
+            if (ag.object.get("max_judge_continuations")) |v| {
+                if (v == .integer) self.agent.max_judge_continuations = @intCast(v.integer);
+            }
             if (ag.object.get("session_idle_timeout_secs")) |v| {
                 if (v == .integer) self.agent.session_idle_timeout_secs = @intCast(v.integer);
             }

@@ -961,6 +961,18 @@ pub const Config = struct {
             defer self.allocator.free(val);
             self.agent.reflect_after_turn = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
         } else |_| {}
+
+        // Agent judge_after_turn
+        if (std_compat.process.getEnvVarOwned(self.allocator, "NULLCLAW_AGENT_JUDGE_AFTER_TURN")) |val| {
+            defer self.allocator.free(val);
+            self.agent.judge_after_turn = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+        } else |_| {}
+
+        // Agent max_judge_continuations
+        if (std_compat.process.getEnvVarOwned(self.allocator, "NULLCLAW_AGENT_MAX_JUDGE_CONTINUATIONS")) |val| {
+            defer self.allocator.free(val);
+            self.agent.max_judge_continuations = std.fmt.parseInt(u8, val, 10) catch self.agent.max_judge_continuations;
+        } else |_| {}
     }
 
     /// Save config as JSON to the config_path.
@@ -1336,6 +1348,8 @@ pub const Config = struct {
             .max_history_messages = self.agent.max_history_messages,
             .reflect_after_turn = self.agent.reflect_after_turn,
             .reflect_model = self.agent.reflect_model,
+            .judge_after_turn = self.agent.judge_after_turn,
+            .max_judge_continuations = self.agent.max_judge_continuations,
             .parallel_tools = self.agent.parallel_tools,
             .tool_dispatcher = self.agent.tool_dispatcher,
             .session_idle_timeout_secs = self.agent.session_idle_timeout_secs,
@@ -8021,6 +8035,8 @@ test "reflection_config_defaults_disabled" {
     };
     try std.testing.expectEqual(false, cfg.agent.reflect_after_turn);
     try std.testing.expect(cfg.agent.reflect_model == null);
+    try std.testing.expectEqual(false, cfg.agent.judge_after_turn);
+    try std.testing.expectEqual(@as(u8, 1), cfg.agent.max_judge_continuations);
 }
 
 test "reflection_config_parse_agent_fields" {
@@ -8039,6 +8055,38 @@ test "reflection_config_parse_agent_fields" {
     try std.testing.expectEqual(true, cfg.agent.reflect_after_turn);
     try std.testing.expect(cfg.agent.reflect_model != null);
     try std.testing.expectEqualStrings("openrouter/reflection-model", cfg.agent.reflect_model.?);
+}
+
+test "judge_config_parse_agent_fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const json =
+        \\{"agent": {"judge_after_turn": true, "max_judge_continuations": 3}}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = arena.allocator(),
+    };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(true, cfg.agent.judge_after_turn);
+    try std.testing.expectEqual(@as(u8, 3), cfg.agent.max_judge_continuations);
+}
+
+test "judge_config_defaults_disabled" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const json =
+        \\{"agent": {"reflect_after_turn": true}}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = arena.allocator(),
+    };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(false, cfg.agent.judge_after_turn);
+    try std.testing.expectEqual(@as(u8, 1), cfg.agent.max_judge_continuations);
 }
 
 test "reflection_config_env_reflect_after_turn" {
@@ -8065,6 +8113,34 @@ test "reflection_config_env_reflect_after_turn" {
     try std.testing.expectEqual(true, cfg.agent.reflect_after_turn);
 }
 
+test "judge_config_env_overrides" {
+    // setenv/unsetenv are POSIX-only; Windows has no cimport member for them.
+    // Matches the guard on the other env-override tests (see config.zig HOME test).
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const bool_key_z = try allocator.dupeZ(u8, "NULLCLAW_AGENT_JUDGE_AFTER_TURN");
+    const bool_value_z = try allocator.dupeZ(u8, "true");
+    const count_key_z = try allocator.dupeZ(u8, "NULLCLAW_AGENT_MAX_JUDGE_CONTINUATIONS");
+    const count_value_z = try allocator.dupeZ(u8, "4");
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(bool_key_z.ptr, bool_value_z.ptr, 1));
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(count_key_z.ptr, count_value_z.ptr, 1));
+    defer _ = c.unsetenv(bool_key_z.ptr);
+    defer _ = c.unsetenv(count_key_z.ptr);
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    cfg.applyEnvOverrides();
+    try std.testing.expectEqual(true, cfg.agent.judge_after_turn);
+    try std.testing.expectEqual(@as(u8, 4), cfg.agent.max_judge_continuations);
+}
+
 test "reflection_config_save_roundtrip_preserves_fields" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -8080,6 +8156,8 @@ test "reflection_config_save_roundtrip_preserves_fields" {
     };
     cfg.agent.reflect_after_turn = true;
     cfg.agent.reflect_model = "openrouter/reflection-model";
+    cfg.agent.judge_after_turn = true;
+    cfg.agent.max_judge_continuations = 3;
     try cfg.save();
 
     const file = try std_compat.fs.openFileAbsolute(config_path, .{});
@@ -8099,4 +8177,6 @@ test "reflection_config_save_roundtrip_preserves_fields" {
     try std.testing.expectEqual(true, loaded.agent.reflect_after_turn);
     try std.testing.expect(loaded.agent.reflect_model != null);
     try std.testing.expectEqualStrings("openrouter/reflection-model", loaded.agent.reflect_model.?);
+    try std.testing.expectEqual(true, loaded.agent.judge_after_turn);
+    try std.testing.expectEqual(@as(u8, 3), loaded.agent.max_judge_continuations);
 }

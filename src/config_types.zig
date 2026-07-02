@@ -388,6 +388,8 @@ pub const AgentConfig = struct {
     /// Optional cheaper model (same provider) used for the reflection verdict;
     /// falls back to the turn model when null.
     reflect_model: ?[]const u8 = null,
+    judge_after_turn: bool = false,
+    max_judge_continuations: u8 = 1,
     parallel_tools: bool = false,
     tool_dispatcher: []const u8 = "auto",
     token_limit: u64 = DEFAULT_AGENT_TOKEN_LIMIT,
