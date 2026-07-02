@@ -319,6 +319,11 @@ pub const Agent = struct {
     /// After-turn reflection pass (opt-in). See AgentConfig.reflect_after_turn.
     reflect_after_turn: bool = false,
     reflect_model: ?[]const u8 = null,
+    judge_after_turn: bool = false,
+    max_judge_continuations: u8 = 1,
+    judge_continue_count: u8 = 0,
+    last_judged_candidate_hash: u64 = 0,
+    last_judged_tool_trace_len: usize = 0,
     /// Per-session count of reflection lessons saved (cap guard).
     reflection_lessons_saved: usize = 0,
     /// Per-turn bounded trace of tool outcomes, fed to the reflection pass.
@@ -651,6 +656,8 @@ pub const Agent = struct {
             .compact_context = cfg.agent.compact_context,
             .reflect_after_turn = cfg.agent.reflect_after_turn,
             .reflect_model = cfg.agent.reflect_model,
+            .judge_after_turn = cfg.agent.judge_after_turn,
+            .max_judge_continuations = cfg.agent.max_judge_continuations,
             .token_limit = resolved_token_limit,
             .token_limit_override = token_limit_override,
             .max_tokens = resolved_max_tokens,
@@ -2069,6 +2076,9 @@ pub const Agent = struct {
         self.resetTurnToolTrace();
         defer self.resetTurnToolTrace();
         self.context_was_compacted = false;
+        self.judge_continue_count = 0;
+        self.last_judged_candidate_hash = 0;
+        self.last_judged_tool_trace_len = 0;
         commands.refreshSubagentToolContext(self);
 
         const turn_input = commands.planTurnInput(user_message);
@@ -11197,6 +11207,31 @@ fn reflectionTurnConfig(allocator: std.mem.Allocator, reflect_after_turn: bool, 
     cfg.agent.reflect_after_turn = reflect_after_turn;
     cfg.agent.max_tool_iterations = max_tool_iterations;
     return cfg;
+}
+
+test "judge_turn_state_resets_at_turn_start" {
+    const allocator = std.testing.allocator;
+    var provider_state = ReflectionTurnProvider{ .mode = .final_only, .capture_alloc = allocator };
+    defer provider_state.deinitState();
+
+    var cfg = reflectionTurnConfig(allocator, false, 4);
+    cfg.agent.judge_after_turn = true;
+    cfg.agent.max_judge_continuations = 2;
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, null, noop.observer(), null);
+    defer agent.deinit();
+
+    agent.judge_continue_count = 2;
+    agent.last_judged_candidate_hash = 0xfeed_beef;
+    agent.last_judged_tool_trace_len = 7;
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("ok", response);
+    try std.testing.expectEqual(@as(u8, 0), agent.judge_continue_count);
+    try std.testing.expectEqual(@as(u64, 0), agent.last_judged_candidate_hash);
+    try std.testing.expectEqual(@as(usize, 0), agent.last_judged_tool_trace_len);
 }
 
 test "reflection_turn_helper_called_signature_compiles" {
