@@ -56,6 +56,17 @@ pub const TagFilter = struct {
     state: State = .passthrough,
     buf: [max_buf_len]u8 = undefined,
     buf_len: u8 = 0,
+    // Bytes suppressed since entering .inside_tag / .skip_to_angle_close for the
+    // current tag. A real tool_call/tool_result/think body is at most a few KB
+    // (a function name + JSON args, or a short reasoning note). If a provider
+    // emits an open tag that is never actually closed -- a false-positive match
+    // on plain prose containing "<think>"/"<tool_call>", or a genuine control
+    // token the model forgot to close -- the filter would otherwise stay in
+    // .inside_tag and silently discard EVERY subsequent byte for the rest of
+    // the stream, which reads as massive text loss/corruption downstream.
+    // Bound the suppression window: past this many bytes, give up looking for
+    // a close tag and resume passthrough so the rest of the stream survives.
+    suppressed_len: usize = 0,
 
     const State = enum {
         passthrough,
@@ -64,6 +75,12 @@ pub const TagFilter = struct {
         inside_tag, // inside tag body, suppressing output
         maybe_close, // buffering after '<', checking if close tag matches
     };
+
+    // Generous upper bound on a legitimate suppressed tag body. Tool-call
+    // arguments and think blocks are normally well under this; a false-positive
+    // open match on ordinary prose would otherwise swallow the rest of the
+    // stream, so bail out and resume passthrough once this is exceeded.
+    const max_suppressed_len: usize = 8192;
 
     // Opening tag prefixes. After matching, skip until '>'.
     // Handles canonical XML tags plus provider-specific *_begin wrappers.
@@ -165,6 +182,7 @@ pub const TagFilter = struct {
                         matchesAnyPrefix(prefix[0 .. self.buf_len - 1], &open_prefixes))
                     {
                         self.buf_len = 0;
+                        self.suppressed_len = 0;
                         if (b == '>') {
                             self.state = .inside_tag;
                         } else {
@@ -186,25 +204,45 @@ pub const TagFilter = struct {
                 },
                 .skip_to_angle_close => {
                     clean_start = i + 1;
+                    self.suppressed_len += 1;
                     if (b == '>') {
                         self.state = .inside_tag;
+                    } else if (self.suppressed_len > max_suppressed_len) {
+                        // Attribute section never closed — not a real tag. Bail
+                        // out to passthrough so the rest of the stream survives.
+                        self.state = .passthrough;
                     }
                 },
                 .inside_tag => {
                     clean_start = i + 1;
+                    self.suppressed_len += 1;
                     if (b == '<') {
                         self.buf[0] = b;
                         self.buf_len = 1;
                         self.state = .maybe_close;
+                    } else if (self.suppressed_len > max_suppressed_len) {
+                        // No close tag found within a plausible tool_call/think
+                        // body length — treat the open tag as a false positive
+                        // and resume passthrough instead of swallowing forever.
+                        self.state = .passthrough;
                     }
                 },
                 .maybe_close => {
                     clean_start = i + 1;
+                    self.suppressed_len += 1;
                     self.buf[self.buf_len] = b;
                     self.buf_len += 1;
                     const prefix = self.buf[0..self.buf_len];
                     if (matchesAny(prefix, &close_tags)) |_| {
                         // Complete close tag matched — back to passthrough.
+                        self.buf_len = 0;
+                        self.state = .passthrough;
+                        clean_start = i + 1;
+                        continue;
+                    }
+                    if (self.suppressed_len > max_suppressed_len) {
+                        // No close tag found within a plausible body length —
+                        // treat the open tag as a false positive.
                         self.buf_len = 0;
                         self.state = .passthrough;
                         clean_start = i + 1;
@@ -536,6 +574,32 @@ test "TagFilter incomplete open tag at end flushes on final" {
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("end<tool_c", col.joined(&buf));
     try std.testing.expect(col.got_final);
+}
+
+// Regression: a provider (e.g. MiniMax-M3) whose raw output contains an open
+// tag like "<think>" or "<tool_call>" that is NEVER followed by its matching
+// close tag -- either a false-positive match on ordinary prose, or a genuine
+// control token the model failed to close -- used to leave the filter stuck
+// in .inside_tag for the rest of the stream, silently discarding every byte
+// after the open tag. On a long article-length generation this reads as
+// massive, seemingly-random text loss. The filter must give up looking for a
+// close tag past a generous byte budget and resume passthrough so the rest
+// of the real content survives.
+test "TagFilter unterminated open tag past budget resumes passthrough" {
+    var col = collectChunks(64){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("before<think>");
+    // Well past max_suppressed_len (8192) with no close tag anywhere.
+    var filler: [9000]u8 = undefined;
+    @memset(&filler, 'x');
+    s.emitChunk(&filler);
+    s.emitChunk("after the giveup point, this must not be swallowed");
+    s.emitFinal();
+    var buf: [10240]u8 = undefined;
+    const out = col.joined(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "before") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "after the giveup point, this must not be swallowed") != null);
 }
 
 test "TagFilter strips pipe-delimited tool_call control block" {
