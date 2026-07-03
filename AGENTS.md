@@ -591,6 +591,7 @@ Both validators return typed errors (`UnsafeSkillName`, `UnsafeSkillArgs`) that 
 
 - Do not add C dependencies or large Zig packages without strong justification (binary size impact).
 - Do not return vtable interfaces pointing to temporaries — dangling pointer.
+- Do not store caller-provided slices verbatim in a bus message that outlives the caller. `bus.InboundMessage`/`OutboundMessage` OWN every string field (including `channel`) — `makeInbound*`/`makeOutbound*` `allocator.dupe()` each one and `deinit` frees it. Producers on the cron/gateway path build messages from a short-lived per-job arena, so a borrowed slice would dangle once the arena is freed before the outbound dispatcher (separate thread) consumes it. Pass a durable allocator (e.g. `state.allocator`, not the per-job `arena`) to `deliverResult`.
 - Do not use `std.io.getStdOut()` — it does not exist in Zig 0.16.
 - Do not silently weaken security policy or access constraints.
 - Do not add speculative config/feature flags "just in case".

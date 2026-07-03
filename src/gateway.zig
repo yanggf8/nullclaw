@@ -4529,7 +4529,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_skill");
                         if (state.event_bus) |eb| {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' resolution failed: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
-                            if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
+                            if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
                         continue;
                     };
@@ -4558,7 +4558,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_skill");
                         if (state.event_bus) |eb| {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' failed to start: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
-                            if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
+                            if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
                         continue;
                     };
@@ -4583,7 +4583,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_skill");
                         if (state.event_bus) |eb| {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' output collection failed: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
-                            if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
+                            if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
                         continue;
                     };
@@ -4592,7 +4592,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_skill");
                         if (state.event_bus) |eb| {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' wait failed: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
-                            if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
+                            if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
                         continue;
                     };
@@ -4678,7 +4678,7 @@ fn runQueueWorker(state: *GatewayState) void {
                                 "[cron] skill '{s}' degraded: failure={s} repair={s} trace={s}\n{s}",
                                 .{ spec.skill_name orelse "?", fc, ra, run_trace_id, stderr_preview },
                             ) catch null;
-                            if (em) |msg| _ = cron_mod.deliverResult(arena, alert_del, msg, false, eb) catch {};
+                            if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
                     }
                     // Log status with first line of output for delivery observability.
@@ -5104,7 +5104,7 @@ fn sendCronRepairAlert(
         .{ job_kind, spec.id, fc, ra, trace_id, preview },
     ) catch return;
     defer allocator.free(msg);
-    _ = cron_mod.deliverResult(allocator, alert_del, msg, false, eb) catch {};
+    _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
 }
 
 fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
@@ -9152,10 +9152,18 @@ test "sendCronRepairAlert uses alert delivery fallback for alert_only shell fail
     var test_bus = bus_mod.Bus.init();
     defer test_bus.close();
     state.event_bus = &test_bus;
+
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    const a = scratch.allocator();
+    const alert_channel = try a.dupe(u8, "telegram");
+    const alert_channel_ptr = alert_channel.ptr;
+    const alert_to = try a.dupe(u8, "ops-chat");
+    const alert_to_ptr = alert_to.ptr;
+
     state.alert_delivery = .{
         .mode = .always,
-        .channel = "telegram",
-        .to = "ops-chat",
+        .channel = alert_channel,
+        .to = alert_to,
         .best_effort = true,
     };
 
@@ -9174,15 +9182,20 @@ test "sendCronRepairAlert uses alert delivery fallback for alert_only shell fail
 
     sendCronRepairAlert(&state, allocator, spec, "shell", run_result, "trace-shell-1", "stderr preview");
 
+    scratch.deinit();
+
     try std.testing.expectEqual(@as(usize, 1), test_bus.outboundDepth());
     var msg = test_bus.consumeOutbound().?;
     defer msg.deinit(allocator);
+    try std.testing.expect(msg.channel.ptr != alert_channel_ptr);
+    try std.testing.expect(msg.chat_id.ptr != alert_to_ptr);
     try std.testing.expectEqualStrings("telegram", msg.channel);
     try std.testing.expectEqualStrings("ops-chat", msg.chat_id);
     try std.testing.expect(std.mem.indexOf(u8, msg.content, "shell 'shell-job-1' degraded") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg.content, "failure=exec_error") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg.content, "repair=alert_sent") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg.content, "trace=trace-shell-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "stderr preview") != null);
 }
 
 // ── Bearer Token Validation tests ───────────────────────────────

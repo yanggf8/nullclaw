@@ -29,7 +29,7 @@ pub const InboundMessage = struct {
         for (self.media) |m| allocator.free(m);
         if (self.media.len > 0) allocator.free(self.media);
         if (self.metadata_json) |md| allocator.free(md);
-        // channel is a string literal or long-lived config pointer — not owned, don't free
+        allocator.free(self.channel);
         allocator.free(self.sender_id);
         allocator.free(self.chat_id);
         allocator.free(self.content);
@@ -52,7 +52,7 @@ pub const OutboundMessage = struct {
         if (self.media.len > 0) allocator.free(self.media);
         for (self.choices) |choice| choice.deinit(allocator);
         if (self.choices.len > 0) allocator.free(self.choices);
-        // channel is a string literal or long-lived config pointer — not owned, don't free
+        allocator.free(self.channel);
         if (self.account_id) |aid| allocator.free(aid);
         allocator.free(self.chat_id);
         allocator.free(self.content);
@@ -71,7 +71,8 @@ pub fn makeInbound(
     content: []const u8,
     session_key: []const u8,
 ) Allocator.Error!InboundMessage {
-    // channel is not duped — must be a literal or long-lived config pointer
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const sid = try allocator.dupe(u8, sender_id);
     errdefer allocator.free(sid);
     const cid = try allocator.dupe(u8, chat_id);
@@ -81,7 +82,7 @@ pub fn makeInbound(
     const sk = try allocator.dupe(u8, session_key);
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .sender_id = sid,
         .chat_id = cid,
         .content = ct,
@@ -100,7 +101,8 @@ pub fn makeInboundFull(
     media_src: []const []const u8,
     metadata_json: ?[]const u8,
 ) Allocator.Error!InboundMessage {
-    // channel is not duped — must be a literal or long-lived config pointer
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const sid = try allocator.dupe(u8, sender_id);
     errdefer allocator.free(sid);
     const cid = try allocator.dupe(u8, chat_id);
@@ -134,7 +136,7 @@ pub fn makeInboundFull(
     const md = if (metadata_json) |mj| try allocator.dupe(u8, mj) else null;
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .sender_id = sid,
         .chat_id = cid,
         .content = ct,
@@ -169,13 +171,14 @@ fn makeOutboundWithStage(
     content: []const u8,
     stage: streaming.OutboundStage,
 ) Allocator.Error!OutboundMessage {
-    // channel is not duped — must be a literal or long-lived config pointer
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .chat_id = cid,
         .content = ct,
         .stage = stage,
@@ -210,6 +213,8 @@ fn makeOutboundWithAccountStage(
     content: []const u8,
     stage: streaming.OutboundStage,
 ) Allocator.Error!OutboundMessage {
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
@@ -217,7 +222,7 @@ fn makeOutboundWithAccountStage(
     const aid = try allocator.dupe(u8, account_id);
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .account_id = aid,
         .chat_id = cid,
         .content = ct,
@@ -291,6 +296,8 @@ pub fn makeOutboundWithChoices(
     content: []const u8,
     choices_src: anytype,
 ) Allocator.Error!OutboundMessage {
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
@@ -302,7 +309,7 @@ pub fn makeOutboundWithChoices(
     };
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .chat_id = cid,
         .content = ct,
         .choices = choices,
@@ -317,6 +324,8 @@ pub fn makeOutboundWithAccountChoices(
     content: []const u8,
     choices_src: anytype,
 ) Allocator.Error!OutboundMessage {
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
@@ -330,7 +339,7 @@ pub fn makeOutboundWithAccountChoices(
     };
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .account_id = aid,
         .chat_id = cid,
         .content = ct,
@@ -346,7 +355,8 @@ fn makeOutboundWithMedia(
     content: []const u8,
     media_src: []const []const u8,
 ) Allocator.Error!OutboundMessage {
-    // channel is not duped — must be a literal or long-lived config pointer
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
@@ -366,7 +376,7 @@ fn makeOutboundWithMedia(
     } else &[_][]const u8{};
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .chat_id = cid,
         .content = ct,
         .media = media,
@@ -662,6 +672,163 @@ test "makeOutboundWithAccountChoices stores account_id and choices" {
     defer msg.deinit(alloc);
     try testing.expectEqualStrings("backup", msg.account_id.?);
     try testing.expectEqual(@as(usize, 2), msg.choices.len);
+}
+
+// Regression: channel must be allocator-owned (duped), not aliased from caller.
+test "makeInbound owns channel copy" {
+    const alloc = testing.allocator;
+    const src_channel = try alloc.dupe(u8, "telegram");
+    const src_ptr = src_channel.ptr;
+    var msg = try makeInbound(alloc, src_channel, "user1", "chat42", "hello", "telegram:chat42");
+    defer msg.deinit(alloc);
+    alloc.free(src_channel);
+    try testing.expect(msg.channel.ptr != src_ptr);
+    try testing.expectEqualStrings("telegram", msg.channel);
+}
+
+test "makeInboundFull owns channel copy" {
+    const alloc = testing.allocator;
+    const src_channel = try alloc.dupe(u8, "discord");
+    const src_ptr = src_channel.ptr;
+    const media_src = [_][]const u8{"/tmp/photo.jpg"};
+    var msg = try makeInboundFull(
+        alloc,
+        src_channel,
+        "user1",
+        "chat42",
+        "hello",
+        "discord:chat42",
+        &media_src,
+        "{\"message_id\":1}",
+    );
+    defer msg.deinit(alloc);
+    alloc.free(src_channel);
+    try testing.expect(msg.channel.ptr != src_ptr);
+    try testing.expectEqualStrings("discord", msg.channel);
+}
+
+test "inbound message survives producer arena source teardown" {
+    const alloc = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    const a = arena.allocator();
+
+    const channel = try a.dupe(u8, "telegram");
+    const channel_ptr = channel.ptr;
+    const sender = try a.dupe(u8, "user1");
+    const chat = try a.dupe(u8, "chat42");
+    const content = try a.dupe(u8, "hello");
+    const session_key = try a.dupe(u8, "telegram:chat42");
+
+    var msg = try makeInbound(alloc, channel, sender, chat, content, session_key);
+    defer msg.deinit(alloc);
+
+    arena.deinit();
+
+    try testing.expect(msg.channel.ptr != channel_ptr);
+    try testing.expectEqualStrings("telegram", msg.channel);
+    try testing.expectEqualStrings("user1", msg.sender_id);
+    try testing.expectEqualStrings("chat42", msg.chat_id);
+    try testing.expectEqualStrings("hello", msg.content);
+    try testing.expectEqualStrings("telegram:chat42", msg.session_key);
+}
+
+test "makeOutbound owns channel copy" {
+    const alloc = testing.allocator;
+    const src_channel = try alloc.dupe(u8, "telegram");
+    const src_ptr = src_channel.ptr;
+    var msg = try makeOutbound(alloc, src_channel, "c1", "reply");
+    defer msg.deinit(alloc);
+    alloc.free(src_channel);
+    try testing.expect(msg.channel.ptr != src_ptr);
+    try testing.expectEqualStrings("telegram", msg.channel);
+}
+
+test "makeOutboundChunk owns channel copy" {
+    const alloc = testing.allocator;
+    const src_channel = try alloc.dupe(u8, "web");
+    const src_ptr = src_channel.ptr;
+    var msg = try makeOutboundChunk(alloc, src_channel, "c1", "delta");
+    defer msg.deinit(alloc);
+    alloc.free(src_channel);
+    try testing.expect(msg.channel.ptr != src_ptr);
+    try testing.expectEqualStrings("web", msg.channel);
+}
+
+test "makeOutboundWithAccount owns channel and account_id copies" {
+    const alloc = testing.allocator;
+    const src_channel = try alloc.dupe(u8, "telegram");
+    const src_channel_ptr = src_channel.ptr;
+    const src_account = try alloc.dupe(u8, "backup");
+    const src_account_ptr = src_account.ptr;
+    var msg = try makeOutboundWithAccount(alloc, src_channel, src_account, "c1", "reply");
+    defer msg.deinit(alloc);
+    alloc.free(src_channel);
+    alloc.free(src_account);
+    try testing.expect(msg.channel.ptr != src_channel_ptr);
+    try testing.expect(msg.account_id.?.ptr != src_account_ptr);
+    try testing.expectEqualStrings("telegram", msg.channel);
+    try testing.expectEqualStrings("backup", msg.account_id.?);
+}
+
+test "makeOutboundChunkWithAccount owns channel and account_id copies" {
+    const alloc = testing.allocator;
+    const src_channel = try alloc.dupe(u8, "web");
+    const src_channel_ptr = src_channel.ptr;
+    const src_account = try alloc.dupe(u8, "main");
+    const src_account_ptr = src_account.ptr;
+    var msg = try makeOutboundChunkWithAccount(alloc, src_channel, src_account, "c1", "delta");
+    defer msg.deinit(alloc);
+    alloc.free(src_channel);
+    alloc.free(src_account);
+    try testing.expect(msg.channel.ptr != src_channel_ptr);
+    try testing.expect(msg.account_id.?.ptr != src_account_ptr);
+    try testing.expectEqualStrings("web", msg.channel);
+    try testing.expectEqualStrings("main", msg.account_id.?);
+}
+
+test "makeOutboundWithChoices owns channel copy" {
+    const alloc = testing.allocator;
+    const src_channel = try alloc.dupe(u8, "telegram");
+    const src_ptr = src_channel.ptr;
+    const choices = [_]outbound.Choice{
+        .{ .id = "yes", .label = "Yes", .submit_text = "yes" },
+    };
+    var msg = try makeOutboundWithChoices(alloc, src_channel, "c1", "reply", &choices);
+    defer msg.deinit(alloc);
+    alloc.free(src_channel);
+    try testing.expect(msg.channel.ptr != src_ptr);
+    try testing.expectEqualStrings("telegram", msg.channel);
+}
+
+test "makeOutboundWithAccountChoices owns channel and account_id copies" {
+    const alloc = testing.allocator;
+    const src_channel = try alloc.dupe(u8, "telegram");
+    const src_channel_ptr = src_channel.ptr;
+    const src_account = try alloc.dupe(u8, "backup");
+    const src_account_ptr = src_account.ptr;
+    const choices = [_]outbound.Choice{
+        .{ .id = "a", .label = "A", .submit_text = "alpha" },
+    };
+    var msg = try makeOutboundWithAccountChoices(alloc, src_channel, src_account, "c1", "reply", &choices);
+    defer msg.deinit(alloc);
+    alloc.free(src_channel);
+    alloc.free(src_account);
+    try testing.expect(msg.channel.ptr != src_channel_ptr);
+    try testing.expect(msg.account_id.?.ptr != src_account_ptr);
+    try testing.expectEqualStrings("telegram", msg.channel);
+    try testing.expectEqualStrings("backup", msg.account_id.?);
+}
+
+test "makeOutboundWithMedia owns channel copy" {
+    const alloc = testing.allocator;
+    const src_channel = try alloc.dupe(u8, "discord");
+    const src_ptr = src_channel.ptr;
+    const media_src = [_][]const u8{"/tmp/result.png"};
+    var msg = try makeOutboundWithMedia(alloc, src_channel, "room1", "here", &media_src);
+    defer msg.deinit(alloc);
+    alloc.free(src_channel);
+    try testing.expect(msg.channel.ptr != src_ptr);
+    try testing.expectEqualStrings("discord", msg.channel);
 }
 
 // ---------------------------------------------------------------------------
