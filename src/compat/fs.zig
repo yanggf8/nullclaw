@@ -147,6 +147,14 @@ pub const File = struct {
         return self.toInner().writer(shared.io(), buffer);
     }
 
+    /// Streaming-mode writer: drains via writev(2) at the fd's current offset
+    /// (append), not pwrite at Writer.pos. Use for stdout writers that share
+    /// the fd with another writer (e.g. the live streaming callback), where a
+    /// positional writer's pos=0 pwrite would clobber already-appended bytes.
+    pub fn writerStreaming(self: File, buffer: []u8) Writer {
+        return self.toInner().writerStreaming(shared.io(), buffer);
+    }
+
     pub fn reader(self: File, buffer: []u8) Reader {
         return self.toInner().reader(shared.io(), buffer);
     }

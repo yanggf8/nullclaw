@@ -246,11 +246,18 @@ fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
     // In tests, stdout is used by Zig's test runner protocol (`--listen`).
     if (builtin.is_test) return;
 
-    var buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
-    const wr = &bw.interface;
-    wr.print("{s}", .{event.text}) catch {};
-    wr.flush() catch {};
+    // Append each streamed delta with a direct streaming (writev-based) write
+    // instead of a fresh buffered File.writer per call. File.writer() ->
+    // Writer.init is positional (pos=0); reconstructing it per chunk pwrote
+    // every chunk at offset 0, clobbering prior chunks whenever stdout was a
+    // regular file/pipe (only the last ~300 bytes survived a redirected or
+    // captured run; invisible on a TTY, where the pwrite hit error.Unseekable
+    // and fell back to append). writeAll -> writeStreamingAll is a plain
+    // writev at the kernel's current offset with no pos, so chunks accumulate
+    // correctly for both TTY and pipe/file and it flushes implicitly (no
+    // buffer object). Errors (e.g. BrokenPipe on a closed reader) are
+    // swallowed to match the previous best-effort behavior.
+    std_compat.fs.File.stdout().writeAll(event.text) catch {};
 }
 
 fn makeCliStreamSink(raw_sink: streaming.Sink, filter: *streaming.TagFilter) streaming.Sink {
@@ -579,7 +586,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     };
 
     var out_buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&out_buf);
+    // Streaming mode: this writer shares the stdout fd with the live streaming
+    // callback (which appends via writev). A positional writer here (pos=0)
+    // would pwrite its first bytes -- the post-stream trailing "\n" and the
+    // usage line -- at offset 0, clobbering the head of the already-streamed
+    // reply on a pipe/file. Streaming/append keeps both writers coherent on
+    // the one kernel fd offset (and is what a TTY's Unseekable fallback
+    // reached anyway).
+    var bw = std_compat.fs.File.stdout().writerStreaming(&out_buf);
     const w = &bw.interface;
 
     const message_arg = parsed_args.message_arg;
