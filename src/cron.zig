@@ -9932,6 +9932,72 @@ test "deliverViaMainAgent preserves account metadata and session key" {
     try std.testing.expectEqualStrings("chat123", parsed.value.object.get("peer_id").?.string);
 }
 
+// Regression: delivery channel must survive arena teardown before bus consumption.
+test "deliverResult owns outbound delivery fields after delivery arena teardown" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    const a = scratch.allocator();
+    const channel = try a.dupe(u8, "telegram");
+    const channel_ptr = channel.ptr;
+    const to = try a.dupe(u8, "chat123");
+    const to_ptr = to.ptr;
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = channel,
+        .to = to,
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "out", true, &test_bus);
+    try std.testing.expect(delivered);
+
+    scratch.deinit();
+
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expect(msg.channel.ptr != channel_ptr);
+    try std.testing.expect(msg.chat_id.ptr != to_ptr);
+    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("chat123", msg.chat_id);
+    try std.testing.expectEqualStrings("out", msg.content);
+}
+
+test "deliverViaMainAgent owns inbound delivery fields after delivery arena teardown" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    const a = scratch.allocator();
+    const channel = try a.dupe(u8, "telegram");
+    const channel_ptr = channel.ptr;
+    const to = try a.dupe(u8, "chat123");
+    const to_ptr = to.ptr;
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = channel,
+        .to = to,
+    };
+
+    const delivered = try deliverViaMainAgent(allocator, delivery, "job output here", true, &test_bus, "traffic");
+    try std.testing.expect(delivered);
+
+    scratch.deinit();
+
+    var msg = test_bus.consumeInbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expect(msg.channel.ptr != channel_ptr);
+    try std.testing.expect(msg.chat_id.ptr != to_ptr);
+    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("chat123", msg.chat_id);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "Scheduled task 'traffic'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "job output here") != null);
+}
+
 test "one-shot job deleted after tick execution" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
