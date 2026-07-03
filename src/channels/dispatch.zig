@@ -9,6 +9,8 @@ const Atomic = @import("../portable_atomic.zig").Atomic;
 const thread_stacks = @import("../thread_stacks.zig");
 const builtin = @import("builtin");
 
+const log = std.log.scoped(.outbound_dispatch);
+
 /// Message dispatch — routes incoming ChannelMessages to the agent,
 /// routes agent responses back to the originating channel.
 ///
@@ -205,18 +207,57 @@ pub fn runOutboundDispatcherWithOutbox(
     while (event_bus.consumeOutbound()) |msg| {
         defer msg.deinit(allocator);
 
+        log.debug("dequeued outbound message channel={s} stage={s} content_len={d} draft_id={d} account_routed={}", .{
+            msg.channel,
+            @tagName(msg.stage),
+            msg.content.len,
+            msg.draft_id,
+            msg.account_id != null,
+        });
+
         const channel_opt = if (msg.account_id) |aid|
             registry.findByNameAccount(msg.channel, aid)
         else
             registry.findByName(msg.channel);
 
         if (channel_opt) |channel| {
+            log.debug("channel lookup found channel={s} stage={s} content_len={d} draft_id={d} account_routed={}", .{
+                msg.channel,
+                @tagName(msg.stage),
+                msg.content.len,
+                msg.draft_id,
+                msg.account_id != null,
+            });
+
             if (delivery_outbox) |outbox| {
                 if (shouldPersistFinalOutbound(msg)) {
-                    if (outbox.enqueueFinal(msg)) |_| {
+                    log.debug("outbox enqueue attempt channel={s} stage={s} content_len={d} draft_id={d} account_routed={}", .{
+                        msg.channel,
+                        @tagName(msg.stage),
+                        msg.content.len,
+                        msg.draft_id,
+                        msg.account_id != null,
+                    });
+                    if (outbox.enqueueFinal(msg)) |job_id| {
+                        log.debug("outbox enqueue success channel={s} stage={s} content_len={d} draft_id={d} account_routed={} job_id={d}", .{
+                            msg.channel,
+                            @tagName(msg.stage),
+                            msg.content.len,
+                            msg.draft_id,
+                            msg.account_id != null,
+                            job_id,
+                        });
                         _ = stats.dispatched.fetchAdd(1, .monotonic);
                         continue;
-                    } else |_| {
+                    } else |err| {
+                        log.warn("outbox enqueue failure channel={s} stage={s} content_len={d} draft_id={d} account_routed={} err={s}", .{
+                            msg.channel,
+                            @tagName(msg.stage),
+                            msg.content.len,
+                            msg.draft_id,
+                            msg.account_id != null,
+                            @errorName(err),
+                        });
                         // Fall back to the legacy direct path so a persistence
                         // failure does not drop the final reply entirely.
                     }
@@ -228,6 +269,14 @@ pub fn runOutboundDispatcherWithOutbox(
             };
             _ = stats.dispatched.fetchAdd(1, .monotonic);
         } else {
+            log.warn("channel not found channel={s} stage={s} content_len={d} draft_id={d} account_routed={} err={s}", .{
+                msg.channel,
+                @tagName(msg.stage),
+                msg.content.len,
+                msg.draft_id,
+                msg.account_id != null,
+                "ChannelNotFound",
+            });
             _ = stats.channel_not_found.fetchAdd(1, .monotonic);
         }
     }
@@ -270,7 +319,24 @@ fn dispatchOutboundMessageWithRetry(
 ) !void {
     var attempt: usize = 1;
     while (true) {
+        log.debug("send attempt channel={s} stage={s} content_len={d} draft_id={d} account_routed={} attempt={d}", .{
+            msg.channel,
+            @tagName(msg.stage),
+            msg.content.len,
+            msg.draft_id,
+            msg.account_id != null,
+            attempt,
+        });
         dispatchOutboundMessage(allocator, channel, msg, draft_messages) catch |err| {
+            log.warn("send failure channel={s} stage={s} content_len={d} draft_id={d} account_routed={} attempt={d} err={s}", .{
+                msg.channel,
+                @tagName(msg.stage),
+                msg.content.len,
+                msg.draft_id,
+                msg.account_id != null,
+                attempt,
+                @errorName(err),
+            });
             if (!shouldRetryOutboundMessage(channel, msg, err) or attempt >= MAX_FINAL_SEND_ATTEMPTS) return err;
             const backoff_idx = @min(attempt - 1, FINAL_SEND_RETRY_BACKOFF_MS.len - 1);
             const backoff_ms = FINAL_SEND_RETRY_BACKOFF_MS[backoff_idx];
@@ -278,6 +344,14 @@ fn dispatchOutboundMessageWithRetry(
             attempt += 1;
             continue;
         };
+        log.debug("send success channel={s} stage={s} content_len={d} draft_id={d} account_routed={} attempt={d}", .{
+            msg.channel,
+            @tagName(msg.stage),
+            msg.content.len,
+            msg.draft_id,
+            msg.account_id != null,
+            attempt,
+        });
         return;
     }
 }
@@ -304,21 +378,54 @@ pub fn drainDurableOutboundOutboxOnce(
     var claimed = (try delivery_outbox.claimNextReady(allocator, now_ns)) orelse return false;
     defer claimed.deinit(allocator);
 
+    log.debug("job claimed job_id={d} channel={s} content_len={d} account_routed={}", .{
+        claimed.id,
+        claimed.channel,
+        claimed.content.len,
+        claimed.account_id != null,
+    });
+
     const channel = if (claimed.account_id) |account_id|
         registry.findByNameAccount(claimed.channel, account_id)
     else
         registry.findByName(claimed.channel);
 
     if (channel) |resolved_channel| {
+        log.debug("channel lookup found job_id={d} channel={s} content_len={d} account_routed={}", .{
+            claimed.id,
+            claimed.channel,
+            claimed.content.len,
+            claimed.account_id != null,
+        });
         dispatchClaimedOutboundDirect(resolved_channel, claimed) catch |err| {
+            log.warn("send failure job_id={d} channel={s} content_len={d} account_routed={} err={s}", .{
+                claimed.id,
+                claimed.channel,
+                claimed.content.len,
+                claimed.account_id != null,
+                @errorName(err),
+            });
             try delivery_outbox.recordFailure(claimed.id, @errorName(err), now_ns);
             return true;
         };
+        log.debug("send success job_id={d} channel={s} content_len={d} account_routed={}", .{
+            claimed.id,
+            claimed.channel,
+            claimed.content.len,
+            claimed.account_id != null,
+        });
         try delivery_outbox.recordDelivered(claimed.id, now_ns);
         try delivery_outbox.purgeDelivered(claimed.id);
         return true;
     }
 
+    log.warn("channel not found job_id={d} channel={s} content_len={d} account_routed={} err={s}", .{
+        claimed.id,
+        claimed.channel,
+        claimed.content.len,
+        claimed.account_id != null,
+        "ChannelNotFound",
+    });
     try delivery_outbox.recordFailure(claimed.id, "ChannelNotFound", now_ns);
     return true;
 }

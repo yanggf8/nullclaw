@@ -19,6 +19,10 @@ pub const DeliveryOutbox = struct {
     jobs: std.ArrayListUnmanaged(Job) = .empty,
     next_id: u64 = 1,
     closed: bool = false,
+    initialized_at_ns: i64 = 0,
+    last_write_at_ns: i64 = 0,
+    last_enqueue_attempt_at_ns: i64 = 0,
+    last_enqueue_success_at_ns: i64 = 0,
 
     const Self = @This();
 
@@ -129,6 +133,7 @@ pub const DeliveryOutbox = struct {
         var self = Self{
             .allocator = allocator,
             .path = try allocator.dupe(u8, path),
+            .initialized_at_ns = @intCast(std_compat.time.nanoTimestamp()),
         };
         errdefer allocator.free(self.path);
         try self.load();
@@ -161,6 +166,8 @@ pub const DeliveryOutbox = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        self.last_enqueue_attempt_at_ns = @intCast(std_compat.time.nanoTimestamp());
+
         var job = try self.jobFromOutboundLocked(msg);
         const job_id = job.id;
         self.jobs.append(self.allocator, job) catch |err| {
@@ -175,6 +182,11 @@ pub const DeliveryOutbox = struct {
             self.next_id = previous_next_id;
         }
         self.next_id += 1;
+
+        const prev_success = self.last_enqueue_success_at_ns;
+        self.last_enqueue_success_at_ns = @intCast(std_compat.time.nanoTimestamp());
+        errdefer self.last_enqueue_success_at_ns = prev_success;
+
         try self.saveLocked();
         return job_id;
     }
@@ -331,6 +343,10 @@ pub const DeliveryOutbox = struct {
     }
 
     fn saveLocked(self: *Self) !void {
+        const prev_write = self.last_write_at_ns;
+        self.last_write_at_ns = @intCast(std_compat.time.nanoTimestamp());
+        errdefer self.last_write_at_ns = prev_write;
+
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(self.allocator);
 
@@ -340,6 +356,14 @@ pub const DeliveryOutbox = struct {
             const text = try std.fmt.bufPrint(&int_buf, "{d}", .{self.next_id});
             try buf.appendSlice(self.allocator, text);
         }
+        try buf.appendSlice(self.allocator, ",\n  ");
+        try json_util.appendJsonInt(&buf, self.allocator, "initialized_at_ns", self.initialized_at_ns);
+        try buf.appendSlice(self.allocator, ",\n  ");
+        try json_util.appendJsonInt(&buf, self.allocator, "last_write_at_ns", self.last_write_at_ns);
+        try buf.appendSlice(self.allocator, ",\n  ");
+        try json_util.appendJsonInt(&buf, self.allocator, "last_enqueue_attempt_at_ns", self.last_enqueue_attempt_at_ns);
+        try buf.appendSlice(self.allocator, ",\n  ");
+        try json_util.appendJsonInt(&buf, self.allocator, "last_enqueue_success_at_ns", self.last_enqueue_success_at_ns);
         try buf.appendSlice(self.allocator, ",\n  \"jobs\": [");
 
         for (self.jobs.items, 0..) |job, idx| {
@@ -408,6 +432,10 @@ pub const DeliveryOutbox = struct {
                 self.next_id = @intCast(value.integer);
             }
         }
+        self.initialized_at_ns = parseLivenessTimestamp(root_value.get("initialized_at_ns"));
+        self.last_write_at_ns = parseLivenessTimestamp(root_value.get("last_write_at_ns"));
+        self.last_enqueue_attempt_at_ns = parseLivenessTimestamp(root_value.get("last_enqueue_attempt_at_ns"));
+        self.last_enqueue_success_at_ns = parseLivenessTimestamp(root_value.get("last_enqueue_success_at_ns"));
         const jobs_value = root_value.get("jobs") orelse return;
         if (jobs_value != .array) return;
 
@@ -493,6 +521,12 @@ fn appendChoices(
 fn jsonString(value: ?std.json.Value) ?[]const u8 {
     const v = value orelse return null;
     return if (v == .string) v.string else null;
+}
+
+fn parseLivenessTimestamp(value: ?std.json.Value) i64 {
+    const v = value orelse return 0;
+    if (v == .integer and v.integer >= 0) return v.integer;
+    return 0;
 }
 
 fn parseStringArray(allocator: Allocator, value: ?std.json.Value) ![]const []const u8 {
@@ -681,4 +715,121 @@ test "delivery outbox persists delivered acknowledgement across restart" {
 
     try std.testing.expectEqual(@as(usize, 1), try reopened.purgePersistedDelivered());
     try std.testing.expectEqual(@as(usize, 0), reopened.pendingCount());
+}
+
+test "delivery outbox persists liveness timestamps after enqueue" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_root);
+    const path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_root, "outbox.json" });
+    defer std.testing.allocator.free(path);
+
+    var outbox = try DeliveryOutbox.init(std.testing.allocator, path);
+
+    var msg = try bus.makeOutbound(std.testing.allocator, "qq", "chat-1", "hello");
+    defer msg.deinit(std.testing.allocator);
+
+    _ = try outbox.enqueueFinal(msg);
+
+    const captured_initialized = outbox.initialized_at_ns;
+    const captured_write = outbox.last_write_at_ns;
+    const captured_attempt = outbox.last_enqueue_attempt_at_ns;
+    const captured_success = outbox.last_enqueue_success_at_ns;
+
+    outbox.close();
+    outbox.deinit();
+
+    var reopened = try DeliveryOutbox.init(std.testing.allocator, path);
+    defer reopened.deinit();
+
+    try std.testing.expect(captured_initialized > 0);
+    try std.testing.expect(captured_write > 0);
+    try std.testing.expect(captured_attempt > 0);
+    try std.testing.expect(captured_success > 0);
+
+    try std.testing.expect(reopened.initialized_at_ns > 0);
+    try std.testing.expect(reopened.last_write_at_ns > 0);
+    try std.testing.expect(reopened.last_enqueue_attempt_at_ns > 0);
+    try std.testing.expect(reopened.last_enqueue_success_at_ns > 0);
+
+    try std.testing.expectEqual(captured_initialized, reopened.initialized_at_ns);
+    try std.testing.expectEqual(captured_write, reopened.last_write_at_ns);
+    try std.testing.expectEqual(captured_attempt, reopened.last_enqueue_attempt_at_ns);
+    try std.testing.expectEqual(captured_success, reopened.last_enqueue_success_at_ns);
+}
+
+test "delivery outbox failed enqueue advances attempt but not success" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_root);
+    const state_dir = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_root, "missing" });
+    defer std.testing.allocator.free(state_dir);
+    const path = try std_compat.fs.path.join(std.testing.allocator, &.{ state_dir, "outbox.json" });
+    defer std.testing.allocator.free(path);
+
+    var outbox = try DeliveryOutbox.init(std.testing.allocator, path);
+    defer outbox.deinit();
+
+    var msg = try bus.makeOutbound(std.testing.allocator, "qq", "chat-1", "hello");
+    defer msg.deinit(std.testing.allocator);
+
+    const before_attempt = outbox.last_enqueue_attempt_at_ns;
+    const before_success = outbox.last_enqueue_success_at_ns;
+
+    try std.testing.expectError(error.FileNotFound, outbox.enqueueFinal(msg));
+
+    try std.testing.expect(outbox.last_enqueue_attempt_at_ns > before_attempt);
+    try std.testing.expectEqual(before_success, outbox.last_enqueue_success_at_ns);
+    try std.testing.expectEqual(@as(usize, 0), outbox.pendingCount());
+}
+
+test "delivery outbox failed enqueue does not advance last write" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_root);
+    const state_dir = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_root, "missing" });
+    defer std.testing.allocator.free(state_dir);
+    const path = try std_compat.fs.path.join(std.testing.allocator, &.{ state_dir, "outbox.json" });
+    defer std.testing.allocator.free(path);
+
+    var outbox = try DeliveryOutbox.init(std.testing.allocator, path);
+    defer outbox.deinit();
+
+    var msg = try bus.makeOutbound(std.testing.allocator, "qq", "chat-1", "hello");
+    defer msg.deinit(std.testing.allocator);
+
+    const before_write = outbox.last_write_at_ns;
+
+    try std.testing.expectError(error.FileNotFound, outbox.enqueueFinal(msg));
+
+    try std.testing.expectEqual(before_write, outbox.last_write_at_ns);
+}
+
+test "delivery outbox legacy JSON defaults liveness timestamps" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_root);
+    const path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_root, "outbox.json" });
+    defer std.testing.allocator.free(path);
+
+    const file = try std_compat.fs.createFileAbsolute(path, .{});
+    defer file.close();
+    try file.writeAll("{\"next_id\":5,\"jobs\":[]}\n");
+
+    var outbox = try DeliveryOutbox.init(std.testing.allocator, path);
+    defer outbox.deinit();
+
+    try std.testing.expectEqual(@as(i64, 0), outbox.initialized_at_ns);
+    try std.testing.expectEqual(@as(i64, 0), outbox.last_write_at_ns);
+    try std.testing.expectEqual(@as(i64, 0), outbox.last_enqueue_attempt_at_ns);
+    try std.testing.expectEqual(@as(i64, 0), outbox.last_enqueue_success_at_ns);
+    try std.testing.expectEqual(@as(u64, 5), outbox.next_id);
 }
