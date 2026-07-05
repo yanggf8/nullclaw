@@ -33,5 +33,3 @@ tmp/
 .codebuddy/
 .codex
 .antigravitycli/
-scripts/canary/**/__pycache__/
-scripts/canary/**/*.pyc
