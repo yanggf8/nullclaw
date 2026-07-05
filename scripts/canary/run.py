@@ -190,7 +190,13 @@ def main(argv: list[str] | None = None) -> int:
         argv = []
 
     if "--dry-run" in argv:
-        dry_run(argv)
+        print(dry_run(argv))
         return 0
 
     return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main(sys.argv[1:]))
