@@ -3236,6 +3236,84 @@ fn writeMemoryEntryJson(out: anytype, entry: yc.memory.MemoryEntry) !void {
     try out.writeAll("}");
 }
 
+const UtilityScoreSource = enum {
+    sqlite,
+    neutral_fallback,
+};
+
+fn utilityScoreSourceString(source: UtilityScoreSource) []const u8 {
+    return switch (source) {
+        .sqlite => "sqlite",
+        .neutral_fallback => "neutral_fallback",
+    };
+}
+
+fn memoryUtilityScoreSource(mem: yc.memory.Memory) UtilityScoreSource {
+    if (mem.vtable.fetchUtilityScore != null and std.mem.eql(u8, mem.name(), "sqlite")) {
+        return .sqlite;
+    }
+    return .neutral_fallback;
+}
+
+fn writeMemoryEntryJsonWithUtility(out: anytype, entry: yc.memory.MemoryEntry, mem: yc.memory.Memory) !void {
+    try out.writeAll("{\"key\":");
+    try writeJsonString(out, entry.key);
+    try out.writeAll(",\"category\":");
+    try writeJsonString(out, entry.category.toString());
+    try out.writeAll(",\"timestamp\":");
+    try writeJsonString(out, entry.timestamp);
+    try out.writeAll(",\"content\":");
+    try writeJsonString(out, entry.content);
+    try out.writeAll(",\"session_id\":");
+    try writeJsonNullableString(out, entry.session_id);
+    try out.writeAll(",\"utility_score\":");
+    try out.print("{d}", .{mem.fetchUtilityScore(entry.key)});
+    try out.writeAll(",\"utility_score_source\":");
+    try writeJsonString(out, utilityScoreSourceString(memoryUtilityScoreSource(mem)));
+    try out.writeAll("}");
+}
+
+fn appendMemoryEntryUtilityText(out: anytype, entry: yc.memory.MemoryEntry, mem: yc.memory.Memory) !void {
+    const source = memoryUtilityScoreSource(mem);
+    switch (source) {
+        .sqlite => try out.print("utility_score: {d} (sqlite-derived)\n", .{mem.fetchUtilityScore(entry.key)}),
+        .neutral_fallback => try out.writeAll("utility_score: 0.5 (neutral fallback; backend does not expose utility counters)\n"),
+    }
+}
+
+fn appendMemoryListJsonWithUtility(
+    out: anytype,
+    entries: []const yc.memory.MemoryEntry,
+    mem: yc.memory.Memory,
+    shown: usize,
+    include_internal: bool,
+) !void {
+    try out.writeAll("[");
+    var written: usize = 0;
+    for (entries) |entry| {
+        if (!memoryEntryVisible(include_internal, entry)) continue;
+        if (written >= shown) break;
+        if (written > 0) try out.writeAll(",");
+        try out.writeAll("{\"key\":");
+        try writeJsonString(out, entry.key);
+        try out.writeAll(",\"category\":");
+        try writeJsonString(out, entry.category.toString());
+        try out.writeAll(",\"timestamp\":");
+        try writeJsonString(out, entry.timestamp);
+        try out.writeAll(",\"content\":");
+        try writeJsonString(out, entry.content);
+        try out.writeAll(",\"session_id\":");
+        try writeJsonNullableString(out, entry.session_id);
+        try out.writeAll(",\"utility_score\":");
+        try out.print("{d}", .{mem.fetchUtilityScore(entry.key)});
+        try out.writeAll(",\"utility_score_source\":");
+        try writeJsonString(out, utilityScoreSourceString(memoryUtilityScoreSource(mem)));
+        try out.writeAll("}");
+        written += 1;
+    }
+    try out.writeAll("]");
+}
+
 const MemoryExportOptions = struct {
     category: ?yc.memory.MemoryCategory = null,
     session_id: ?[]const u8 = null,
@@ -3631,6 +3709,10 @@ fn appendMemorySearchResultsJson(out: anytype, results: []const yc.memory.Retrie
         try writeJsonNullableU32(out, rc.keyword_rank);
         try out.writeAll(",\"vector_score\":");
         try writeJsonNullableF32(out, rc.vector_score);
+        try out.writeAll(",\"utility_score\":");
+        try out.print("{d}", .{rc.utility_score});
+        try out.writeAll(",\"utility_score_source\":");
+        try writeJsonString(out, "sqlite");
         try out.writeAll("}");
     }
     try out.writeAll("]");
@@ -3668,6 +3750,19 @@ fn writeMemoryDeleteJsonLine(key: []const u8, session_id: ?[]const u8, deleted: 
 
 fn writeMemoryEntryJsonLine(entry: yc.memory.MemoryEntry) void {
     writeRenderedJsonLine(writeMemoryEntryJson, .{entry});
+}
+
+fn writeMemoryEntryJsonWithUtilityLine(entry: yc.memory.MemoryEntry, mem: yc.memory.Memory) void {
+    writeRenderedJsonLine(writeMemoryEntryJsonWithUtility, .{ entry, mem });
+}
+
+fn writeMemoryEntryUtilityTextLine(entry: yc.memory.MemoryEntry, mem: yc.memory.Memory) void {
+    var buf: [256]u8 = undefined;
+    var bw = std_compat.fs.File.stderr().writer(&buf);
+    appendMemoryEntryUtilityText(&bw.interface, entry, mem) catch {
+        std_compat.process.exit(1);
+    };
+    bw.interface.flush() catch {};
 }
 
 fn writeMemoryListJson(entries: []const yc.memory.MemoryEntry, shown: usize, include_internal: bool) void {
@@ -4005,7 +4100,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         if (entry) |e| {
             defer e.deinit(allocator);
             if (json_mode) {
-                writeMemoryEntryJsonLine(e);
+                writeMemoryEntryJsonWithUtilityLine(e, mem_rt.memory);
             } else {
                 std.debug.print("key: {s}\ncategory: {s}\ntimestamp: {s}\ncontent:\n{s}\n", .{
                     e.key,
@@ -4013,6 +4108,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                     e.timestamp,
                     e.content,
                 });
+                writeMemoryEntryUtilityTextLine(e, mem_rt.memory);
             }
         } else {
             if (json_mode) {
@@ -4093,30 +4189,37 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             var buf: [65536]u8 = undefined;
             var bw = std_compat.fs.File.stdout().writer(&buf);
             const out = &bw.interface;
-            out.writeAll("[") catch return;
-            for (entries[0..shown], 0..) |e, idx| {
-                if (idx > 0) out.writeAll(",") catch return;
-                out.writeAll("{\"key\":") catch return;
-                writeJsonString(out, e.key) catch return;
-                out.writeAll(",\"category\":") catch return;
-                writeJsonString(out, e.category.toString()) catch return;
-                out.writeAll(",\"timestamp\":") catch return;
-                writeJsonString(out, e.timestamp) catch return;
-                out.writeAll(",\"content\":") catch return;
-                writeJsonString(out, e.content) catch return;
-                out.writeAll(",\"session_id\":") catch return;
-                writeJsonNullableString(out, e.session_id) catch return;
-                if (show_age) {
+            if (show_age) {
+                out.writeAll("[") catch return;
+                for (entries[0..shown], 0..) |e, idx| {
+                    if (idx > 0) out.writeAll(",") catch return;
+                    out.writeAll("{\"key\":") catch return;
+                    writeJsonString(out, e.key) catch return;
+                    out.writeAll(",\"category\":") catch return;
+                    writeJsonString(out, e.category.toString()) catch return;
+                    out.writeAll(",\"timestamp\":") catch return;
+                    writeJsonString(out, e.timestamp) catch return;
+                    out.writeAll(",\"content\":") catch return;
+                    writeJsonString(out, e.content) catch return;
+                    out.writeAll(",\"session_id\":") catch return;
+                    writeJsonNullableString(out, e.session_id) catch return;
                     const age_d = memoryAgeDays(e.timestamp);
                     if (age_d) |d| {
                         out.print(",\"age_days\":{d}", .{d}) catch return;
                     } else {
                         out.writeAll(",\"age_days\":null") catch return;
                     }
+                    out.writeAll(",\"utility_score\":") catch return;
+                    out.print("{d}", .{mem_rt.memory.fetchUtilityScore(e.key)}) catch return;
+                    out.writeAll(",\"utility_score_source\":") catch return;
+                    writeJsonString(out, utilityScoreSourceString(memoryUtilityScoreSource(mem_rt.memory))) catch return;
+                    out.writeAll("}") catch return;
                 }
-                out.writeAll("}") catch return;
+                out.writeAll("]\n") catch return;
+            } else {
+                appendMemoryListJsonWithUtility(out, entries[0..shown], mem_rt.memory, shown, include_internal) catch return;
+                out.writeAll("\n") catch return;
             }
-            out.writeAll("]\n") catch return;
             out.flush() catch return;
         } else {
             std.debug.print("Memory entries: showing {d} from offset {d}\n", .{ shown, offset });
@@ -4143,6 +4246,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                         if (preview.truncated) "..." else "",
                     });
                 }
+                writeMemoryEntryUtilityTextLine(e, mem_rt.memory);
             }
         }
         return;
@@ -8702,9 +8806,121 @@ test "appendMemorySearchResultsJson renders retrieval candidates" {
 
     try appendMemorySearchResultsJson(&writer, &results);
     try std.testing.expectEqualStrings(
-        "[{\"key\":\"fact\",\"category\":\"conversation\",\"snippet\":\"hello\",\"source\":\"primary\",\"source_path\":\"memory://fact\",\"final_score\":0.9,\"start_line\":1,\"end_line\":1,\"created_at\":42,\"keyword_rank\":1,\"vector_score\":null}]",
+        "[{\"key\":\"fact\",\"category\":\"conversation\",\"snippet\":\"hello\",\"source\":\"primary\",\"source_path\":\"memory://fact\",\"final_score\":0.9,\"start_line\":1,\"end_line\":1,\"created_at\":42,\"keyword_rank\":1,\"vector_score\":null,\"utility_score\":0.5,\"utility_score_source\":\"sqlite\"}]",
         writer.buffered(),
     );
+}
+
+test "memory search JSON includes utility_score and source" {
+    const results = [_]yc.memory.RetrievalCandidate{
+        .{
+            .id = "row-1",
+            .key = "fact",
+            .content = "hello world",
+            .snippet = "hello",
+            .category = .conversation,
+            .keyword_rank = 1,
+            .vector_score = null,
+            .final_score = 0.9,
+            .source = "primary",
+            .source_path = "memory://fact",
+            .start_line = 1,
+            .end_line = 1,
+            .created_at = 42,
+            .utility_score = 0.75,
+        },
+    };
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendMemorySearchResultsJson(&writer, &results);
+    const json = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"utility_score\":0.75") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"utility_score_source\":\"sqlite\"") != null);
+}
+
+test "memory get output labels sqlite-derived utility score" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try yc.memory.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("fact", "hello", .conversation, "s-1");
+    try yc.memory.SqliteMemory.recordRecallImpl(@ptrCast(&sqlite_mem), "fact");
+    try yc.memory.SqliteMemory.recordRecallImpl(@ptrCast(&sqlite_mem), "fact");
+    try yc.memory.SqliteMemory.recordSuccessImpl(@ptrCast(&sqlite_mem), "fact");
+    try yc.memory.SqliteMemory.recordSuccessImpl(@ptrCast(&sqlite_mem), "fact");
+
+    const entry = (try mem.get(allocator, "fact")).?;
+    defer entry.deinit(allocator);
+
+    var json_buf: [512]u8 = undefined;
+    var json_writer: std.Io.Writer = .fixed(&json_buf);
+    try writeMemoryEntryJsonWithUtility(&json_writer, entry, mem);
+    const json = json_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"utility_score_source\":\"sqlite\"") != null);
+
+    const text_rendered = try yc.admin_output.renderBytes(allocator, appendMemoryEntryUtilityText, .{ entry, mem });
+    defer allocator.free(text_rendered);
+    try std.testing.expect(std.mem.indexOf(u8, text_rendered, "sqlite-derived") != null);
+}
+
+test "memory list output labels utility per entry" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try yc.memory.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("fact-a", "alpha", .conversation, null);
+    try mem.store("fact-b", "beta", .core, null);
+
+    const entries = try mem.list(allocator, null, null);
+    defer yc.memory.freeEntries(allocator, entries);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+
+    var buf: [1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try appendMemoryListJsonWithUtility(&writer, entries, mem, entries.len, false);
+    const json = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"utility_score\"") != null);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, json, "\"utility_score_source\":\"sqlite\""),
+    );
+}
+
+test "memory utility output labels neutral fallback for non-sqlite backend" {
+    const allocator = std.testing.allocator;
+    var lru_mem = yc.memory.InMemoryLruMemory.init(allocator, 100);
+    defer lru_mem.deinit();
+    const mem = lru_mem.memory();
+
+    try mem.store("fact", "hello", .conversation, "s-1");
+
+    const entry = (try mem.get(allocator, "fact")).?;
+    defer entry.deinit(allocator);
+
+    var get_json_buf: [512]u8 = undefined;
+    var get_json_writer: std.Io.Writer = .fixed(&get_json_buf);
+    try writeMemoryEntryJsonWithUtility(&get_json_writer, entry, mem);
+    const get_json = get_json_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"utility_score\":0.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"utility_score_source\":\"neutral_fallback\"") != null);
+
+    const get_text = try yc.admin_output.renderBytes(allocator, appendMemoryEntryUtilityText, .{ entry, mem });
+    defer allocator.free(get_text);
+    try std.testing.expect(std.mem.indexOf(u8, get_text, "neutral fallback") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_text, "sqlite-derived") == null);
+
+    const entries = try mem.list(allocator, null, null);
+    defer yc.memory.freeEntries(allocator, entries);
+
+    var list_json_buf: [512]u8 = undefined;
+    var list_json_writer: std.Io.Writer = .fixed(&list_json_buf);
+    try appendMemoryListJsonWithUtility(&list_json_writer, entries, mem, entries.len, false);
+    const list_json = list_json_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, list_json, "\"utility_score\":0.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_json, "\"utility_score_source\":\"neutral_fallback\"") != null);
 }
 
 test "appendAgentSessionTerminationJson renders terminated session payload" {
