@@ -8,6 +8,8 @@ const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
 const log = std.log.scoped(.agent);
+const log_judge = std.log.scoped(.agent_judge);
+const log_reflect = std.log.scoped(.agent_reflection);
 const Config = @import("../config.zig").Config;
 const config_types = @import("../config_types.zig");
 const providers = @import("../providers/root.zig");
@@ -91,6 +93,14 @@ pub const DrainCallback = *const fn (ctx: *anyopaque, allocator: std.mem.Allocat
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const Agent = struct {
+    const ReflectionLlmCallResult = struct {
+        verdict: ?reflection.ReflectionResult = null,
+        est_prompt_tokens: u32 = 0,
+        est_completion_tokens: u32 = 0,
+        duration_ms: u64 = 0,
+        provider_error: bool = false,
+    };
+
     const TextPreview = struct {
         slice: []const u8,
         truncated: bool,
@@ -331,6 +341,9 @@ pub const Agent = struct {
     turn_tool_failure_seen: bool = false,
     /// Count of finishTurnReflection invocations (observability + tests).
     reflection_turn_invocations: usize = 0,
+    /// Per-turn estimated reflection/judge token usage (not billed to session totals).
+    reflection_estimated_tokens: usize = 0,
+    reflection_estimated_cost_usd: f64 = 0.0,
     token_limit: u64 = 0,
     token_limit_override: ?u64 = null,
     max_tokens: u32 = max_tokens_resolver.DEFAULT_MODEL_MAX_TOKENS,
@@ -2012,20 +2025,67 @@ pub const Agent = struct {
         };
     }
 
+    fn recordReflectionEstimate(self: *Agent, model: []const u8, prompt_toks: u32, completion_toks: u32) void {
+        self.reflection_estimated_tokens += prompt_toks + completion_toks;
+        const usage = providers.TokenUsage{
+            .prompt_tokens = prompt_toks,
+            .completion_tokens = completion_toks,
+            .total_tokens = prompt_toks +| completion_toks,
+        };
+        self.reflection_estimated_cost_usd += cost_mod.TokenUsage.fromProviders(model, usage).cost();
+    }
+
+    fn runReflectionLlmCall(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        model: []const u8,
+        reflection_prompt: []const u8,
+    ) ReflectionLlmCallResult {
+        const start_ms = std_compat.time.milliTimestamp();
+        const response = self.provider.chatWithSystem(arena, null, reflection_prompt, model, 0.0) catch {
+            const duration_ms: u64 = @intCast(@max(0, std_compat.time.milliTimestamp() - start_ms));
+            return .{ .duration_ms = duration_ms, .provider_error = true };
+        };
+        const duration_ms: u64 = @intCast(@max(0, std_compat.time.milliTimestamp() - start_ms));
+        const est_prompt = estimate_text_tokens(reflection_prompt);
+        const est_completion = estimate_text_tokens(response);
+        self.recordReflectionEstimate(model, est_prompt, est_completion);
+        const capped_len = @min(response.len, reflection.MAX_RESPONSE_BYTES);
+        const capped = response[0..capped_len];
+        const verdict = reflection.parseReflectionResult(arena, capped);
+        return .{
+            .verdict = verdict,
+            .est_prompt_tokens = est_prompt,
+            .est_completion_tokens = est_completion,
+            .duration_ms = duration_ms,
+        };
+    }
+
     fn applyReflectionVerdict(self: *Agent, arena: std.mem.Allocator, verdict: ?reflection.ReflectionResult, outcome: TurnOutcome) void {
         if (verdict) |v| {
             if (v.worth_saving) {
-                const sanitized = reflection.sanitizeLesson(arena, v.lesson) catch null;
+                const sanitized: ?[]const u8 = reflection.sanitizeLesson(arena, v.lesson) catch blk: {
+                    log_reflect.warn("lesson sanitize failed", .{});
+                    break :blk null;
+                };
                 if (sanitized) |sanitize| {
-                    if (reflection.lessonPassesQualityGate(sanitize) and
-                        self.reflection_lessons_saved < reflection.MAX_LESSONS_PER_SESSION and
-                        self.mem != null)
-                    {
+                    if (!reflection.lessonPassesQualityGate(sanitize)) {
+                        log_reflect.warn("lesson quality gate rejected", .{});
+                    } else if (self.reflection_lessons_saved >= reflection.MAX_LESSONS_PER_SESSION) {
+                        log_reflect.warn("lesson session cap rejected", .{});
+                    } else if (self.mem == null) {
+                        log_reflect.warn("lesson not saved memory absent", .{});
+                    } else {
                         const key = std.fmt.allocPrint(arena, "lesson:{x}", .{std.hash.Wyhash.hash(0, sanitize)}) catch null;
                         if (key) |lesson_key| {
                             if (self.mem.?.store(lesson_key, sanitize, .{ .custom = reflection.LESSON_CATEGORY }, self.memory_session_id)) |_| {
                                 self.reflection_lessons_saved += 1;
-                            } else |_| {}
+                                log_reflect.debug("lesson saved lessons_saved={d}", .{self.reflection_lessons_saved});
+                            } else |_| {
+                                log_reflect.warn("lesson store failed", .{});
+                            }
+                        } else {
+                            log_reflect.warn("lesson key alloc failed", .{});
                         }
                     }
                 }
@@ -2034,19 +2094,31 @@ pub const Agent = struct {
 
         if (outcome == .success and self.last_recalled_top_key != null and self.mem_rt != null) {
             const is_logic_fail = if (verdict) |v| v.failure_class == .logic else true;
-            if (!is_logic_fail) self.mem_rt.?.recordSuccess(self.last_recalled_top_key.?);
+            if (!is_logic_fail) {
+                self.mem_rt.?.recordSuccess(self.last_recalled_top_key.?);
+                log_reflect.debug("success attribution applied", .{});
+            } else {
+                const reason: []const u8 = if (verdict == null) "null_verdict" else @tagName(verdict.?.failure_class);
+                log_reflect.debug("success attribution withheld reason={s}", .{reason});
+            }
         }
     }
 
     fn finishTurnReflection(self: *Agent, arena: std.mem.Allocator, outcome: TurnOutcome) void {
-        if (!self.reflect_after_turn) return;
+        if (!self.reflect_after_turn) {
+            log_reflect.debug("reflection skipped reason=disabled", .{});
+            return;
+        }
 
         self.reflection_turn_invocations += 1;
 
         const has_learning_signal = self.turn_tool_failure_seen or
             outcome == .exhausted or
             self.last_recalled_top_key != null;
-        if (!has_learning_signal) return;
+        if (!has_learning_signal) {
+            log_reflect.debug("reflection skipped reason=no_learning_signal", .{});
+            return;
+        }
 
         const user_goal = self.lastTurnUserGoalFromHistory() orelse "agent turn";
         const ctx = reflection.ReflectionContext{
@@ -2057,9 +2129,23 @@ pub const Agent = struct {
         };
 
         const model = self.reflect_model orelse self.model_name;
-        const verdict: ?reflection.ReflectionResult = reflection.reflectOnTurn(arena, self.provider, model, ctx) catch null;
+        const reflection_prompt = reflection.buildReflectionPrompt(arena, ctx) catch {
+            log_reflect.warn("reflection prompt build failed", .{});
+            self.applyReflectionVerdict(arena, null, outcome);
+            return;
+        };
+        const call = self.runReflectionLlmCall(arena, model, reflection_prompt);
+        const est_tokens = call.est_prompt_tokens + call.est_completion_tokens;
+        log_reflect.debug("reflection invoked model={s} duration_ms={d} estimated_tokens={d}", .{ model, call.duration_ms, est_tokens });
+        if (call.verdict == null) {
+            if (call.provider_error) {
+                log_reflect.warn("reflection verdict null reason=provider_error duration_ms={d}", .{call.duration_ms});
+            } else {
+                log_reflect.warn("reflection verdict null reason=parse_fail duration_ms={d} estimated_tokens={d}", .{ call.duration_ms, est_tokens });
+            }
+        }
 
-        self.applyReflectionVerdict(arena, verdict, outcome);
+        self.applyReflectionVerdict(arena, call.verdict, outcome);
     }
 
     fn isStreamingTurn(self: *const Agent) bool {
@@ -2090,15 +2176,12 @@ pub const Agent = struct {
         arena: std.mem.Allocator,
         ctx: reflection.ReflectionContext,
         want_completion_judge: bool,
-    ) ?reflection.ReflectionResult {
+    ) ReflectionLlmCallResult {
         self.reflection_turn_invocations += 1;
 
-        const reflection_prompt = reflection.buildReflectionPromptForJudge(arena, ctx, want_completion_judge) catch return null;
+        const reflection_prompt = reflection.buildReflectionPromptForJudge(arena, ctx, want_completion_judge) catch return .{};
         const model = self.reflect_model orelse self.model_name;
-        const response = self.provider.chatWithSystem(arena, null, reflection_prompt, model, 0.0) catch return null;
-        const capped_len = @min(response.len, reflection.MAX_RESPONSE_BYTES);
-        const capped = response[0..capped_len];
-        return reflection.parseReflectionResult(arena, capped);
+        return self.runReflectionLlmCall(arena, model, reflection_prompt);
     }
 
     fn candidateMadeProgressForJudge(self: *Agent, candidate_text: []const u8) bool {
@@ -2179,6 +2262,8 @@ pub const Agent = struct {
         defer self.resetTurnToolTrace();
         self.context_was_compacted = false;
         self.judge_continue_count = 0;
+        self.reflection_estimated_tokens = 0;
+        self.reflection_estimated_cost_usd = 0.0;
         self.last_judged_candidate_hash = 0;
         self.last_judged_tool_trace_len = 0;
         commands.refreshSubagentToolContext(self);
@@ -2922,30 +3007,52 @@ pub const Agent = struct {
                 var judge_verdict_for_finalize: ?reflection.ReflectionResult = null;
                 var judge_force_logic_failure = false;
 
-                if (should_reflect_for_judge) {
-                    const ctx = self.buildReflectionContextForCandidate(final_text);
-                    judge_verdict_for_finalize = self.reflectOnTurnForJudge(arena, ctx, true);
-                    if (judge_verdict_for_finalize) |verdict| {
-                        if (!verdict.goal_achieved) {
-                            if (judge_continue_eligible) {
-                                if (self.candidateMadeProgressForJudge(final_text)) {
-                                    try self.appendJudgeContinuationMessages(display_text, verdict.continue_reason);
-                                    self.context_was_compacted = candidate_context_was_compacted;
-                                    self.allocator.free(final_text);
-                                    self.allocator.free(base_text);
-                                    self.freeResponseFields(&response);
-                                    self.judge_continue_count += 1;
-                                    last_judge_incomplete = true;
-                                    continue;
+                if (judge_enabled) {
+                    if (should_reflect_for_judge) {
+                        const ctx = self.buildReflectionContextForCandidate(final_text);
+                        const judge_call = self.reflectOnTurnForJudge(arena, ctx, true);
+                        const judge_model = self.reflect_model orelse self.model_name;
+                        const judge_est_tokens = judge_call.est_prompt_tokens + judge_call.est_completion_tokens;
+                        log_judge.debug("judge invoked model={s} duration_ms={d} estimated_tokens={d}", .{ judge_model, judge_call.duration_ms, judge_est_tokens });
+                        judge_verdict_for_finalize = judge_call.verdict;
+                        if (judge_verdict_for_finalize) |verdict| {
+                            if (!verdict.goal_achieved) {
+                                if (judge_continue_eligible) {
+                                    if (self.candidateMadeProgressForJudge(final_text)) {
+                                        log_judge.debug("judge decision continue", .{});
+                                        try self.appendJudgeContinuationMessages(display_text, verdict.continue_reason);
+                                        self.context_was_compacted = candidate_context_was_compacted;
+                                        self.allocator.free(final_text);
+                                        self.allocator.free(base_text);
+                                        self.freeResponseFields(&response);
+                                        self.judge_continue_count += 1;
+                                        last_judge_incomplete = true;
+                                        continue;
+                                    }
+                                    log_judge.warn("judge no progress force fail", .{});
+                                    judge_force_logic_failure = true;
+                                } else {
+                                    log_judge.warn("judge ineligible force fail", .{});
+                                    judge_force_logic_failure = true;
                                 }
-                                judge_force_logic_failure = true;
                             } else {
-                                judge_force_logic_failure = true;
+                                log_judge.debug("judge stop goal achieved", .{});
+                            }
+                        } else {
+                            if (judge_call.provider_error) {
+                                log_judge.warn("judge verdict null reason=provider_error", .{});
+                            } else {
+                                log_judge.warn("judge verdict null reason=parse_fail", .{});
                             }
                         }
+                    } else if (last_judge_incomplete) {
+                        log_judge.warn("judge ineligible force fail", .{});
+                        judge_force_logic_failure = true;
+                    } else {
+                        log_judge.debug("judge ineligible reason=cap_or_budget continue_count={d} max={d}", .{ self.judge_continue_count, self.max_judge_continuations });
                     }
-                } else if (judge_enabled and last_judge_incomplete) {
-                    judge_force_logic_failure = true;
+                } else if (self.judge_after_turn and is_streaming) {
+                    log_judge.debug("judge skipped reason=streaming", .{});
                 }
 
                 self.context_was_compacted = false;
@@ -11273,7 +11380,7 @@ const ReflectionTurnProvider = struct {
 
         return switch (self.mode) {
             .final_only => try finalResponse(allocator, model, "ok"),
-            .failed_tool_then_final => if (self.chat_calls == 1)
+            .failed_tool_then_final => if ((self.chat_calls % 2) == 1)
                 try toolResponse(allocator, model, "reflection_fail_probe")
             else
                 try finalResponse(allocator, model, "done after failed tool"),
@@ -12083,6 +12190,7 @@ const JudgeLoopProvider = struct {
     capture_alloc: std.mem.Allocator,
     chat_calls: usize = 0,
     reflection_calls: usize = 0,
+    fail_reflection: bool = false,
     chat_responses: []const []const u8 = &.{ "candidate-1", "candidate-2", "candidate-3" },
     reflection_responses: []const []const u8 = &.{},
     captured_reflection_prompt: ?[]u8 = null,
@@ -12150,6 +12258,7 @@ const JudgeLoopProvider = struct {
     ) anyerror![]const u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.reflection_calls += 1;
+        if (self.fail_reflection) return error.JudgeProviderFailure;
         if (self.captured_reflection_prompt) |old| self.capture_alloc.free(old);
         self.captured_reflection_prompt = try self.capture_alloc.dupe(u8, message);
         return allocator.dupe(u8, self.reflectionResponseText());
@@ -12593,6 +12702,265 @@ test "judge_incomplete_withholds_success_attribution" {
     try std.testing.expectEqual(@as(usize, 1), provider_state.reflection_calls);
     try std.testing.expectEqual(@as(usize, 0), recorder.count);
     try std.testing.expect(recorder.last_key == null);
+}
+
+// ── reflection/judge estimate accounting (C2 RED) tests ──────────────
+
+test "reflection_estimate_after_turn_records_tokens_and_cost" {
+    const allocator = std.testing.allocator;
+    var provider_state = ReflectionLearningProvider{};
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var agent = try reflectionLearningMakeAgent(allocator, provider_state.provider(), mem);
+    defer agent.deinit();
+    agent.turn_tool_failure_seen = true;
+
+    reflectionLearningFinish(allocator, &agent, .degraded);
+
+    try std.testing.expectEqual(@as(usize, 1), provider_state.reflection_calls);
+    try std.testing.expect(agent.reflection_estimated_tokens > 0);
+    try std.testing.expect(agent.reflection_estimated_cost_usd > 0.0);
+}
+
+test "reflection_estimate_after_turn_keeps_real_usage_unchanged" {
+    const allocator = std.testing.allocator;
+    var provider_state = ReflectionLearningProvider{};
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var agent = try reflectionLearningMakeAgent(allocator, provider_state.provider(), mem);
+    defer agent.deinit();
+    agent.turn_tool_failure_seen = true;
+    agent.total_tokens = 1234;
+    agent.total_cost_usd = 0.567;
+    agent.last_turn_usage = .{ .prompt_tokens = 100, .completion_tokens = 50, .total_tokens = 150 };
+
+    reflectionLearningFinish(allocator, &agent, .degraded);
+
+    try std.testing.expectEqual(@as(u64, 1234), agent.total_tokens);
+    try std.testing.expectEqual(@as(f64, 0.567), agent.total_cost_usd);
+    try std.testing.expectEqual(@as(u32, 150), agent.last_turn_usage.total_tokens);
+    try std.testing.expect(agent.reflection_estimated_tokens > 0);
+    try std.testing.expect(agent.reflection_estimated_cost_usd > 0.0);
+}
+
+test "reflection_estimate_failed_after_turn_chat_does_not_advance" {
+    const allocator = std.testing.allocator;
+    var provider_state = ReflectionLearningProvider{ .fail_reflection = true };
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var agent = try reflectionLearningMakeAgent(allocator, provider_state.provider(), mem);
+    defer agent.deinit();
+    agent.turn_tool_failure_seen = true;
+
+    reflectionLearningFinish(allocator, &agent, .degraded);
+
+    try std.testing.expectEqual(@as(usize, 1), provider_state.reflection_calls);
+    try std.testing.expectEqual(@as(usize, 0), agent.reflection_estimated_tokens);
+    try std.testing.expectEqual(@as(f64, 0.0), agent.reflection_estimated_cost_usd);
+}
+
+test "reflection_estimate_after_turn_bad_json_still_estimates" {
+    const allocator = std.testing.allocator;
+    var provider_state = ReflectionLearningProvider{ .response = "{not-json" };
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var agent = try reflectionLearningMakeAgent(allocator, provider_state.provider(), mem);
+    defer agent.deinit();
+    agent.turn_tool_failure_seen = true;
+
+    reflectionLearningFinish(allocator, &agent, .degraded);
+
+    try std.testing.expectEqual(@as(usize, 1), provider_state.reflection_calls);
+    try std.testing.expectEqual(@as(usize, 0), agent.reflection_lessons_saved);
+    try std.testing.expect(agent.reflection_estimated_tokens > 0);
+}
+
+test "reflection_estimate_judge_keeps_tokens_used_separate" {
+    const allocator = std.testing.allocator;
+    var provider_state = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .reflection_responses = &.{judge_verdict_achieved},
+    };
+    defer provider_state.deinitState();
+
+    var cfg = judgeLoopConfig(allocator, true, 4, 1);
+    var observer = RecordingObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, null, observer.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("separate usage");
+    defer allocator.free(response);
+
+    const expected_turn_tokens = estimate_text_tokens("candidate-1");
+    try std.testing.expect(agent.reflection_estimated_tokens > 0);
+    try std.testing.expectEqual(@as(u32, expected_turn_tokens), agent.last_turn_usage.total_tokens);
+    try std.testing.expectEqual(@as(u64, expected_turn_tokens), observer.tokens_used_metric_total);
+}
+
+test "reflection_estimate_judge_failed_chat_does_not_advance" {
+    const allocator = std.testing.allocator;
+    var provider_state = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .fail_reflection = true,
+        .reflection_responses = &.{judge_verdict_achieved},
+    };
+    defer provider_state.deinitState();
+
+    var cfg = judgeLoopConfig(allocator, true, 4, 1);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, null, noop.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("failed judge chat");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("candidate-1", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.reflection_calls);
+    try std.testing.expectEqual(@as(usize, 0), agent.reflection_estimated_tokens);
+    try std.testing.expectEqual(@as(f64, 0.0), agent.reflection_estimated_cost_usd);
+}
+
+test "reflection_estimate_resets_per_turn" {
+    const allocator = std.testing.allocator;
+    var provider_state = ReflectionTurnProvider{ .mode = .failed_tool_then_final, .capture_alloc = allocator };
+    defer provider_state.deinitState();
+
+    var failure_tool = ReflectionFailureTool{};
+    const tool_list = [_]Tool{failure_tool.tool()};
+
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var cfg = reflectionTurnConfig(allocator, true, 4);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), tool_list[0..], mem, noop.observer(), null);
+    defer agent.deinit();
+
+    const first = try agent.turn("turn one");
+    defer allocator.free(first);
+    const after_turn_one = agent.reflection_estimated_tokens;
+    try std.testing.expect(after_turn_one > 0);
+
+    const second = try agent.turn("turn two");
+    defer allocator.free(second);
+
+    try std.testing.expectEqual(@as(usize, 2), provider_state.reflection_calls);
+    try std.testing.expect(agent.reflection_estimated_tokens > 0);
+    try std.testing.expectEqual(after_turn_one, agent.reflection_estimated_tokens);
+}
+
+test "reflection_estimate_judge_continuation_accumulates_within_turn" {
+    const allocator = std.testing.allocator;
+    var provider_state = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .reflection_responses = &.{ judge_verdict_incomplete, judge_verdict_achieved },
+    };
+    defer provider_state.deinitState();
+
+    var cfg = judgeLoopConfig(allocator, true, 4, 2);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, null, noop.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("accumulate within turn");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("candidate-2", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.reflection_calls);
+    try std.testing.expect(agent.reflection_estimated_tokens > 0);
+
+    var single_provider = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .reflection_responses = &.{judge_verdict_achieved},
+    };
+    defer single_provider.deinitState();
+
+    var single_agent = try Agent.fromConfigWithProfile(allocator, &cfg, single_provider.provider(), &.{}, null, noop.observer(), null);
+    defer single_agent.deinit();
+
+    const single_response = try single_agent.turn("single judge call");
+    defer allocator.free(single_response);
+
+    try std.testing.expectEqual(@as(usize, 1), single_provider.reflection_calls);
+    try std.testing.expect(single_agent.reflection_estimated_tokens > 0);
+    try std.testing.expect(agent.reflection_estimated_tokens > single_agent.reflection_estimated_tokens);
+}
+
+// ── reflection/judge decision branches (C1 RED) tests ────────────────
+
+test "judge_null_verdict_on_provider_failure" {
+    const allocator = std.testing.allocator;
+    var provider_state = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .fail_reflection = true,
+    };
+    defer provider_state.deinitState();
+
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var recorder = ReflectionLearningSuccessRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+    var rt = reflectionLearningRuntime(allocator, mem, &recorder);
+
+    var cfg = judgeLoopConfig(allocator, true, 4, 1);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, mem, noop.observer(), null);
+    agent.mem_rt = &rt;
+    defer agent.deinit();
+    try reflectionLearningSetLastRecalledKey(&agent, "memory:judge-provider-fail");
+
+    const response = try agent.turn("provider failure");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("candidate-1", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.reflection_calls);
+    try std.testing.expectEqual(@as(usize, 0), recorder.count);
+    try std.testing.expect(recorder.last_key == null);
+}
+
+test "judge_null_verdict_on_parse_failure" {
+    const allocator = std.testing.allocator;
+    var provider_state = JudgeLoopProvider{
+        .capture_alloc = allocator,
+        .reflection_responses = &.{"{not-json"},
+    };
+    defer provider_state.deinitState();
+
+    var cfg = judgeLoopConfig(allocator, true, 4, 2);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_state.provider(), &.{}, null, noop.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("parse failure");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("candidate-1", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.reflection_calls);
+}
+
+test "lesson_not_saved_when_memory_absent" {
+    const allocator = std.testing.allocator;
+    var provider_state = ReflectionLearningProvider{};
+    var agent = try reflectionLearningMakeAgent(allocator, provider_state.provider(), null);
+    defer agent.deinit();
+    agent.turn_tool_failure_seen = true;
+
+    reflectionLearningFinish(allocator, &agent, .degraded);
+
+    try std.testing.expectEqual(@as(usize, 1), provider_state.reflection_calls);
+    try std.testing.expectEqual(@as(usize, 0), agent.reflection_lessons_saved);
 }
 
 fn redactionFromConfigAllocationTest(allocator: std.mem.Allocator) !void {

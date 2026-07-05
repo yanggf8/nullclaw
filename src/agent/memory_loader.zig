@@ -1,4 +1,5 @@
 const std = @import("std");
+const log_reflect = std.log.scoped(.agent_reflection);
 const memory_mod = @import("../memory/root.zig");
 const multimodal = @import("../multimodal.zig");
 const util = @import("../util.zig");
@@ -153,6 +154,9 @@ pub fn loadContext(
             defer allocator.free(sanitized);
             try w.print("- {s}: {s}\n", .{ entry.key, sanitized });
             appended += 1;
+            if (tier == .lesson) {
+                log_reflect.debug("lesson recalled appended={d} tier={s} session_scoped={}", .{ appended, @tagName(tier), session_id != null });
+            }
             if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
         }
         if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
@@ -241,6 +245,9 @@ pub fn loadContextWithRuntime(
             defer allocator.free(sanitized);
             try w.print("- {s}: {s}\n", .{ cand.key, sanitized });
             appended += 1;
+            if (tier == .lesson) {
+                log_reflect.debug("lesson recalled appended={d} tier={s} session_scoped={}", .{ appended, @tagName(tier), session_id != null });
+            }
             if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
         }
         if (appended < DEFAULT_RECALL_LIMIT and buf.items.len < MAX_CONTEXT_BYTES) {
@@ -258,6 +265,9 @@ pub fn loadContextWithRuntime(
                     defer allocator.free(sanitized);
                     try w.print("- {s}: {s}\n", .{ entry.key, sanitized });
                     appended += 1;
+                    if (tier == .lesson) {
+                        log_reflect.debug("lesson recalled appended={d} tier={s} session_scoped={}", .{ appended, @tagName(tier), session_id != null });
+                    }
                     if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
                 }
             }
