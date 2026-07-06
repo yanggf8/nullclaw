@@ -221,7 +221,10 @@ fn runCanaryArm(
     const arm_name: []const u8 = if (is_baseline) "baseline" else "treatment";
     const class_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ scratch_base, @tagName(class) });
     defer allocator.free(class_dir);
-    try std_compat.fs.makeDirAbsolute(class_dir);
+    std_compat.fs.makeDirAbsolute(class_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
 
     const arm_ws = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ class_dir, arm_name });
     defer allocator.free(arm_ws);
@@ -333,19 +336,23 @@ pub fn run(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     defer allocator.free(summary);
 
     const model = cfg.default_model orelse return error.NoDefaultModel;
-    const verdict = try provider.chatWithSystem(
+
+    var buf: [8192]u8 = undefined;
+    var bw = std_compat.fs.File.stdout().writer(&buf);
+    const w = &bw.interface;
+
+    if (provider.chatWithSystem(
         allocator,
         "You are evaluating a nullclaw self-improvement canary. Give a concise GO/NO-GO verdict with reasoning from the metrics.",
         summary,
         model,
         0.0,
-    );
-    defer allocator.free(verdict);
-
-    var buf: [8192]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
-    const w = &bw.interface;
-    try w.print("{s}\n\n", .{verdict});
+    )) |verdict| {
+        defer allocator.free(verdict);
+        try w.print("{s}\n\n", .{verdict});
+    } else |err| {
+        try w.print("(LLM verdict unavailable: {s} — showing raw metrics)\n\n", .{@errorName(err)});
+    }
     try w.print("{s}\n", .{summary});
     try w.flush();
 }
