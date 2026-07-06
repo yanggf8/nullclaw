@@ -864,6 +864,10 @@ pub const MemoryRuntime = struct {
         }
     }
 
+    pub fn primaryDbPath(self: *const MemoryRuntime) ?[]const u8 {
+        return if (self._db_path) |p| std.mem.span(p) else null;
+    }
+
     pub fn deinit(self: *MemoryRuntime) void {
         // Best-effort: drain any pending vector sync operations before teardown.
         // Must happen while embedding provider, vector store, and circuit breaker
