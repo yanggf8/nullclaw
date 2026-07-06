@@ -6,7 +6,7 @@
 
 ## Why v1's metric was invalid
 
-v1 compared the loops' INTERNAL counters (`reflection_estimated_tokens`) between arms. Baseline has the loops OFF, so its reflection tokens are always 0 — the comparison measures "did the loop run," not "did it help." The v1 LLM verdict flagged this itself: "the baseline isn't a working control, it's an inert placeholder." A naive alternative — pre-seed a lesson and check the answer contains it — is ALSO invalid: Codex confirmed memory recall (`enrichMessageWithRuntime`, root.zig:2488) is NOT gated by the loop flags, so both arms would recall a pre-seeded lesson equally. Both measure recall-in-general or loop-ran, not loop-impact.
+v1 compared the loops' INTERNAL counters (`reflection_estimated_tokens`) between arms. Baseline has the loops OFF, so its reflection tokens are always 0 — the comparison measures "did the loop run," not "did it help." The v1 LLM verdict flagged this itself: "the baseline isn't a working control, it's an inert placeholder." A naive alternative — pre-seed a lesson and check the answer contains it — is ALSO invalid: Codex confirmed memory recall (`enrichMessageWithRuntime`, root.zig:2489) is NOT gated by the loop flags, so both arms would recall a pre-seeded lesson equally. Both measure recall-in-general or loop-ran, not loop-impact.
 
 ## What v2 measures — the closed loop, mechanically
 
@@ -16,6 +16,12 @@ The loops' actual job: `reflect_after_turn` SAVES a lesson after a learning-sign
 - **Turn B** — a memory-dependent prompt, same agent/session. After the turn, read the agent's `last_recalled_top_key` (set from `topRecalledKey` after memory enrichment, root.zig:2495-2497): `turn_b_recalled_lesson = (key != null AND std.mem.startsWith(key, "lesson:"))`. The `lesson:` prefix is the reliable discriminator (root.zig:2087 stores lessons as `lesson:{hash}`; memory_loader.zig:70 treats `lesson:` keys as lessons). Treatment recalls the lesson it saved; baseline has none, so `key == null` (or not a lesson).
 
 **Shared objective outcome** `loop_closed: bool = turn_a_saved AND turn_b_recalled_lesson`. Treatment should be true, baseline false — a valid, mechanical pass/fail caused by the loop, with NO dependence on the LLM echoing a marker (the rejected marker-in-answer approach depended on two model-compliance hopes: reflection preserving the token, then Turn B echoing it).
+
+**RELIABILITY (corroboration #4 — the make-or-break):** there is NO source guarantee that a tool-failure Turn A saves a lesson — reflection may legitimately return `worth_saving=false` (root.zig:2073/2074), or the sanitized lesson may fail `lessonPassesQualityGate` (reflection.zig:108). So `turn_a_saved=false` does NOT mean the machinery is broken; it means "no lesson worth saving this run." The verdict MUST split these:
+- `turn_a_saved == false` (treatment) → report as `reflection_no_save` / `induce_did_not_produce_lesson` — an inconclusive/flaky-induce signal, NOT `loop_never_closed`.
+- `turn_a_saved == true AND turn_b_recalled_lesson == false` (treatment) → THAT is the real save→recall machinery failure → `loop_never_closed`.
+De-risk the induce: engineer Turn A's prompt so reflection is very likely to return a durable `worth_saving` lesson (concrete, specific tool-boundary lesson), but treat this as probabilistic, not guaranteed. Corroborate `turn_a_saved` with `memory.list(.custom="lesson")` after Turn A (the canary already lists lesson entries, canary.zig:285) — belt-and-suspenders with the `reflection_lessons_saved` delta.
+**Also required:** REMOVE the current pre-seed of `"canary-topic"` for the memory-dependent case (canary.zig:243) — with a pre-seeded lesson, BASELINE would also have a lesson to recall, invalidating the control. The primary closed-loop case must start with an EMPTY scratch memory so only treatment's Turn-A-saved lesson exists.
 
 The `reflection_estimated_tokens` / `lessons_saved` counters remain — as DIAGNOSTICS (did the loop fire, what did it cost), not the comparison axis.
 
@@ -35,10 +41,11 @@ New `ArmMetrics` fields: `turn_a_saved: bool`, `turn_b_recalled_lesson: bool`, `
 
 ## Verdict & kill signals
 
-Primary axis = `loop_closed` per arm. Rewritten kill signals:
-- `loop_never_closed` (hard NO-GO): treatment `loop_closed == false` — the save→recall chain failed even with flags on (machinery broken).
-- `no_arm_difference`: treatment and baseline have the SAME `loop_closed` — the loop makes no observable difference.
-- `token_blowup` (kept, now a real diagnostic): compares the actual turn cost (`last_turn_usage`, same-shape for both arms) treatment vs baseline > factor. NOT the old reflection-token-vs-0.
+Primary axis = `loop_closed` per arm. Rewritten kill signals (corroboration #4/#5 applied):
+- `reflection_no_save` (inconclusive, NOT a hard NO-GO): treatment `turn_a_saved == false` — the induce turn didn't produce a saveable lesson this run (reflection said not-worth-saving or quality-gate rejected). Signals a flaky/weak induce prompt, not broken machinery. Re-run or strengthen the induce.
+- `loop_never_closed` (hard NO-GO): treatment `turn_a_saved == true AND turn_b_recalled_lesson == false` — a lesson WAS saved but Turn B failed to recall it. THIS is the real save→recall machinery failure.
+- `no_arm_difference`: treatment and baseline have the SAME `loop_closed` (both true or both false) — the loop makes no observable difference.
+- `token_blowup` (diagnostic): compares total loop cost treatment vs baseline > factor. Total cost per arm = `last_turn_usage` (main-turn tokens, root.zig:390) ACCUMULATED across Turn A + Turn B PLUS `reflection_estimated_tokens` (the loop's extra calls — root.zig:2036/2060, which are NOT in last_turn_usage). last_turn_usage after Turn B is only the most recent turn, so the impl must SUM Turn A + Turn B main-turn usage into ArmMetrics. Baseline reflection_estimated_tokens is 0 (loops off), so this compares real added cost — a valid diagnostic, unlike v1's reflection-token-vs-0-as-primary.
 Drop v1's `judge_never_fired` / `no_useful_lessons` as PRIMARY signals (counter-based proxies); keep as diagnostics in the summary.
 
 The LLM verdict (`provider.chatWithSystem`, now working after the 20a2206a escaping fix) still writes the natural-language GO/NO-GO — now fed the `loop_closed` outcomes + diagnostics, so it reasons from a VALID comparison. buildMetricsSummary renders the new outcome fields.
