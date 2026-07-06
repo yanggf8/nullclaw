@@ -101,6 +101,14 @@ pub const Agent = struct {
         provider_error: bool = false,
     };
 
+    pub const ReflectionMetrics = struct {
+        reflection_estimated_tokens: usize,
+        reflection_estimated_cost_usd: f64,
+        judge_continue_count: u8,
+        reflection_lessons_saved: usize,
+        reflection_turn_invocations: usize,
+    };
+
     const TextPreview = struct {
         slice: []const u8,
         truncated: bool,
@@ -4314,6 +4322,19 @@ pub const Agent = struct {
     /// Get current history length.
     pub fn historyLen(self: *const Agent) usize {
         return self.history.items.len;
+    }
+
+    /// Snapshot of the reflection/judge counters for diagnostics and canary runs.
+    /// estimated_tokens/estimated_cost_usd/judge_continue_count reset at turn start;
+    /// reflection_lessons_saved and reflection_turn_invocations are Agent-lifetime counters.
+    pub fn reflectionMetrics(self: *const Agent) ReflectionMetrics {
+        return .{
+            .reflection_estimated_tokens = self.reflection_estimated_tokens,
+            .reflection_estimated_cost_usd = self.reflection_estimated_cost_usd,
+            .judge_continue_count = self.judge_continue_count,
+            .reflection_lessons_saved = self.reflection_lessons_saved,
+            .reflection_turn_invocations = self.reflection_turn_invocations,
+        };
     }
 
     /// Load persisted messages into history (for session restore).
@@ -11462,6 +11483,26 @@ fn reflectionTurnConfig(allocator: std.mem.Allocator, reflect_after_turn: bool, 
     cfg.agent.reflect_after_turn = reflect_after_turn;
     cfg.agent.max_tool_iterations = max_tool_iterations;
     return cfg;
+}
+
+test "reflectionMetrics returns reflection counter snapshot" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.reflection_estimated_tokens = 123;
+    agent.reflection_estimated_cost_usd = 0.045;
+    agent.judge_continue_count = 2;
+    agent.reflection_lessons_saved = 3;
+    agent.reflection_turn_invocations = 4;
+
+    const metrics = agent.reflectionMetrics();
+
+    try std.testing.expectEqual(@as(usize, 123), metrics.reflection_estimated_tokens);
+    try std.testing.expectEqual(@as(f64, 0.045), metrics.reflection_estimated_cost_usd);
+    try std.testing.expectEqual(@as(u8, 2), metrics.judge_continue_count);
+    try std.testing.expectEqual(@as(usize, 3), metrics.reflection_lessons_saved);
+    try std.testing.expectEqual(@as(usize, 4), metrics.reflection_turn_invocations);
 }
 
 test "judge_turn_state_resets_at_turn_start" {
