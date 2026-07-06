@@ -99,6 +99,7 @@ pub const skillforge = @import("skillforge.zig");
 pub const verbose = @import("verbose.zig");
 pub const tunnel = @import("tunnel.zig");
 pub const voice = @import("voice.zig");
+pub const canary = @import("canary.zig");
 
 test {
     // Run tests from all imported modules

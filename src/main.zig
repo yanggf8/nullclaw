@@ -40,6 +40,7 @@ const Command = enum {
     mcp,
     auth,
     update,
+    canary,
     help,
 };
 
@@ -72,6 +73,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\  status       Show system status
     \\  version      Show CLI version
     \\  doctor       Run diagnostics
+    \\  canary       Run self-improvement canary
     \\  cron         Manage scheduled tasks
     \\  channel      Manage channels (Telegram, Discord, Slack, ...)
     \\  skills       Manage skills
@@ -140,6 +142,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "-V", .version },
         .{ "onboard", .onboard },
         .{ "doctor", .doctor },
+        .{ "canary", .canary },
         .{ "cron", .cron },
         .{ "channel", .channel },
         .{ "skills", .skills },
@@ -252,6 +255,7 @@ pub fn main(init: std.process.Init) !void {
         .mcp => try runMcp(allocator, sub_args),
         .auth => try runAuth(allocator, sub_args),
         .update => try runUpdate(allocator, sub_args),
+        .canary => try yc.canary.run(allocator, sub_args),
     }
 }
 
@@ -7077,6 +7081,7 @@ test "parse known commands" {
     try std.testing.expectEqual(.models, parseCommand("models").?);
     try std.testing.expectEqual(.auth, parseCommand("auth").?);
     try std.testing.expectEqual(.update, parseCommand("update").?);
+    try std.testing.expectEqual(.canary, parseCommand("canary").?);
     try std.testing.expect(parseCommand("daemon") == null);
     try std.testing.expect(parseCommand("unknown") == null);
 }
