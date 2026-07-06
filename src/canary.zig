@@ -152,6 +152,20 @@ pub fn buildMetricsSummary(allocator: std.mem.Allocator, report: CanaryReport) !
         try w.print("  treatment reflection_estimated_tokens: {d}\n", .{r.treatment.reflection.reflection_estimated_tokens});
         try w.print("  treatment lesson_count: {d}\n", .{r.treatment.lesson_count});
         try w.print("  treatment judge_continue_count: {d}\n", .{r.treatment.reflection.judge_continue_count});
+        try w.print("  [{s}] baseline: turn_a_saved={} turn_b_recalled_lesson={} loop_closed={} main_turn_tokens={d}\n", .{
+            @tagName(r.class),
+            r.baseline.turn_a_saved,
+            r.baseline.turn_b_recalled_lesson,
+            r.baseline.loop_closed,
+            r.baseline.main_turn_tokens,
+        });
+        try w.print("  [{s}] treatment: turn_a_saved={} turn_b_recalled_lesson={} loop_closed={} main_turn_tokens={d}\n", .{
+            @tagName(r.class),
+            r.treatment.turn_a_saved,
+            r.treatment.turn_b_recalled_lesson,
+            r.treatment.loop_closed,
+            r.treatment.main_turn_tokens,
+        });
     }
 
     try w.print("\nTotal baseline tokens: {d}\n", .{baseline_token_total});
@@ -189,11 +203,19 @@ const CanaryFailTool = struct {
 
 const lesson_category: memory.MemoryCategory = .{ .custom = "lesson" };
 
-fn promptForClass(class: CanaryInputClass) []const u8 {
+fn inducePromptForClass(class: CanaryInputClass) []const u8 {
     return switch (class) {
         .tool_failure => "You must call the canary_fail tool once to complete this task. Do not answer without calling it.",
-        .memory_dependent => "Recall what you know about the canary test topic from memory and answer based on that lesson.",
+        .memory_dependent => "Canary memory drill. Call the canary_fail tool exactly once. When it fails, do not retry it. State this durable lesson to remember: the canary_fail tool always rejects the request, so for the canary-topic task answer the follow-up directly from the saved lesson instead of retrying canary_fail.",
         .simple_qa => "What is 2+2? Reply with just the number.",
+    };
+}
+
+fn recallPromptForClass(class: CanaryInputClass) []const u8 {
+    return switch (class) {
+        .tool_failure => "Briefly state whether the previous canary_fail attempt produced a useful lesson. Do not call tools.",
+        .memory_dependent => "Canary-topic follow-up. Using any recalled memory, state the durable lesson learned about the canary_fail tool. Answer from the saved lesson; do not call any tool.",
+        .simple_qa => "What is 3+3? Reply with just the number.",
     };
 }
 
@@ -227,15 +249,6 @@ fn runCanaryArm(
     var rt = try initScratchMemoryRuntime(allocator, &cfg.memory, arm_ws);
     defer rt.deinit();
 
-    if (class == .memory_dependent) {
-        try rt.memory.store(
-            "canary-topic",
-            "The canary test answer is 42.",
-            lesson_category,
-            null,
-        );
-    }
-
     var fail_tool = CanaryFailTool{};
     const tool_list = [_]Tool{fail_tool.tool()};
 
@@ -261,28 +274,56 @@ fn runCanaryArm(
     agent.policy = &policy;
     agent.mem_rt = &rt;
 
-    const prompt = promptForClass(class);
+    const lessons_before = agent.reflectionMetrics().reflection_lessons_saved;
+
     const start_ms = std_compat.time.milliTimestamp();
-    const resp = try agent.turn(prompt);
-    defer allocator.free(resp);
+
+    const resp_a = try agent.turn(inducePromptForClass(class));
+    defer allocator.free(resp_a);
+    const turn_a_tokens: usize = @intCast(agent.last_turn_usage.total_tokens);
+
+    const post_a = agent.reflectionMetrics();
+    const refl_tokens_a = post_a.reflection_estimated_tokens;
+    const refl_cost_a = post_a.reflection_estimated_cost_usd;
+
+    const lessons_list = try rt.memory.list(allocator, lesson_category, null);
+    defer memory.freeEntries(allocator, lessons_list);
+
+    const turn_a_saved = (post_a.reflection_lessons_saved > lessons_before) and (lessons_list.len > 0);
+
+    const resp_b = try agent.turn(recallPromptForClass(class));
+    defer allocator.free(resp_b);
+    const turn_b_tokens: usize = @intCast(agent.last_turn_usage.total_tokens);
+
     const end_ms = std_compat.time.milliTimestamp();
 
-    const reflection = agent.reflectionMetrics();
-
-    const entries = try rt.memory.list(allocator, lesson_category, null);
-    defer memory.freeEntries(allocator, entries);
+    const post_b = agent.reflectionMetrics();
+    const turn_b_recalled_lesson = post_b.recalled_lesson;
+    const loop_closed = turn_a_saved and turn_b_recalled_lesson;
+    const main_turn_tokens = turn_a_tokens + turn_b_tokens;
 
     var max_utility: f32 = 0.5;
-    for (entries) |entry| {
+    for (lessons_list) |entry| {
         if (entry.utility_score > max_utility) max_utility = entry.utility_score;
     }
 
     return .{
-        .reflection = reflection,
-        .response_len = resp.len,
-        .lesson_count = entries.len,
+        .reflection = .{
+            .reflection_estimated_tokens = refl_tokens_a + post_b.reflection_estimated_tokens,
+            .reflection_estimated_cost_usd = refl_cost_a + post_b.reflection_estimated_cost_usd,
+            .judge_continue_count = post_b.judge_continue_count,
+            .reflection_lessons_saved = post_b.reflection_lessons_saved,
+            .reflection_turn_invocations = post_b.reflection_turn_invocations,
+            .recalled_lesson = post_b.recalled_lesson,
+        },
+        .main_turn_tokens = main_turn_tokens,
+        .response_len = resp_a.len + resp_b.len,
+        .lesson_count = lessons_list.len,
         .max_lesson_utility_score = max_utility,
         .duration_ms = if (end_ms >= start_ms) @intCast(end_ms - start_ms) else 0,
+        .turn_a_saved = turn_a_saved,
+        .turn_b_recalled_lesson = turn_b_recalled_lesson,
+        .loop_closed = loop_closed,
     };
 }
 
@@ -724,6 +765,63 @@ test "buildMetricsSummary includes token and kill-signal info" {
     try std.testing.expect(std.mem.indexOf(u8, summary, "token") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "50") != null or std.mem.indexOf(u8, summary, "200") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "token_blowup") != null or std.mem.indexOf(u8, summary, "blowup") != null);
+}
+
+test "buildMetricsSummary renders v2 loop outcome fields" {
+    const allocator = std.testing.allocator;
+
+    const results = [_]CanaryInputResult{
+        .{
+            .class = .memory_dependent,
+            .baseline = .{
+                .reflection = .{
+                    .reflection_estimated_tokens = 50,
+                    .reflection_estimated_cost_usd = 0,
+                    .judge_continue_count = 0,
+                    .reflection_lessons_saved = 0,
+                    .reflection_turn_invocations = 0,
+                },
+                .main_turn_tokens = 100,
+                .turn_a_saved = false,
+                .turn_b_recalled_lesson = false,
+                .loop_closed = false,
+            },
+            .treatment = .{
+                .reflection = .{
+                    .reflection_estimated_tokens = 80,
+                    .reflection_estimated_cost_usd = 0,
+                    .judge_continue_count = 0,
+                    .reflection_lessons_saved = 1,
+                    .reflection_turn_invocations = 1,
+                },
+                .main_turn_tokens = 120,
+                .turn_a_saved = true,
+                .turn_b_recalled_lesson = true,
+                .loop_closed = true,
+            },
+        },
+    };
+
+    const report: CanaryReport = .{
+        .results = &results,
+        .kills = .{},
+    };
+
+    const summary = try buildMetricsSummary(allocator, report);
+    defer allocator.free(summary);
+
+    // GREEN impl (commit 3) must render these exact field labels per arm.
+    try std.testing.expect(std.mem.indexOf(u8, summary, "turn_a_saved") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "turn_b_recalled_lesson") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "loop_closed") != null);
+
+    // Both arms' bool values must appear (baseline false, treatment true).
+    try std.testing.expect(std.mem.indexOf(u8, summary, "turn_a_saved=false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "turn_a_saved=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "loop_closed=false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "loop_closed=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "turn_b_recalled_lesson=false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "turn_b_recalled_lesson=true") != null);
 }
 
 test "buildMetricsSummary handles empty results" {
