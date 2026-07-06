@@ -56,7 +56,6 @@ pub fn initScratchMemoryRuntime(
 }
 
 pub const TOKEN_BLOWUP_FACTOR: f64 = 3.0;
-pub const JUDGE_LOOP_MIN_INPUTS: usize = 2;
 
 pub const CanaryInputClass = enum {
     tool_failure,
@@ -66,10 +65,14 @@ pub const CanaryInputClass = enum {
 
 pub const ArmMetrics = struct {
     reflection: Agent.ReflectionMetrics,
+    main_turn_tokens: usize = 0,
     response_len: usize = 0,
     lesson_count: usize = 0,
     max_lesson_utility_score: f32 = 0.5,
     duration_ms: u64 = 0,
+    turn_a_saved: bool = false,
+    turn_b_recalled_lesson: bool = false,
+    loop_closed: bool = false,
 };
 
 pub const CanaryInputResult = struct {
@@ -79,62 +82,46 @@ pub const CanaryInputResult = struct {
 };
 
 pub const KillSignalOptions = struct {
-    judge_enabled: bool = true,
-    max_judge_continuations: u8 = 1,
     token_blowup_factor: f64 = TOKEN_BLOWUP_FACTOR,
 };
 
 pub const KillSignalEvaluation = struct {
-    judge_never_fired: bool = false,
-    no_useful_lessons: bool = false,
+    reflection_no_save: bool = false,
+    loop_never_closed: bool = false,
+    no_arm_difference: bool = false,
     token_blowup: bool = false,
     token_blowup_ratio: ?f64 = null,
-    judge_continuation_loop: bool = false,
 
     pub fn any(self: @This()) bool {
-        return self.judge_never_fired or self.no_useful_lessons or self.token_blowup or self.judge_continuation_loop;
+        return self.reflection_no_save or self.loop_never_closed or self.no_arm_difference or self.token_blowup;
     }
 };
 
 pub fn evaluateKillSignals(results: []const CanaryInputResult, opts: KillSignalOptions) KillSignalEvaluation {
-    var baseline_token_sum: usize = 0;
-    var treatment_token_sum: usize = 0;
-    var no_useful_lessons = false;
-    var judge_continuation_loop_count: usize = 0;
-    var all_judge_zero = true;
+    var baseline_total: usize = 0;
+    var treatment_total: usize = 0;
+    var eval: KillSignalEvaluation = .{};
 
     for (results) |r| {
-        baseline_token_sum += r.baseline.reflection.reflection_estimated_tokens;
-        treatment_token_sum += r.treatment.reflection.reflection_estimated_tokens;
+        baseline_total += r.baseline.main_turn_tokens + r.baseline.reflection.reflection_estimated_tokens;
+        treatment_total += r.treatment.main_turn_tokens + r.treatment.reflection.reflection_estimated_tokens;
 
-        if (r.class == .tool_failure and
-            r.treatment.reflection.reflection_turn_invocations > 0 and
-            r.treatment.lesson_count == 0)
-        {
-            no_useful_lessons = true;
-        }
-
-        if (r.treatment.reflection.judge_continue_count >= opts.max_judge_continuations) {
-            judge_continuation_loop_count += 1;
-        }
-
-        if (r.treatment.reflection.judge_continue_count != 0) {
-            all_judge_zero = false;
+        if (r.class == .memory_dependent) {
+            if (!r.treatment.turn_a_saved) {
+                eval.reflection_no_save = true;
+            } else if (!r.treatment.turn_b_recalled_lesson) {
+                eval.loop_never_closed = true;
+            } else if (r.treatment.loop_closed == r.baseline.loop_closed) {
+                eval.no_arm_difference = true;
+            }
         }
     }
 
-    var eval: KillSignalEvaluation = .{
-        .no_useful_lessons = no_useful_lessons,
-        .judge_continuation_loop = judge_continuation_loop_count >= JUDGE_LOOP_MIN_INPUTS,
-    };
-
-    if (baseline_token_sum > 0) {
-        const ratio = @as(f64, @floatFromInt(treatment_token_sum)) / @as(f64, @floatFromInt(baseline_token_sum));
+    if (baseline_total > 0) {
+        const ratio = @as(f64, @floatFromInt(treatment_total)) / @as(f64, @floatFromInt(baseline_total));
         eval.token_blowup_ratio = ratio;
         eval.token_blowup = ratio > opts.token_blowup_factor;
     }
-
-    eval.judge_never_fired = opts.judge_enabled and all_judge_zero and treatment_token_sum == 0;
 
     return eval;
 }
@@ -172,10 +159,10 @@ pub fn buildMetricsSummary(allocator: std.mem.Allocator, report: CanaryReport) !
 
     const kills = report.kills;
     try w.writeAll("\nKill signals:\n");
+    try w.print("  reflection_no_save={}\n", .{kills.reflection_no_save});
+    try w.print("  loop_never_closed={}\n", .{kills.loop_never_closed});
+    try w.print("  no_arm_difference={}\n", .{kills.no_arm_difference});
     try w.print("  token_blowup={}\n", .{kills.token_blowup});
-    try w.print("  no_useful_lessons={}\n", .{kills.no_useful_lessons});
-    try w.print("  judge_never_fired={}\n", .{kills.judge_never_fired});
-    try w.print("  judge_continuation_loop={}\n", .{kills.judge_continuation_loop});
     if (kills.token_blowup_ratio) |ratio| {
         try w.print("  token_blowup_ratio={d:.2}\n", .{ratio});
     }
@@ -449,98 +436,160 @@ test "initScratchMemoryRuntime isolates db under scratch" {
     try std.testing.expect(std.mem.endsWith(u8, db_path, "memory.db"));
 }
 
-test "evaluateKillSignals clean run has no signals" {
-    const results = [_]CanaryInputResult{
+test "evaluateKillSignals v2 signal table" {
+    const empty_refl = Agent.ReflectionMetrics{
+        .reflection_estimated_tokens = 0,
+        .reflection_estimated_cost_usd = 0,
+        .judge_continue_count = 0,
+        .reflection_lessons_saved = 0,
+        .reflection_turn_invocations = 0,
+    };
+
+    const RatioExpect = union(enum) {
+        skip,
+        is_null,
+        approx: f64,
+    };
+
+    const Case = struct {
+        name: []const u8,
+        class: CanaryInputClass = .memory_dependent,
+        baseline: ArmMetrics,
+        treatment: ArmMetrics,
+        opts: KillSignalOptions = .{},
+        expect_any: bool,
+        expect_reflection_no_save: bool,
+        expect_loop_never_closed: bool,
+        expect_no_arm_difference: bool,
+        expect_token_blowup: bool,
+        ratio_expect: RatioExpect = .skip,
+    };
+
+    const cases = [_]Case{
         .{
-            .class = .tool_failure,
+            .name = "clean",
             .baseline = .{
-                .reflection = .{
-                    .reflection_estimated_tokens = 50,
-                    .reflection_estimated_cost_usd = 0,
-                    .judge_continue_count = 0,
-                    .reflection_lessons_saved = 0,
-                    .reflection_turn_invocations = 0,
-                },
+                .main_turn_tokens = 100,
+                .reflection = empty_refl,
+                .turn_a_saved = false,
+                .turn_b_recalled_lesson = false,
+                .loop_closed = false,
             },
             .treatment = .{
+                .main_turn_tokens = 120,
                 .reflection = .{
-                    .reflection_estimated_tokens = 100,
+                    .reflection_estimated_tokens = 30,
+                    .reflection_estimated_cost_usd = 0,
+                    .judge_continue_count = 0,
+                    .reflection_lessons_saved = 1,
+                    .reflection_turn_invocations = 1,
+                    .recalled_lesson = true,
+                },
+                .turn_a_saved = true,
+                .turn_b_recalled_lesson = true,
+                .loop_closed = true,
+            },
+            .expect_any = false,
+            .expect_reflection_no_save = false,
+            .expect_loop_never_closed = false,
+            .expect_no_arm_difference = false,
+            .expect_token_blowup = false,
+            .ratio_expect = .{ .approx = 1.5 },
+        },
+        .{
+            .name = "reflection_no_save",
+            .baseline = .{
+                .main_turn_tokens = 50,
+                .reflection = empty_refl,
+                .turn_a_saved = false,
+                .turn_b_recalled_lesson = false,
+                .loop_closed = false,
+            },
+            .treatment = .{
+                .main_turn_tokens = 60,
+                .reflection = .{
+                    .reflection_estimated_tokens = 10,
                     .reflection_estimated_cost_usd = 0,
                     .judge_continue_count = 0,
                     .reflection_lessons_saved = 0,
                     .reflection_turn_invocations = 1,
                 },
-                .lesson_count = 1,
+                .turn_a_saved = false,
+                .turn_b_recalled_lesson = false,
+                .loop_closed = false,
             },
+            .expect_any = true,
+            .expect_reflection_no_save = true,
+            .expect_loop_never_closed = false,
+            .expect_no_arm_difference = false,
+            .expect_token_blowup = false,
         },
         .{
-            .class = .simple_qa,
+            .name = "loop_never_closed",
             .baseline = .{
-                .reflection = .{
-                    .reflection_estimated_tokens = 50,
-                    .reflection_estimated_cost_usd = 0,
-                    .judge_continue_count = 0,
-                    .reflection_lessons_saved = 0,
-                    .reflection_turn_invocations = 0,
-                },
+                .main_turn_tokens = 50,
+                .reflection = empty_refl,
+                .turn_a_saved = false,
+                .turn_b_recalled_lesson = false,
+                .loop_closed = false,
             },
             .treatment = .{
-                .reflection = .{
-                    .reflection_estimated_tokens = 100,
-                    .reflection_estimated_cost_usd = 0,
-                    .judge_continue_count = 0,
-                    .reflection_lessons_saved = 0,
-                    .reflection_turn_invocations = 0,
-                },
-            },
-        },
-    };
-
-    const eval = evaluateKillSignals(&results, .{});
-    try std.testing.expect(!eval.any());
-    try std.testing.expect(!eval.judge_never_fired);
-    try std.testing.expect(!eval.no_useful_lessons);
-    try std.testing.expect(!eval.token_blowup);
-    try std.testing.expect(!eval.judge_continuation_loop);
-    try std.testing.expect(eval.token_blowup_ratio != null);
-    try std.testing.expect(eval.token_blowup_ratio.? < TOKEN_BLOWUP_FACTOR);
-}
-
-test "evaluateKillSignals flags no_useful_lessons" {
-    const results = [_]CanaryInputResult{
-        .{
-            .class = .tool_failure,
-            .baseline = .{
+                .main_turn_tokens = 60,
                 .reflection = .{
                     .reflection_estimated_tokens = 10,
                     .reflection_estimated_cost_usd = 0,
                     .judge_continue_count = 0,
-                    .reflection_lessons_saved = 0,
-                    .reflection_turn_invocations = 0,
-                },
-            },
-            .treatment = .{
-                .reflection = .{
-                    .reflection_estimated_tokens = 20,
-                    .reflection_estimated_cost_usd = 0,
-                    .judge_continue_count = 0,
-                    .reflection_lessons_saved = 0,
+                    .reflection_lessons_saved = 1,
                     .reflection_turn_invocations = 1,
                 },
-                .lesson_count = 0,
+                .turn_a_saved = true,
+                .turn_b_recalled_lesson = false,
+                .loop_closed = false,
             },
+            .expect_any = true,
+            .expect_reflection_no_save = false,
+            .expect_loop_never_closed = true,
+            .expect_no_arm_difference = false,
+            .expect_token_blowup = false,
         },
-    };
-
-    const eval = evaluateKillSignals(&results, .{});
-    try std.testing.expect(eval.no_useful_lessons);
-}
-
-test "evaluateKillSignals flags token_blowup" {
-    const results = [_]CanaryInputResult{
         .{
+            .name = "no_arm_difference",
+            .baseline = .{
+                .main_turn_tokens = 80,
+                .reflection = empty_refl,
+                .turn_a_saved = true,
+                .turn_b_recalled_lesson = true,
+                .loop_closed = true,
+            },
+            .treatment = .{
+                .main_turn_tokens = 90,
+                .reflection = .{
+                    .reflection_estimated_tokens = 10,
+                    .reflection_estimated_cost_usd = 0,
+                    .judge_continue_count = 0,
+                    .reflection_lessons_saved = 1,
+                    .reflection_turn_invocations = 1,
+                    .recalled_lesson = true,
+                },
+                .turn_a_saved = true,
+                .turn_b_recalled_lesson = true,
+                .loop_closed = true,
+            },
+            .expect_any = true,
+            .expect_reflection_no_save = false,
+            .expect_loop_never_closed = false,
+            .expect_no_arm_difference = true,
+            .expect_token_blowup = false,
+        },
+        .{
+            .name = "token_blowup",
             .class = .simple_qa,
             .baseline = .{
+                .main_turn_tokens = 100,
+                .reflection = empty_refl,
+            },
+            .treatment = .{
+                .main_turn_tokens = 250,
                 .reflection = .{
                     .reflection_estimated_tokens = 100,
                     .reflection_estimated_cost_usd = 0,
@@ -549,79 +598,23 @@ test "evaluateKillSignals flags token_blowup" {
                     .reflection_turn_invocations = 0,
                 },
             },
-            .treatment = .{
-                .reflection = .{
-                    .reflection_estimated_tokens = 301,
-                    .reflection_estimated_cost_usd = 0,
-                    .judge_continue_count = 0,
-                    .reflection_lessons_saved = 0,
-                    .reflection_turn_invocations = 0,
-                },
-            },
+            .opts = .{ .token_blowup_factor = 3.0 },
+            .expect_any = true,
+            .expect_reflection_no_save = false,
+            .expect_loop_never_closed = false,
+            .expect_no_arm_difference = false,
+            .expect_token_blowup = true,
+            .ratio_expect = .{ .approx = 3.5 },
         },
-    };
-
-    const eval = evaluateKillSignals(&results, .{ .token_blowup_factor = TOKEN_BLOWUP_FACTOR });
-    try std.testing.expect(eval.token_blowup);
-    try std.testing.expect(eval.token_blowup_ratio != null);
-    try std.testing.expect(eval.token_blowup_ratio.? > TOKEN_BLOWUP_FACTOR);
-}
-
-test "evaluateKillSignals flags judge_continuation_loop" {
-    const results = [_]CanaryInputResult{
         .{
+            .name = "baseline_zero",
             .class = .simple_qa,
             .baseline = .{
-                .reflection = .{
-                    .reflection_estimated_tokens = 10,
-                    .reflection_estimated_cost_usd = 0,
-                    .judge_continue_count = 0,
-                    .reflection_lessons_saved = 0,
-                    .reflection_turn_invocations = 0,
-                },
+                .main_turn_tokens = 0,
+                .reflection = empty_refl,
             },
             .treatment = .{
-                .reflection = .{
-                    .reflection_estimated_tokens = 20,
-                    .reflection_estimated_cost_usd = 0,
-                    .judge_continue_count = 1,
-                    .reflection_lessons_saved = 0,
-                    .reflection_turn_invocations = 0,
-                },
-            },
-        },
-        .{
-            .class = .memory_dependent,
-            .baseline = .{
-                .reflection = .{
-                    .reflection_estimated_tokens = 10,
-                    .reflection_estimated_cost_usd = 0,
-                    .judge_continue_count = 0,
-                    .reflection_lessons_saved = 0,
-                    .reflection_turn_invocations = 0,
-                },
-            },
-            .treatment = .{
-                .reflection = .{
-                    .reflection_estimated_tokens = 20,
-                    .reflection_estimated_cost_usd = 0,
-                    .judge_continue_count = 1,
-                    .reflection_lessons_saved = 0,
-                    .reflection_turn_invocations = 0,
-                },
-            },
-        },
-    };
-
-    const eval = evaluateKillSignals(&results, .{});
-    try std.testing.expect(eval.judge_continuation_loop);
-}
-
-test "evaluateKillSignals judge_never_fired best effort" {
-    const results = [_]CanaryInputResult{
-        .{
-            .class = .simple_qa,
-            .baseline = .{
+                .main_turn_tokens = 50,
                 .reflection = .{
                     .reflection_estimated_tokens = 50,
                     .reflection_estimated_cost_usd = 0,
@@ -630,71 +623,38 @@ test "evaluateKillSignals judge_never_fired best effort" {
                     .reflection_turn_invocations = 0,
                 },
             },
-            .treatment = .{
-                .reflection = .{
-                    .reflection_estimated_tokens = 0,
-                    .reflection_estimated_cost_usd = 0,
-                    .judge_continue_count = 0,
-                    .reflection_lessons_saved = 0,
-                    .reflection_turn_invocations = 0,
-                },
-            },
-        },
-        .{
-            .class = .tool_failure,
-            .baseline = .{
-                .reflection = .{
-                    .reflection_estimated_tokens = 50,
-                    .reflection_estimated_cost_usd = 0,
-                    .judge_continue_count = 0,
-                    .reflection_lessons_saved = 0,
-                    .reflection_turn_invocations = 0,
-                },
-            },
-            .treatment = .{
-                .reflection = .{
-                    .reflection_estimated_tokens = 0,
-                    .reflection_estimated_cost_usd = 0,
-                    .judge_continue_count = 0,
-                    .reflection_lessons_saved = 0,
-                    .reflection_turn_invocations = 0,
-                },
-            },
+            .expect_any = false,
+            .expect_reflection_no_save = false,
+            .expect_loop_never_closed = false,
+            .expect_no_arm_difference = false,
+            .expect_token_blowup = false,
+            .ratio_expect = .is_null,
         },
     };
 
-    const eval = evaluateKillSignals(&results, .{ .judge_enabled = true });
-    try std.testing.expect(eval.judge_never_fired);
-}
+    for (cases) |c| {
+        const results = [_]CanaryInputResult{.{
+            .class = c.class,
+            .baseline = c.baseline,
+            .treatment = c.treatment,
+        }};
+        const eval = evaluateKillSignals(&results, c.opts);
 
-test "evaluateKillSignals baseline zero tokens no blowup" {
-    const results = [_]CanaryInputResult{
-        .{
-            .class = .simple_qa,
-            .baseline = .{
-                .reflection = .{
-                    .reflection_estimated_tokens = 0,
-                    .reflection_estimated_cost_usd = 0,
-                    .judge_continue_count = 0,
-                    .reflection_lessons_saved = 0,
-                    .reflection_turn_invocations = 0,
-                },
-            },
-            .treatment = .{
-                .reflection = .{
-                    .reflection_estimated_tokens = 50,
-                    .reflection_estimated_cost_usd = 0,
-                    .judge_continue_count = 0,
-                    .reflection_lessons_saved = 0,
-                    .reflection_turn_invocations = 0,
-                },
-            },
-        },
-    };
+        try std.testing.expectEqual(c.expect_any, eval.any());
+        try std.testing.expectEqual(c.expect_reflection_no_save, eval.reflection_no_save);
+        try std.testing.expectEqual(c.expect_loop_never_closed, eval.loop_never_closed);
+        try std.testing.expectEqual(c.expect_no_arm_difference, eval.no_arm_difference);
+        try std.testing.expectEqual(c.expect_token_blowup, eval.token_blowup);
 
-    const eval = evaluateKillSignals(&results, .{});
-    try std.testing.expect(!eval.token_blowup);
-    try std.testing.expect(eval.token_blowup_ratio == null);
+        switch (c.ratio_expect) {
+            .skip => {},
+            .is_null => try std.testing.expect(eval.token_blowup_ratio == null),
+            .approx => |expected_ratio| {
+                try std.testing.expect(eval.token_blowup_ratio != null);
+                try std.testing.expectApproxEqAbs(expected_ratio, eval.token_blowup_ratio.?, 0.001);
+            },
+        }
+    }
 }
 
 test "buildMetricsSummary includes token and kill-signal info" {
