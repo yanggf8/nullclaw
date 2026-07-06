@@ -107,6 +107,7 @@ pub const Agent = struct {
         judge_continue_count: u8,
         reflection_lessons_saved: usize,
         reflection_turn_invocations: usize,
+        recalled_lesson: bool = false,
     };
 
     const TextPreview = struct {
@@ -4334,6 +4335,8 @@ pub const Agent = struct {
             .judge_continue_count = self.judge_continue_count,
             .reflection_lessons_saved = self.reflection_lessons_saved,
             .reflection_turn_invocations = self.reflection_turn_invocations,
+            .recalled_lesson = self.last_recalled_top_key != null and
+                std.mem.startsWith(u8, self.last_recalled_top_key.?, "lesson:"),
         };
     }
 
@@ -11503,6 +11506,17 @@ test "reflectionMetrics returns reflection counter snapshot" {
     try std.testing.expectEqual(@as(u8, 2), metrics.judge_continue_count);
     try std.testing.expectEqual(@as(usize, 3), metrics.reflection_lessons_saved);
     try std.testing.expectEqual(@as(usize, 4), metrics.reflection_turn_invocations);
+
+    // RED: recalled_lesson not yet exposed in ReflectionMetrics.
+    try std.testing.expectEqual(false, agent.reflectionMetrics().recalled_lesson);
+
+    if (agent.last_recalled_top_key) |old| agent.allocator.free(old);
+    agent.last_recalled_top_key = try agent.allocator.dupe(u8, "lesson:abc");
+    try std.testing.expectEqual(true, agent.reflectionMetrics().recalled_lesson);
+
+    if (agent.last_recalled_top_key) |old| agent.allocator.free(old);
+    agent.last_recalled_top_key = try agent.allocator.dupe(u8, "conversation:x");
+    try std.testing.expectEqual(false, agent.reflectionMetrics().recalled_lesson);
 }
 
 test "judge_turn_state_resets_at_turn_start" {
