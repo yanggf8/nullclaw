@@ -72,15 +72,30 @@ pub const AnthropicProvider = struct {
         model: []const u8,
         temperature: f64,
     ) ![]const u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        try buf.appendSlice(allocator, "{\"model\":");
+        try root.appendJsonString(&buf, allocator, model);
+        try buf.appendSlice(allocator, ",\"max_tokens\":");
+        var max_buf: [16]u8 = undefined;
+        const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{DEFAULT_MAX_TOKENS}) catch unreachable;
+        try buf.appendSlice(allocator, max_str);
+
         if (system_prompt) |sys| {
-            return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","max_tokens":{d},"system":"{s}","messages":[{{"role":"user","content":"{s}"}}],"temperature":{d:.2}}}
-            , .{ model, DEFAULT_MAX_TOKENS, sys, message, temperature });
-        } else {
-            return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","max_tokens":{d},"messages":[{{"role":"user","content":"{s}"}}],"temperature":{d:.2}}}
-            , .{ model, DEFAULT_MAX_TOKENS, message, temperature });
+            try buf.appendSlice(allocator, ",\"system\":");
+            try root.appendJsonString(&buf, allocator, sys);
         }
+
+        try buf.appendSlice(allocator, ",\"messages\":[{\"role\":\"user\",\"content\":");
+        try root.appendJsonString(&buf, allocator, message);
+        try buf.appendSlice(allocator, "}],\"temperature\":");
+        var temp_buf: [16]u8 = undefined;
+        const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch unreachable;
+        try buf.appendSlice(allocator, temp_str);
+        try buf.append(allocator, '}');
+
+        return try buf.toOwnedSlice(allocator);
     }
 
     /// Build the authorization header value based on credential type.
@@ -714,6 +729,37 @@ test "buildSimpleRequestBody with system prompt" {
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "system") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "You are helpful") != null);
+}
+
+test "buildSimpleRequestBody escapes quotes and newlines in message" {
+    const allocator = std.testing.allocator;
+    const system_prompt = "sys with \"quote\"";
+    const message = "say \"hello\"\nand bye";
+
+    const body = try AnthropicProvider.buildSimpleRequestBody(
+        allocator,
+        system_prompt,
+        message,
+        "claude-3-opus",
+        0.7,
+    );
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const root_obj = parsed.value.object;
+    const system_val = root_obj.get("system").?;
+    try std.testing.expect(system_val == .string);
+    try std.testing.expectEqualStrings(system_prompt, system_val.string);
+
+    const messages_val = root_obj.get("messages").?;
+    try std.testing.expect(messages_val == .array);
+    try std.testing.expectEqual(@as(usize, 1), messages_val.array.items.len);
+
+    const content_val = messages_val.array.items[0].object.get("content").?;
+    try std.testing.expect(content_val == .string);
+    try std.testing.expectEqualStrings(message, content_val.string);
 }
 
 test "parseTextResponse extracts text" {
