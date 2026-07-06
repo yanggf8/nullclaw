@@ -42,14 +42,27 @@ Same input, same scratch Memory config, same provider/model, non-streaming. Afte
 
 ### Isolation (SAFETY — the hard boundary; every leak vector from corroboration)
 
-The canary MUST, before constructing the Agent/tools:
-1. Load real config (`Config.load`) for the provider/credentials, then SANITIZE a copy:
-2. Override `cfg.workspace_dir` to a fresh temp dir (else it defaults to `~/.nullclaw/workspace` and writes there — `config_paths.zig:51`). This is separate from the initRuntime workspace arg and must be set BEFORE Agent/tools/scaffold.
-3. Force `cfg.memory.backend = "sqlite"` (postgres/redis/api ignore workspace_dir and would hit the real store — `registry.zig` needs_db_path=false). Disable memory sub-features that write sidecar DBs (response_cache/vectors/semantic_cache) or accept they land in the temp workspace.
-4. `initRuntime(alloc, &sanitized_cfg, temp_ws)` → `<temp_ws>/memory.db` (`memory/root.zig:1002`, `registry.zig:294`); wire BOTH `agent.mem` and `agent.mem_rt` (the recall learning signal needs `mem_rt`, not just `mem` — `root.zig:2487`).
-5. Use a MINIMAL tool set (no MCP/subagent/delegate tools — full `allTools` causes side effects / child processes).
-6. Do NOT set `stream_callback`/`stream_ctx` (CLI force-sets them; canary must stay non-streaming so the judge fires — `root.zig:2151`, `cli.zig:795`).
-Safety assertion: the canary records the resolved scratch db path and asserts it is under the temp dir, never `~/.nullclaw`. (No code path opens the real db when wired correctly; the failure mode is operator mis-wiring, which the assertion catches.)
+The canary MUST, before constructing the Agent/tools. **Corroborated correction: MUTATE the loaded Config in place** (do NOT make a by-value copy — a copy borrows `base`'s arena strings and dangles if base.deinit() runs; in-place keeps one `defer cfg.deinit()` owning the arena). `Config` fields live in `src/config.zig:196-262` (`.arena: ?*ArenaAllocator`, `.workspace_dir`, `.workspace_dir_override`, `.config_path`).
+
+Sanitize field set (ALL of these — corroboration found workspace_dir alone is insufficient; config_path derives daemon/session/token/audit/channel state via backfillRuntimeDerivedFields):
+```
+cfg.workspace_dir = scratch_ws;
+cfg.workspace_dir_override = scratch_ws;   // save() serializes from this; stale otherwise
+cfg.config_path = scratch_config_path;     // else daemon state / session claim / token ledger / audit dir / channel config_dirs point at real ~/.nullclaw
+cfg.memory.backend = "sqlite";             // postgres/redis/api ignore workspace_dir → would hit real store
+cfg.memory.auto_save = false;              // avoid unintended writes
+cfg.memory.search.store.sidecar_path = ""; // absolute sidecar path would bypass scratch
+cfg.memory.response_cache.enabled = false; // sidecar db under workspace
+cfg.memory.qmd.enabled = false;
+cfg.security.audit.log_path = "audit.log"; // relative → under scratch config dir, not absolute real path
+try cfg.backfillRuntimeDerivedFields();    // re-derives channel config_dirs etc. from new config_path
+cfg.syncFlatFields();
+```
+Then:
+- `initRuntime(alloc, &cfg.memory, scratch_ws)` (takes `*const MemoryConfig`, NOT full Config — corroborated) → `<scratch_ws>/memory.db` (`memory/root.zig:1002`, `registry.zig:294`); wire BOTH `agent.mem` and `agent.mem_rt` (recall learning signal needs `mem_rt` — `root.zig:2487`).
+- MINIMAL tool set — a local `CanaryFailTool` only; do NOT call `tools.allTools` (MCP/subagent/delegate side effects, child processes).
+- Do NOT set `stream_callback`/`stream_ctx` (CLI force-sets them at `cli.zig:795`; canary stays non-streaming so the judge fires — `root.zig:2151`).
+Safety assertion: read the resolved db path via a new `MemoryRuntime.primaryDbPath()` accessor and assert it starts with scratch_ws AND does not contain `/.nullclaw/`; abort before running if it fails. Failure mode is operator mis-wiring, caught by the assertion.
 
 ### Input classes (must actually exercise the loops)
 
