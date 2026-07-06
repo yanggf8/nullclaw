@@ -96,3 +96,15 @@ Use `builtin.is_test` guards to skip the live provider/turn in unit tests (proje
 ## Rollout
 
 Deliverable: `Agent.reflectionMetrics()` + snapshot struct, `src/canary.zig`, `main.zig` routing, and the `zig build test` coverage above. The first LIVE run (spends tokens, needs the real provider) is a separate gated step after the code lands, surfaced for explicit user go-ahead. Nothing enables the loops on the gateway.
+
+## Live-run findings (2026-07-06)
+
+The canary was built, merged, and run live (anthropic-custom → MiniMax-M3). It works end-to-end — isolation held (zero writes to `~/.nullclaw`), the loops fire, and the LLM verdict renders ("talks to you"). Three things the live runs surfaced:
+
+1. **Two live-path bugs (fixed, commit `02c443f7`):** the run path is `builtin.is_test`-guarded, so unit tests could not catch them. (a) Both arms of an input class derived the same `<scratch>/<class>` parent dir → `PathAlreadyExists` crash; made the parent-dir creation idempotent. (b) The verdict LLM call was a bare `try` → any provider error crashed the whole canary and discarded all metrics; made it degrade (print the metrics table + a "verdict unavailable" note).
+
+2. **Root-cause production bug the canary surfaced (fixed, commit `20a2206a`):** `AnthropicProvider.buildSimpleRequestBody` (the `chatWithSystem` path) interpolated the system/message into the request JSON as **raw `{s}`, unescaped**. Reflection/judge prompts embed a literal JSON example (quotes + newlines) → invalid JSON → endpoint rejects → `provider_error`. Normal turns via `chat()` work because they escape through `json_util.appendJsonString`. **This means the reflection/judge loops never worked on any provider using `chatWithSystem`** — the whole self-improvement feature was silently broken until a live canary run exposed it. Fixed by escaping. (`src/providers/vertex.zig` has the same buggy copy — separate fix still TODO.)
+
+3. **CANARY METRIC-DESIGN FLAW (open — v2 work):** the first complete run returned NO-GO, and the verdict correctly flagged why: the baseline arm has the flags OFF, so reflection never runs, so `baseline reflection_estimated_tokens` is **always 0**. Comparing treatment vs baseline *reflection tokens* measures whether the loop RAN, not whether it HELPS — an inert control. The `reflection_estimated_tokens`/`judge_continue_count` counters are **diagnostics** (did the loop fire, what did it cost), not a valid comparison axis. **Canary v2 must compare the arms on a SHARED OUTCOME** — did the answer improve / task succeed / did a recalled lesson change a later answer — with the loop counters used only as diagnostics. `token_blowup` (treatment vs baseline=0) is likewise degenerate as a comparison.
+
+**Status:** the canary tooling is proven working; the current NO-GO is methodologically correct ("this experiment cannot demonstrate improvement") but not yet a real finding about the loops. Next: canary v2 metric redesign (shared-outcome comparison), plus minor refinements (pace turns — 1/3 judge calls still transient-failed; a judge-invocation counter; the vertex.zig same-bug fix).
