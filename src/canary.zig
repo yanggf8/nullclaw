@@ -144,8 +144,8 @@ pub fn buildMetricsSummary(allocator: std.mem.Allocator, report: CanaryReport) !
     var treatment_token_total: usize = 0;
 
     for (report.results) |r| {
-        baseline_token_total += r.baseline.reflection.reflection_estimated_tokens;
-        treatment_token_total += r.treatment.reflection.reflection_estimated_tokens;
+        baseline_token_total += r.baseline.main_turn_tokens + r.baseline.reflection.reflection_estimated_tokens;
+        treatment_token_total += r.treatment.main_turn_tokens + r.treatment.reflection.reflection_estimated_tokens;
 
         try w.print("\n[{s}]\n", .{@tagName(r.class)});
         try w.print("  baseline reflection_estimated_tokens: {d}\n", .{r.baseline.reflection.reflection_estimated_tokens});
@@ -243,7 +243,7 @@ fn runCanaryArm(
     defer allocator.free(scratch_config_path);
 
     sanitizeConfigInPlace(cfg, arm_ws, scratch_config_path);
-    cfg.agent.judge_after_turn = !is_baseline;
+    cfg.agent.judge_after_turn = false;
     cfg.agent.reflect_after_turn = !is_baseline;
 
     var rt = try initScratchMemoryRuntime(allocator, &cfg.memory, arm_ws);
@@ -822,6 +822,56 @@ test "buildMetricsSummary renders v2 loop outcome fields" {
     try std.testing.expect(std.mem.indexOf(u8, summary, "loop_closed=true") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "turn_b_recalled_lesson=false") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "turn_b_recalled_lesson=true") != null);
+}
+
+test "buildMetricsSummary total tokens include main-turn tokens" {
+    const allocator = std.testing.allocator;
+
+    const results = [_]CanaryInputResult{
+        .{
+            .class = .memory_dependent,
+            .baseline = .{
+                .reflection = .{
+                    .reflection_estimated_tokens = 0,
+                    .reflection_estimated_cost_usd = 0,
+                    .judge_continue_count = 0,
+                    .reflection_lessons_saved = 0,
+                    .reflection_turn_invocations = 0,
+                },
+                .main_turn_tokens = 400,
+                .turn_a_saved = false,
+                .turn_b_recalled_lesson = false,
+                .loop_closed = false,
+            },
+            .treatment = .{
+                .reflection = .{
+                    .reflection_estimated_tokens = 30,
+                    .reflection_estimated_cost_usd = 0,
+                    .judge_continue_count = 0,
+                    .reflection_lessons_saved = 1,
+                    .reflection_turn_invocations = 1,
+                },
+                .main_turn_tokens = 500,
+                .turn_a_saved = true,
+                .turn_b_recalled_lesson = true,
+                .loop_closed = true,
+            },
+        },
+    };
+
+    const report: CanaryReport = .{
+        .results = &results,
+        .kills = .{},
+    };
+
+    const summary = try buildMetricsSummary(allocator, report);
+    defer allocator.free(summary);
+
+    // Total lines must sum main_turn_tokens + reflection_estimated_tokens (same basis as token_blowup).
+    // Treatment: 500 + 30 = 530; baseline: 400 + 0 = 400.
+    try std.testing.expect(std.mem.indexOf(u8, summary, "530") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "Total baseline tokens: 400") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "Total treatment tokens: 530") != null);
 }
 
 test "buildMetricsSummary handles empty results" {
