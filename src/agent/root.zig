@@ -12235,6 +12235,51 @@ test "apply_reflection_verdict_persists_quality_lesson_entry" {
     }
 }
 
+test "reflection_learning_seeded_lesson_recall_sets_recalled_metric" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "lesson:canarytopic",
+        "canarytopic rule answer followups directly from learned rule",
+        .{ .custom = reflection.LESSON_CATEGORY },
+        null,
+    );
+
+    var recorder = ReflectionLearningSuccessRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+    var rt = reflectionLearningRuntime(allocator, mem, &recorder);
+    rt._rollout_policy = .{ .mode = .off, .canary_percent = 0, .shadow_percent = 0 };
+
+    var provider_state = ReflectionLearningProvider{};
+    var agent = try reflectionLearningMakeAgent(allocator, provider_state.provider(), mem);
+    defer agent.deinit();
+
+    const recalled_key = memory_loader.topRecalledKey(allocator, &rt, "canarytopic followup", null) orelse
+        return error.TestExpectedLessonRecall;
+    defer allocator.free(recalled_key);
+
+    try std.testing.expectEqualStrings("lesson:canarytopic", recalled_key);
+
+    try reflectionLearningSetLastRecalledKey(&agent, recalled_key);
+    try std.testing.expectEqual(true, agent.reflectionMetrics().recalled_lesson);
+}
+
+test "reflection_learning_non_lesson_recalled_key_leaves_metric_false" {
+    const allocator = std.testing.allocator;
+    var provider_state = ReflectionLearningProvider{};
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    var agent = try reflectionLearningMakeAgent(allocator, provider_state.provider(), mem_backend.memory());
+    defer agent.deinit();
+
+    try reflectionLearningSetLastRecalledKey(&agent, "conversation:not-a-lesson");
+    try std.testing.expectEqual(false, agent.reflectionMetrics().recalled_lesson);
+}
+
 test "reflection_learning_no_recalled_key_does_not_credit" {
     const allocator = std.testing.allocator;
     var provider_state = ReflectionLearningProvider{
