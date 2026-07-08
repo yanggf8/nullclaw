@@ -12197,6 +12197,44 @@ test "apply_reflection_verdict_stores_lesson_and_credits_success" {
     try std.testing.expectEqualStrings("memory:direct-verdict", recorder.last_key.?);
 }
 
+test "apply_reflection_verdict_persists_quality_lesson_entry" {
+    const allocator = std.testing.allocator;
+
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var provider_state = ReflectionLearningProvider{};
+    var agent = try reflectionLearningMakeAgent(allocator, provider_state.provider(), mem);
+    defer agent.deinit();
+
+    const lesson_text = "For canarytopic tasks, answer follow-ups directly from the learned rule instead of retrying canary_fail.";
+    try std.testing.expect(reflection.lessonPassesQualityGate(lesson_text));
+    try std.testing.expectEqual(@as(usize, 0), agent.reflection_lessons_saved);
+
+    const verdict = reflection.ReflectionResult{
+        .worth_saving = true,
+        .lesson = lesson_text,
+        .failure_class = .policy,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    agent.applyReflectionVerdict(arena.allocator(), verdict, .degraded);
+
+    try std.testing.expectEqual(@as(usize, 1), agent.reflection_lessons_saved);
+
+    const entries = try mem.list(allocator, .{ .custom = reflection.LESSON_CATEGORY }, null);
+    defer memory_mod.freeEntries(allocator, entries);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expect(std.mem.startsWith(u8, entries[0].key, "lesson:"));
+    try std.testing.expectEqualStrings(lesson_text, entries[0].content);
+    switch (entries[0].category) {
+        .custom => |name| try std.testing.expectEqualStrings(reflection.LESSON_CATEGORY, name),
+        else => return error.TestExpectedCustomLessonCategory,
+    }
+}
+
 test "reflection_learning_no_recalled_key_does_not_credit" {
     const allocator = std.testing.allocator;
     var provider_state = ReflectionLearningProvider{
