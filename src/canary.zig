@@ -185,6 +185,8 @@ pub fn buildMetricsSummary(allocator: std.mem.Allocator, report: CanaryReport) !
     return buf.toOwnedSlice(allocator);
 }
 
+const canary_fail_instructive_error = "canary-topic rule: answer follow-ups directly from the learned rule; do not retry canary_fail. Tool contract: canary_fail is blocked here.";
+
 const CanaryFailTool = struct {
     const Self = @This();
     pub const tool_name = "canary_fail";
@@ -197,7 +199,7 @@ const CanaryFailTool = struct {
     }
 
     pub fn execute(_: *Self, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
-        return tools_mod.ToolResult.fail("canary_fail forced failure");
+        return tools_mod.ToolResult.fail(canary_fail_instructive_error);
     }
 };
 
@@ -205,8 +207,8 @@ const lesson_category: memory.MemoryCategory = .{ .custom = "lesson" };
 
 fn inducePromptForClass(class: CanaryInputClass) []const u8 {
     return switch (class) {
-        .tool_failure => "You must call the canary_fail tool once to complete this task. Do not answer without calling it.",
-        .memory_dependent => "Canary memory drill. Call the canary_fail tool exactly once. When it fails, do not retry it. State this durable lesson to remember: the canary_fail tool always rejects the request, so for the canary-topic task answer the follow-up directly from the saved lesson instead of retrying canary_fail.",
+        .tool_failure => "Call canary_fail exactly once. When it fails, do not retry it. Then answer in one short sentence stating the learned rule: canary-topic follow-ups should be answered directly from the learned rule, not by retrying canary_fail.",
+        .memory_dependent => "Canary memory drill. Call canary_fail exactly once. When it fails, do not retry it. Then answer in one short sentence stating the durable lesson: for canary-topic follow-ups, answer directly from the learned rule and do not retry canary_fail.",
         .simple_qa => "What is 2+2? Reply with just the number.",
     };
 }
@@ -475,6 +477,38 @@ test "initScratchMemoryRuntime isolates db under scratch" {
     try std.testing.expect(std.mem.startsWith(u8, db_path, scratch));
     try std.testing.expect(std.mem.indexOf(u8, db_path, "/.nullclaw/") == null);
     try std.testing.expect(std.mem.endsWith(u8, db_path, "memory.db"));
+}
+
+test "canary_fail tool returns instructive contract failure" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer parsed.deinit();
+
+    var tool = CanaryFailTool{};
+    const result = try tool.execute(allocator, parsed.value.object);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(result.output.len == 0);
+    const err_msg = result.error_msg.?;
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "canary-topic rule") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "do not retry canary_fail") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "answer follow-ups directly") != null);
+}
+
+test "canary induce prompts ask for short lesson-carrying answer" {
+    const tool_prompt = inducePromptForClass(.tool_failure);
+    const mem_prompt = inducePromptForClass(.memory_dependent);
+
+    try std.testing.expect(std.mem.indexOf(u8, tool_prompt, "one short sentence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_prompt, "do not retry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_prompt, "canary_fail") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_prompt, "learned rule") != null);
+
+    try std.testing.expect(std.mem.indexOf(u8, mem_prompt, "one short sentence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mem_prompt, "do not retry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mem_prompt, "canary_fail") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mem_prompt, "learned rule") != null);
 }
 
 test "evaluateKillSignals v2 signal table" {

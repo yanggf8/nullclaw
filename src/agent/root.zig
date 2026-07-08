@@ -12197,6 +12197,89 @@ test "apply_reflection_verdict_stores_lesson_and_credits_success" {
     try std.testing.expectEqualStrings("memory:direct-verdict", recorder.last_key.?);
 }
 
+test "apply_reflection_verdict_persists_quality_lesson_entry" {
+    const allocator = std.testing.allocator;
+
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var provider_state = ReflectionLearningProvider{};
+    var agent = try reflectionLearningMakeAgent(allocator, provider_state.provider(), mem);
+    defer agent.deinit();
+
+    const lesson_text = "For canarytopic tasks, answer follow-ups directly from the learned rule instead of retrying canary_fail.";
+    try std.testing.expect(reflection.lessonPassesQualityGate(lesson_text));
+    try std.testing.expectEqual(@as(usize, 0), agent.reflection_lessons_saved);
+
+    const verdict = reflection.ReflectionResult{
+        .worth_saving = true,
+        .lesson = lesson_text,
+        .failure_class = .policy,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    agent.applyReflectionVerdict(arena.allocator(), verdict, .degraded);
+
+    try std.testing.expectEqual(@as(usize, 1), agent.reflection_lessons_saved);
+
+    const entries = try mem.list(allocator, .{ .custom = reflection.LESSON_CATEGORY }, null);
+    defer memory_mod.freeEntries(allocator, entries);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expect(std.mem.startsWith(u8, entries[0].key, "lesson:"));
+    try std.testing.expectEqualStrings(lesson_text, entries[0].content);
+    switch (entries[0].category) {
+        .custom => |name| try std.testing.expectEqualStrings(reflection.LESSON_CATEGORY, name),
+        else => return error.TestExpectedCustomLessonCategory,
+    }
+}
+
+test "reflection_learning_seeded_lesson_recall_sets_recalled_metric" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "lesson:canarytopic",
+        "canarytopic rule answer followups directly from learned rule",
+        .{ .custom = reflection.LESSON_CATEGORY },
+        null,
+    );
+
+    var recorder = ReflectionLearningSuccessRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+    var rt = reflectionLearningRuntime(allocator, mem, &recorder);
+    rt._rollout_policy = .{ .mode = .off, .canary_percent = 0, .shadow_percent = 0 };
+
+    var provider_state = ReflectionLearningProvider{};
+    var agent = try reflectionLearningMakeAgent(allocator, provider_state.provider(), mem);
+    defer agent.deinit();
+
+    const recalled_key = memory_loader.topRecalledKey(allocator, &rt, "canarytopic followup", null) orelse
+        return error.TestExpectedLessonRecall;
+    defer allocator.free(recalled_key);
+
+    try std.testing.expectEqualStrings("lesson:canarytopic", recalled_key);
+
+    try reflectionLearningSetLastRecalledKey(&agent, recalled_key);
+    try std.testing.expectEqual(true, agent.reflectionMetrics().recalled_lesson);
+}
+
+test "reflection_learning_non_lesson_recalled_key_leaves_metric_false" {
+    const allocator = std.testing.allocator;
+    var provider_state = ReflectionLearningProvider{};
+    var mem_backend = memory_mod.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    var agent = try reflectionLearningMakeAgent(allocator, provider_state.provider(), mem_backend.memory());
+    defer agent.deinit();
+
+    try reflectionLearningSetLastRecalledKey(&agent, "conversation:not-a-lesson");
+    try std.testing.expectEqual(false, agent.reflectionMetrics().recalled_lesson);
+}
+
 test "reflection_learning_no_recalled_key_does_not_credit" {
     const allocator = std.testing.allocator;
     var provider_state = ReflectionLearningProvider{
