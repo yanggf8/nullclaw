@@ -1836,10 +1836,10 @@ pub fn resolveSkillCommand(allocator: std.mem.Allocator, command: []const u8) !?
         try allocator.dupe(u8, raw_path);
     defer allocator.free(expanded);
 
-    if (extra_args.len > 0) {
-        return try std.fmt.allocPrint(allocator, "python3 {s} {s}", .{ expanded, extra_args });
-    }
-    return try std.fmt.allocPrint(allocator, "python3 {s}", .{expanded});
+    // Interpreter: frontmatter `interpreter:` declaration wins, else infer from
+    // the script extension (.py → python3, native binary → run directly).
+    const interp_prefix = resolveInterpreterPrefix(content, expanded);
+    return try buildSkillCommand(allocator, interp_prefix, expanded, extra_args);
 }
 
 /// Resolves a skill name + args into an executable shell command.
@@ -1892,8 +1892,77 @@ pub fn validateSkillArgsSafe(args: []const u8) !void {
     }
 }
 
+/// Read the frontmatter `interpreter:` field from a SKILL.md `content`, if any.
+/// Frontmatter is the block between the leading `---\n` and the next `\n---`.
+/// Returns the trimmed value slice (into `content`) or null when not declared.
+fn frontmatterInterpreter(content: []const u8) ?[]const u8 {
+    // Frontmatter must start at the very top of the file.
+    if (!std.mem.startsWith(u8, content, "---\n")) return null;
+    const after_open = content[4..];
+    const close = std.mem.indexOf(u8, after_open, "\n---") orelse return null;
+    const fm = after_open[0..close];
+
+    var line_iter = std.mem.splitScalar(u8, fm, '\n');
+    while (line_iter.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        const key = "interpreter:";
+        if (std.mem.startsWith(u8, trimmed, key)) {
+            const val = std.mem.trim(u8, trimmed[key.len..], " \t\r");
+            if (val.len == 0) return null;
+            return val;
+        }
+    }
+    return null;
+}
+
+/// Decide the interpreter prefix for a skill script. Two-tier, DECLARED wins:
+///  1. A frontmatter `interpreter:` declaration in `content` — `none`/`native`
+///     → run the binary directly (empty prefix); any other value (e.g. `python3`,
+///     `node`) → that value as the prefix.
+///  2. No declaration → infer from the script path's extension: `.py` → `python3`
+///     (backward-compat for every existing skill), otherwise (a native binary /
+///     no extension) → run directly (empty prefix).
+/// Returns a prefix slice; `""` means "exec the script path directly".
+/// The returned slice is borrowed from `content` (declared) or is a static
+/// literal (inferred) — never allocated, never needs freeing.
+fn resolveInterpreterPrefix(content: []const u8, script_path: []const u8) []const u8 {
+    if (frontmatterInterpreter(content)) |interp| {
+        if (std.mem.eql(u8, interp, "none") or std.mem.eql(u8, interp, "native")) {
+            return "";
+        }
+        return interp;
+    }
+    // No declaration: infer from extension.
+    if (std.mem.endsWith(u8, script_path, ".py")) return "python3";
+    return "";
+}
+
+/// Build the final exec command string from an interpreter prefix + script path
+/// + optional args. Empty prefix runs the script directly (native binary).
+/// Caller owns the returned slice.
+fn buildSkillCommand(
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    script_path: []const u8,
+    args: []const u8,
+) ![]const u8 {
+    if (prefix.len > 0) {
+        if (args.len > 0) {
+            return try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ prefix, script_path, args });
+        }
+        return try std.fmt.allocPrint(allocator, "{s} {s}", .{ prefix, script_path });
+    }
+    // Native: no interpreter prefix.
+    if (args.len > 0) {
+        return try std.fmt.allocPrint(allocator, "{s} {s}", .{ script_path, args });
+    }
+    return try allocator.dupe(u8, script_path);
+}
+
 /// Testable inner: reads SKILL.md from `skills_dir/<name>/SKILL.md` and builds
-/// `python3 <script_path> [args]`. `tilde_home` is used for `~/` expansion.
+/// the exec command. The interpreter is resolved from the SKILL.md frontmatter
+/// `interpreter:` field, falling back to extension inference (`.py` → python3,
+/// native binary → direct). `tilde_home` is used for `~/` expansion.
 pub fn resolveSkillExecFrom(
     allocator: std.mem.Allocator,
     skill_name: ?[]const u8,
@@ -1944,10 +2013,10 @@ pub fn resolveSkillExecFrom(
     defer allocator.free(expanded);
 
     const args = skill_args orelse "";
-    if (args.len > 0) {
-        return try std.fmt.allocPrint(allocator, "python3 {s} {s}", .{ expanded, args });
-    }
-    return try std.fmt.allocPrint(allocator, "python3 {s}", .{expanded});
+    // Interpreter: frontmatter `interpreter:` declaration wins, else infer from
+    // the script extension (.py → python3, native binary → run directly).
+    const prefix = resolveInterpreterPrefix(content, expanded);
+    return buildSkillCommand(allocator, prefix, expanded, args);
 }
 
 pub fn runAgentJob(
@@ -6186,10 +6255,21 @@ fn appendTruncated(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocato
     if (text.len > max_len) try buf.appendSlice(allocator, "...");
 }
 
+/// Extract the script path from a resolved exec command for diagnostics. The
+/// command is one of: `<interpreter> <path> [args]` (e.g. `python3 /x.py …`),
+/// or `<path> [args]` (a native binary, no interpreter prefix). The first token
+/// is an interpreter iff it contains no path separator (`/`); a script path
+/// always does (SKILL.md paths are absolute or `~/`-expanded). So: if the first
+/// token has a `/`, it IS the path; otherwise the second token is.
 fn extractScriptPathFromResolved(resolved: []const u8) []const u8 {
-    const prefix = "python3 ";
-    if (!std.mem.startsWith(u8, resolved, prefix)) return resolved;
-    const rest = resolved[prefix.len..];
+    const first_end = std.mem.indexOfScalar(u8, resolved, ' ') orelse return resolved;
+    const first = resolved[0..first_end];
+    if (std.mem.indexOfScalar(u8, first, '/') != null) {
+        // First token is the script path itself (native binary, no interpreter).
+        return first;
+    }
+    // First token is an interpreter name; the path is the next token.
+    const rest = resolved[first_end + 1 ..];
     const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
     return rest[0..end];
 }
@@ -11137,6 +11217,98 @@ test "resolveSkillExecFrom rejects shell-injectable skill_args" {
     const cmd = try resolveSkillExecFrom(allocator, "news", "--lang zh", skills_dir, base);
     defer allocator.free(cmd);
     try std.testing.expect(std.mem.indexOf(u8, cmd, "--lang zh") != null);
+}
+
+// Helper for the interpreter-resolution tests: write a SKILL.md with the given
+// `## Script` line + optional frontmatter, resolve it, return the command.
+fn resolveWithSkillMd(
+    allocator: std.mem.Allocator,
+    tmp: *std.testing.TmpDir,
+    skill_md: []const u8,
+    args: ?[]const u8,
+) ![]const u8 {
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skills_dir = try std.fmt.allocPrint(allocator, "{s}/skills", .{base});
+    defer allocator.free(skills_dir);
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/s");
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "skills/s/SKILL.md",
+        .data = skill_md,
+    });
+    return resolveSkillExecFrom(allocator, "s", args, skills_dir, base);
+}
+
+test "resolveSkillExecFrom infers python3 for a .py script (no declaration)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cmd = try resolveWithSkillMd(allocator, &tmp, "# s\n\n## Script\n\n~/scripts/run.py\n", "write");
+    defer allocator.free(cmd);
+    // Backward-compat: existing .py skills still get python3.
+    try std.testing.expect(std.mem.startsWith(u8, cmd, "python3 "));
+    try std.testing.expect(std.mem.endsWith(u8, cmd, "/scripts/run.py write"));
+}
+
+test "resolveSkillExecFrom runs a native binary directly (no extension, no declaration)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cmd = try resolveWithSkillMd(allocator, &tmp, "# s\n\n## Script\n\n~/bin/ainews\n", "skill write");
+    defer allocator.free(cmd);
+    // A native binary path (no .py) is executed directly — no python3 prefix.
+    try std.testing.expect(!std.mem.startsWith(u8, cmd, "python3 "));
+    try std.testing.expect(std.mem.endsWith(u8, cmd, "/bin/ainews skill write"));
+}
+
+test "resolveSkillExecFrom honors frontmatter interpreter: none (native override)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Even a .py-looking path runs native when explicitly declared `none`.
+    const cmd = try resolveWithSkillMd(
+        allocator,
+        &tmp,
+        "---\nname: s\ninterpreter: none\n---\n\n## Script\n\n~/bin/ainews\n",
+        "skill write",
+    );
+    defer allocator.free(cmd);
+    try std.testing.expect(!std.mem.startsWith(u8, cmd, "python3 "));
+    try std.testing.expect(std.mem.endsWith(u8, cmd, "/bin/ainews skill write"));
+}
+
+test "resolveSkillExecFrom honors frontmatter interpreter: python3 (explicit)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A declared python3 wins even if the script has no .py extension.
+    const cmd = try resolveWithSkillMd(
+        allocator,
+        &tmp,
+        "---\nname: s\ninterpreter: python3\n---\n\n## Script\n\n~/scripts/entry\n",
+        null,
+    );
+    defer allocator.free(cmd);
+    try std.testing.expect(std.mem.startsWith(u8, cmd, "python3 "));
+    try std.testing.expect(std.mem.endsWith(u8, cmd, "/scripts/entry"));
+}
+
+test "extractScriptPathFromResolved handles interpreter prefix and native" {
+    // python3 <path> [args] → path is the second token.
+    try std.testing.expectEqualStrings(
+        "/home/u/scripts/run.py",
+        extractScriptPathFromResolved("python3 /home/u/scripts/run.py --lang zh"),
+    );
+    // native <path> [args] → path is the first token (it has a '/').
+    try std.testing.expectEqualStrings(
+        "/home/u/bin/ainews",
+        extractScriptPathFromResolved("/home/u/bin/ainews skill write"),
+    );
+    // native path with no args.
+    try std.testing.expectEqualStrings(
+        "/home/u/bin/ainews",
+        extractScriptPathFromResolved("/home/u/bin/ainews"),
+    );
 }
 
 test "dbCompleteJob inserts cron_runs history row" {
