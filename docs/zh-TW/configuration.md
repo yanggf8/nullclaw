@@ -281,6 +281,28 @@ nullclaw onboard --interactive
 - 裸模型名的故障轉移順序：先嘗試主要提供方，再依次嘗試每個列出的 `fallback_provider`。
 - 像 `openai/gpt-4o` 這樣的顯式 `provider/model` 備用項會直接路由到對應 provider，不會再走通用 provider 扇出鏈路。
 - `api_keys`: (可選) 用於在速率限制 (429) 錯誤時輪換的額外 API 金鑰列表。
+
+#### Grok CLI 備援
+
+`grok-cli` 重用本機 Grok CLI 的登入狀態，不需要 `XAI_API_KEY`。先執行 `grok login --device-auth` 完成認證，再把它加入 provider 備援鏈：
+
+```json
+{
+  "reliability": {
+    "fallback_providers": ["grok-cli"]
+  }
+}
+```
+
+provider 會依序尋找 `GROK_BIN`、`PATH` 中的 `grok`，以及 `~/.grok/bin/grok`。當其他 provider 的模型名稱進入備援時，它會使用 `grok-composer-2.5-fast`；明確路由（例如 `grok-cli/grok-code-fast-1`）仍會選擇指定的 Grok 模型。Grok 內建工具、網頁搜尋、記憶和子代理均被停用，所有操作仍由 nullclaw 自身的工具策略管理。
+
+只有非串流聊天請求的主 provider 失敗後，才會嘗試 `grok-cli`。已經開始的串流回應無法在中途切換 provider。如果本機 OAuth 登入過期，請重新執行 `grok login --device-auth`，然後在重啟執行環境前驗證備援：
+
+```bash
+nullclaw --probe-provider-health --provider grok-cli \
+  --model grok-composer-2.5-fast --timeout-secs 30
+```
+
 ### `identity`（AIEOS v1.1）
 
 如果你希望執行時身分來自 AIEOS 文件，可以使用這一節。設定後，nullclaw 會把解析後的 AIEOS 內容連同 `AGENTS.md`、`IDENTITY.md` 等工作區身分檔案一起注入 system prompt：

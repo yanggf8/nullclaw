@@ -40,7 +40,7 @@ fn isLocalEndpoint(url: []const u8) bool {
 
 pub fn providerRequiresApiKey(provider_name: []const u8, base_url: ?[]const u8) bool {
     return switch (providers.classifyProvider(provider_name)) {
-        .ollama_provider, .claude_cli_provider, .codex_cli_provider, .gemini_cli_provider, .openai_codex_provider => false,
+        .ollama_provider, .claude_cli_provider, .codex_cli_provider, .gemini_cli_provider, .grok_cli_provider, .openai_codex_provider => false,
         .compatible_provider => blk: {
             if (base_url) |configured| {
                 break :blk !isLocalEndpoint(configured);
@@ -406,6 +406,7 @@ test "providerRequiresApiKey marks local providers as keyless" {
     try std.testing.expect(!providerRequiresApiKey("codex-cli", null));
     try std.testing.expect(!providerRequiresApiKey("openai-codex", null));
     try std.testing.expect(!providerRequiresApiKey("gemini-cli", null));
+    try std.testing.expect(!providerRequiresApiKey("grok-cli", null));
     try std.testing.expect(providerRequiresApiKey("openai", null));
     try std.testing.expect(!providerRequiresApiKey("lmstudio", null));
     // Regression: local-network compatible endpoints should not require API keys.

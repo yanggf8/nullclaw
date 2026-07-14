@@ -363,6 +363,28 @@ Notes:
 - Failover order for bare model refs: primary provider first, then each listed `fallback_provider`.
 - Provider-qualified fallback refs such as `openai/gpt-4o` route directly to that provider and skip the generic provider fanout.
 - `api_keys`: (Optional) List of extra API keys for rotation on rate-limit (429) errors.
+
+#### Grok CLI fallback
+
+`grok-cli` reuses the local Grok CLI login instead of an `XAI_API_KEY`. Authenticate once with `grok login --device-auth`, then add it to the provider fallback chain:
+
+```json
+{
+  "reliability": {
+    "fallback_providers": ["grok-cli"]
+  }
+}
+```
+
+The provider resolves `GROK_BIN`, `grok` on `PATH`, or `~/.grok/bin/grok`, in that order. When another provider's model name reaches the fallback, it uses `grok-composer-2.5-fast`; an explicit route such as `grok-cli/grok-code-fast-1` still selects that Grok model. Grok's built-in tools, web search, memory, and subagents are disabled so all actions remain governed by nullclaw's own tool policy.
+
+`grok-cli` is attempted only after the primary provider fails on a non-streaming chat request. An active streaming response cannot switch providers mid-stream. If the local OAuth login expires, run `grok login --device-auth` again, then verify the fallback before restarting the runtime:
+
+```bash
+nullclaw --probe-provider-health --provider grok-cli \
+  --model grok-composer-2.5-fast --timeout-secs 30
+```
+
 ### `identity` (AIEOS v1.1)
 
 Use this section when you want the runtime identity to come from an AIEOS document.

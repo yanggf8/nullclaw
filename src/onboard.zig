@@ -156,6 +156,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "codex-cli", .label = "Codex CLI (local CLI)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "OPENAI_API_KEY" },
     .{ .key = "openai-codex", .label = "OpenAI Codex (ChatGPT login)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
     .{ .key = "gemini-cli", .label = "Gemini CLI (Google Gemini, local)", .default_model = "gemini-2.0-flash", .env_var = "GEMINI_API_KEY" },
+    .{ .key = "grok-cli", .label = "Grok CLI (xAI login, local)", .default_model = "grok-composer-2.5-fast", .env_var = "" },
 };
 
 /// Canonicalize provider name (handle aliases).
@@ -191,6 +192,7 @@ fn providerRequiresApiKeyForSetup(provider: []const u8, base_url: ?[]const u8) b
         std.mem.eql(u8, canonical, "claude-cli") or
         std.mem.eql(u8, canonical, "codex-cli") or
         std.mem.eql(u8, canonical, "gemini-cli") or
+        std.mem.eql(u8, canonical, "grok-cli") or
         std.mem.eql(u8, canonical, "openai-codex"))
     {
         return false;
@@ -246,6 +248,14 @@ fn printProviderNextSteps(
     if (std.mem.eql(u8, canonical, "gemini-cli")) {
         try out.writeAll("    1. Authenticate:  gemini\n");
         try out.writeAll("       Then choose:   Login with Google\n");
+        try out.writeAll("    2. Interactive chat:  nullclaw agent\n");
+        try out.writeAll("       Then type:         Hello!\n");
+        try out.writeAll("    3. Gateway:       nullclaw gateway\n");
+        return;
+    }
+
+    if (std.mem.eql(u8, canonical, "grok-cli")) {
+        try out.writeAll("    1. Authenticate:  grok login --device-auth\n");
         try out.writeAll("    2. Interactive chat:  nullclaw agent\n");
         try out.writeAll("       Then type:         Hello!\n");
         try out.writeAll("    3. Gateway:       nullclaw gateway\n");
@@ -341,6 +351,10 @@ const gemini_cli_fallback = [_][]const u8{
     "gemini-2.0-flash",
 };
 
+const grok_cli_fallback = [_][]const u8{
+    "grok-composer-2.5-fast",
+};
+
 /// Hardcoded fallback models for each provider (used when API fetch fails).
 pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     const canonical = canonicalProviderName(provider);
@@ -357,6 +371,7 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "codex-cli")) return &codex_support.codex_model_fallbacks;
     if (std.mem.eql(u8, canonical, "openai-codex")) return &codex_support.codex_model_fallbacks;
     if (std.mem.eql(u8, canonical, "gemini-cli")) return &gemini_cli_fallback;
+    if (std.mem.eql(u8, canonical, "grok-cli")) return &grok_cli_fallback;
 
     // For providers without a curated fallback list, return a single-item fallback
     // based on the onboarding default model for that provider.
@@ -536,6 +551,10 @@ pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: 
 /// back to the public models.dev catalog before using hardcoded defaults.
 pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8, base_url: ?[]const u8) ![][]const u8 {
     const canonical = canonicalProviderName(provider);
+
+    if (std.mem.eql(u8, canonical, "grok-cli")) {
+        return dupeFallbackModels(allocator, canonical);
+    }
 
     if (std.mem.eql(u8, canonical, "codex-cli") or std.mem.eql(u8, canonical, "openai-codex")) {
         return codex_support.loadCodexModels(allocator);
@@ -3427,6 +3446,7 @@ test "providerRequiresApiKeyForSetup marks local and OAuth providers as keyless"
     try std.testing.expect(!providerRequiresApiKeyForSetup("gemini-cli", null));
     try std.testing.expect(!providerRequiresApiKeyForSetup("codex-cli", null));
     try std.testing.expect(!providerRequiresApiKeyForSetup("openai-codex", null));
+    try std.testing.expect(!providerRequiresApiKeyForSetup("grok-cli", null));
     // Regression: local-network compatible endpoints should not require API keys.
     try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://127.0.0.1:8080/v1", "http://127.0.0.1:8080/v1"));
     try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://100.64.0.1:8080/v1", "http://100.64.0.1:8080/v1"));
@@ -4324,6 +4344,17 @@ test "printProviderNextSteps keeps gemini-cli auth flow and interactive chat" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
 }
 
+test "printProviderNextSteps keeps grok-cli device auth flow" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+
+    try printProviderNextSteps(&aw.writer, "grok-cli", "", false, false);
+
+    const rendered = aw.writer.buffer[0..aw.writer.end];
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "grok login --device-auth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
+}
+
 test "providerEnvVar gemini aliases" {
     try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("gemini"));
     try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("google"));
@@ -4483,6 +4514,13 @@ test "buildModelsRefreshFetchOptions sets output budget for large provider catal
 test "known_providers includes gemini-cli" {
     for (known_providers) |provider| {
         if (std.mem.eql(u8, provider.key, "gemini-cli")) return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "known_providers includes grok-cli" {
+    for (known_providers) |provider| {
+        if (std.mem.eql(u8, provider.key, "grok-cli")) return;
     }
     return error.TestUnexpectedResult;
 }

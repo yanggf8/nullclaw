@@ -11,6 +11,12 @@ const ChatResponse = root.ChatResponse;
 
 /// Check if an error message indicates a non-retryable client error (4xx except 429/408).
 pub fn isNonRetryable(err_msg: []const u8) bool {
+    if (std.mem.eql(u8, err_msg, "AuthenticationFailed") or
+        std.mem.eql(u8, err_msg, "CliNotFound"))
+    {
+        return true;
+    }
+
     // Look for 4xx status codes
     var i: usize = 0;
     while (i < err_msg.len) {
@@ -732,6 +738,8 @@ test "isNonRetryable detects common patterns" {
     try std.testing.expect(isNonRetryable("401 Unauthorized"));
     try std.testing.expect(isNonRetryable("403 Forbidden"));
     try std.testing.expect(isNonRetryable("404 Not Found"));
+    try std.testing.expect(isNonRetryable("AuthenticationFailed"));
+    try std.testing.expect(isNonRetryable("CliNotFound"));
     try std.testing.expect(!isNonRetryable("429 Too Many Requests"));
     try std.testing.expect(!isNonRetryable("408 Request Timeout"));
     try std.testing.expect(!isNonRetryable("500 Internal Server Error"));

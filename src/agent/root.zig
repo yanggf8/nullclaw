@@ -971,8 +971,14 @@ pub const Agent = struct {
     }
 
     fn providerAuthStatus(self: *const Agent, provider_name: []const u8) []const u8 {
-        if (providers.classifyProvider(provider_name) == .openai_codex_provider) {
-            return "oauth";
+        switch (providers.classifyProvider(provider_name)) {
+            .openai_codex_provider => return "oauth",
+            .claude_cli_provider,
+            .codex_cli_provider,
+            .gemini_cli_provider,
+            .grok_cli_provider,
+            => return "cli",
+            else => {},
         }
 
         const resolved_key = providers.resolveApiKeyFromConfig(
@@ -7049,6 +7055,24 @@ test "slash /model shows provider and model fallback chains" {
         u8,
         response,
         "Model chain: gpt-5.3-codex -> openrouter/anthropic/claude-sonnet-4",
+    ) != null);
+}
+
+test "slash /model marks grok cli fallback authentication as cli" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.default_provider = "openrouter";
+    agent.fallback_providers = &.{"grok-cli"};
+
+    const response = (try agent.handleSlashCommand("/model")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        response,
+        "grok-cli [fallback] (auth: cli)",
     ) != null);
 }
 

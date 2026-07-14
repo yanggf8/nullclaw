@@ -44,6 +44,7 @@ const allowed_exact_paths = [_][]const u8{
     "gateway.port",
     "tunnel.provider",
     primary_model_path,
+    "reliability.fallback_providers",
 };
 
 const allowed_prefix_paths = [_][]const u8{
@@ -123,6 +124,7 @@ pub fn pathRequiresRestart(path: []const u8) bool {
     if (std.mem.startsWith(u8, path, "channels.")) return true;
     if (std.mem.startsWith(u8, path, "runtime.")) return true;
     if (std.mem.eql(u8, path, "memory.backend") or std.mem.eql(u8, path, "memory.profile")) return true;
+    if (std.mem.eql(u8, path, "reliability.fallback_providers")) return true;
     return false;
 }
 
@@ -505,12 +507,14 @@ test "pathRequiresRestart detects structural paths" {
     try std.testing.expect(pathRequiresRestart("channels.telegram.accounts.default.bot_token"));
     try std.testing.expect(pathRequiresRestart("runtime.kind"));
     try std.testing.expect(pathRequiresRestart("memory.backend"));
+    try std.testing.expect(pathRequiresRestart("reliability.fallback_providers"));
     try std.testing.expect(!pathRequiresRestart("default_temperature"));
 }
 
 test "isAllowedPath accepts channels and memory path" {
     try std.testing.expect(isAllowedPath("channels.telegram.accounts.default.bot_token"));
     try std.testing.expect(isAllowedPath("memory.backend"));
+    try std.testing.expect(isAllowedPath("reliability.fallback_providers"));
     try std.testing.expect(!isAllowedPath("identity.format"));
 }
 
