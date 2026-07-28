@@ -231,11 +231,22 @@ All cron-spawned subprocesses (`shell`, `skill`, and `agent` job types, across b
 
 Retry children (`retry_once` repair policy) reuse the same env_map as their initial spawn.
 
-Manual `cron run` skill jobs also receive `NULLCLAW_SKILL_TIMEOUT=<seconds>` via `buildManualSkillChildEnv()` so `delivery.py` and similar helpers can honor the per-run timeout budget. When `timeout_secs` is unset on the job, this defaults to `120`.
+Skill jobs receive a delivery budget so a helper's retry loop cannot starve the
+skill's own timeout:
+
+- **Manual** `cron run` — `buildManualSkillChildEnv()` sets `NULLCLAW_SKILL_TIMEOUT=<seconds>`, defaulting to `120` when `timeout_secs` is unset on the job.
+- **Scheduled** — `putSkillBudgetEnv()` sets `NULLCLAW_SKILL_TIMEOUT` *and* `NULLCLAW_SKILL_STARTED` on both the initial spawn and the retry. Added 2026-07-28; before that the scheduled path set neither, so `delivery.py`'s elapsed-time branch had never executed in production and every scheduled delivery fell back to telegram's flat 30s cap. A job with no explicit timeout exports `0`, which `delivery.py`'s `if timeout <= 0` turns back into that same 30s default.
+
+`NULLCLAW_SKILL_STARTED` is **CLOCK_MONOTONIC seconds**, matching Python's
+`time.monotonic()` and Rust's `clock_gettime(CLOCK_MONOTONIC)`. A wall-clock
+value would make consumers' `now - started` hugely negative; they clamp it to
+zero, so the budget would look healthy while doing nothing. `cron.zig` has a
+test pinning this. The retry takes a **fresh** monotonic start — it is a new run
+with its own budget, not a continuation.
 
 #### First-class `skill` job type
 
-Set `job_type: "skill"`, `skill_name: "<name>"`, and optionally `skill_args: "<args>"`. The gateway calls `resolveSkillExec()` (or the testable `resolveSkillExecFrom()`) in `src/cron.zig` to read `## Script` from `~/.nullclaw/skills/<name>/SKILL.md`, expand `~/`, and build `python3 <path> [args]`. The subprocess receives the execution-context env vars described above — scripts can read `NULLCLAW_JOB_ID` to embed the trace ID in their output, and manual `cron run` executions also receive `NULLCLAW_SKILL_TIMEOUT`.
+Set `job_type: "skill"`, `skill_name: "<name>"`, and optionally `skill_args: "<args>"`. The gateway calls `resolveSkillExec()` (or the testable `resolveSkillExecFrom()`) in `src/cron.zig` to read `## Script` from `~/.nullclaw/skills/<name>/SKILL.md`, expand `~/`, and build the command. The interpreter comes from the SKILL.md frontmatter `interpreter:` field (`none`/`native` means run the file directly); with no declaration it is inferred from the extension — `.py` gets `python3`, anything else is executed directly, so a native binary works with no nullclaw change. Note that resolution only builds a command string: it does **not** check that the path exists or is executable, so a missing artifact surfaces as `exec_error` at fire time. The subprocess receives the execution-context env vars described above — scripts can read `NULLCLAW_JOB_ID` to embed the trace ID in their output, and both scheduled and manual executions receive the delivery-budget vars described above.
 
 Runtime skill resolution uses `~/.nullclaw/skills` as the only source of truth. On the current deployment, most entries under that directory are symlinks into the editable source mirror `~/a/claw-skills/<name>` (for example `~/.nullclaw/skills/news -> ~/a/claw-skills/news`). Edit and commit the mirror repository when changing skill scripts; keep `~/.claude/skills` only as an interactive/legacy copy unless explicitly syncing it.
 
