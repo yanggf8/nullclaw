@@ -4535,6 +4535,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     };
                     defer arena.free(raw_skill_cmd);
                     const skill_cmd = raw_skill_cmd;
+                    const skill_started_s = cron_mod.monotonicSeconds();
                     var skill_env = cron_mod.buildCronChildEnv(arena, .{
                         .source = "cron_scheduler_skill",
                         .trace_id = run_trace_id,
@@ -4544,6 +4545,11 @@ fn runQueueWorker(state: *GatewayState) void {
                         continue;
                     };
                     defer skill_env.deinit();
+                    cron_mod.putSkillBudgetEnv(&skill_env, timeout, skill_started_s) catch |err| {
+                        log.err("[{s}] skill env setup failed: {s}", .{ spec.id, @errorName(err) });
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_skill");
+                        continue;
+                    };
                     var skill_child = std_compat.process.Child.init(
                         &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), skill_cmd },
                         arena,
@@ -4611,6 +4617,13 @@ fn runQueueWorker(state: *GatewayState) void {
                         defer retry_stdout.deinit(arena);
                         var retry_stderr: std.ArrayList(u8) = .empty;
                         defer retry_stderr.deinit(arena);
+                        // The retry is a new run with its own budget, not a
+                        // continuation — take a fresh monotonic start.
+                        const retry_started_s = cron_mod.monotonicSeconds();
+                        cron_mod.putSkillBudgetEnv(&skill_env, timeout, retry_started_s) catch |err| {
+                            log.err("[{s}] skill retry env setup failed: {s}", .{ spec.id, @errorName(err) });
+                            break;
+                        };
                         var retry_child = std_compat.process.Child.init(
                             &.{ @import("platform.zig").getShell(), @import("platform.zig").getShellFlag(), skill_cmd },
                             arena,

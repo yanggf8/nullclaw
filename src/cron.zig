@@ -1518,6 +1518,37 @@ const SENSORIUM_STATE_ENV = "NULLCLAW_SENSORIUM_STATE";
 const SENSORIUM_STATE_SESSION_ONLY = "session_only_not_attached";
 const JOB_ID_ENV = "NULLCLAW_JOB_ID";
 const SKILL_TIMEOUT_ENV = "NULLCLAW_SKILL_TIMEOUT";
+const SKILL_STARTED_ENV = "NULLCLAW_SKILL_STARTED";
+
+/// Publish the delivery budget to a skill child.
+///
+/// `started` MUST be CLOCK_MONOTONIC seconds — the same clock domain the Python
+/// (`time.monotonic()`) and Rust (`clock_gettime(CLOCK_MONOTONIC)`) consumers
+/// read. A wall-clock value makes their `now - started` hugely negative, which
+/// both clamp to zero, so the budget silently degrades to "no elapsed time has
+/// passed" and nothing looks wrong.
+pub fn putSkillBudgetEnv(
+    env_map: *std_compat.process.EnvMap,
+    timeout_secs: u64,
+    started_monotonic_s: f64,
+) !void {
+    var timeout_buf: [32]u8 = undefined;
+    const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch "120";
+    try env_map.put(SKILL_TIMEOUT_ENV, timeout_str);
+
+    var started_buf: [64]u8 = undefined;
+    const started_str = std.fmt.bufPrint(&started_buf, "{d:.6}", .{started_monotonic_s}) catch "0";
+    try env_map.put(SKILL_STARTED_ENV, started_str);
+}
+
+pub fn monotonicSeconds() f64 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => {},
+        else => return 0,
+    }
+    return @as(f64, @floatFromInt(ts.sec)) + @as(f64, @floatFromInt(ts.nsec)) / 1e9;
+}
 
 fn pathAgentExecutableName() []const u8 {
     return if (comptime builtin.os.tag == .windows) "nullclaw.exe" else "nullclaw";
@@ -12373,6 +12404,22 @@ test "buildManualSkillChildEnv defaults timeout to 120 seconds" {
     defer env_map.deinit();
 
     try std.testing.expectEqualStrings("120", env_map.get(SKILL_TIMEOUT_ENV).?);
+}
+
+test "monotonicSeconds is not a unix epoch timestamp" {
+    const t = monotonicSeconds();
+    try std.testing.expect(t > 0);
+    // A wall-clock value in 2026 is ~1.78e9. CLOCK_MONOTONIC is seconds since
+    // boot. If this fails, every delivery budget consumer is silently broken.
+    try std.testing.expect(t < 1.0e9);
+}
+
+test "putSkillBudgetEnv writes both variables" {
+    var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
+    defer env_map.deinit();
+    try putSkillBudgetEnv(&env_map, 30, 12345.5);
+    try std.testing.expectEqualStrings("30", env_map.get(SKILL_TIMEOUT_ENV).?);
+    try std.testing.expectEqualStrings("12345.500000", env_map.get(SKILL_STARTED_ENV).?);
 }
 
 test "buildJobsJson serializes cron jobs for CLI read-side" {
