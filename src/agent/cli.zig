@@ -51,6 +51,9 @@ const CliStreamCtx = struct {
     /// terminal render is suppressed.
     suppress_live: bool = false,
     think_filter: streaming.ThinkPassthroughFilter = undefined,
+    /// Set once the streaming stdout write has failed and been reported, so a
+    /// persistent failure logs one line per turn instead of one per chunk.
+    write_error_logged: bool = false,
 };
 
 const CliProviderContext = struct {
@@ -255,9 +258,29 @@ fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
     // and fell back to append). writeAll -> writeStreamingAll is a plain
     // writev at the kernel's current offset with no pos, so chunks accumulate
     // correctly for both TTY and pipe/file and it flushes implicitly (no
-    // buffer object). Errors (e.g. BrokenPipe on a closed reader) are
-    // swallowed to match the previous best-effort behavior.
-    std_compat.fs.File.stdout().writeAll(event.text) catch {};
+    // buffer object).
+    //
+    // A failure here TRUNCATES the streamed reply: writeAll keeps whatever
+    // prefix it already wrote, so the consumer silently receives a stream with
+    // a hole in it and the run still reports success. That is exactly the
+    // shape of a corruption seen on 2026-08-14, where a captured reply lost a
+    // single byte mid-stream (a 3-byte CJK character surfaced downstream as
+    // one U+FFFD) with everything after it intact. Whether this write was the
+    // cause is unproven, but it must not fail silently while we find out.
+    //
+    // BrokenPipe stays quiet: it means the reader closed (`| head`, a
+    // cancelled run), there is nobody left to tell, and nothing to salvage.
+    // Every other error is reported ONCE per turn — this is a per-chunk hot
+    // path, so a persistent failure must not produce one line per chunk.
+    std_compat.fs.File.stdout().writeAll(event.text) catch |err| {
+        if (err != error.BrokenPipe and !stream_ctx.write_error_logged) {
+            stream_ctx.write_error_logged = true;
+            log.err(
+                "stdout write failed mid-stream ({s}); the streamed reply is TRUNCATED and any captured copy is incomplete",
+                .{@errorName(err)},
+            );
+        }
+    };
 }
 
 fn makeCliStreamSink(raw_sink: streaming.Sink, filter: *streaming.TagFilter) streaming.Sink {
