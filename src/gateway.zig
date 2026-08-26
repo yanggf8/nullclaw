@@ -3252,6 +3252,13 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
     const timeout_secs_add: ?u32 = blk: {
         const v = jsonIntField(body, "timeout_secs") orelse break :blk null;
         if (v <= 0) break :blk null;
+        // Persistence binds timeout via sqlite3_bind_int (c_int); anything
+        // larger would trap mid-write instead of validating.
+        if (v > std.math.maxInt(i32)) {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"invalid timeout_secs\"}";
+            return;
+        }
         break :blk @intCast(v);
     };
     const tz_offset_s_add: i32 = blk: {
@@ -3796,6 +3803,13 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
     const timeout_secs_opt: ?u32 = blk: {
         const v = jsonIntField(body, "timeout_secs") orelse break :blk null;
         if (v <= 0) break :blk null;
+        // Persistence binds timeout via sqlite3_bind_int (c_int); anything
+        // larger would trap mid-write instead of validating.
+        if (v > std.math.maxInt(i32)) {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"invalid timeout_secs\"}";
+            return;
+        }
         break :blk @intCast(v);
     };
 
@@ -8629,6 +8643,95 @@ test "handleCronAdd rejects invalid session_target" {
     try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "invalid session_target") != null);
 }
 
+test "handleCronAdd rejects timeout_secs above i32 max" {
+    // Persistence binds timeout via sqlite3_bind_int (c_int); anything larger
+    // would trap mid-write instead of validating.
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"expression\":\"*/10 * * * *\",\"command\":\"echo hello\",\"timeout_secs\":2147483648}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "invalid timeout_secs") != null);
+}
+
+test "handleCronAdd accepts timeout_secs up to i32 max" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/cron_timeout_add.db", .{base});
+    defer std.testing.allocator.free(db_path_str);
+    const db_path = try std.testing.allocator.dupeZ(u8, db_path_str);
+    defer std.testing.allocator.free(db_path);
+
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    scheduler.db_path = db_path;
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.scheduler_mutex.lock();
+    state.scheduler = &scheduler;
+    state.scheduler_mutex.unlock();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"expression\":\"*/10 * * * *\",\"command\":\"echo bounded\",\"timeout_secs\":2147483647}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    const jobs = scheduler.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqual(@as(u32, 2147483647), jobs[0].timeout_secs.?);
+}
+
 test "handleCronUpdate accepts session_target" {
     if (!build_options.enable_sqlite) return error.SkipZigTest;
 
@@ -8765,6 +8868,95 @@ test "handleCronUpdate rejects invalid session_target" {
 
     try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
     try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "invalid session_target") != null);
+}
+
+test "handleCronUpdate rejects timeout_secs above i32 max" {
+    // Persistence binds timeout via sqlite3_bind_int (c_int); anything larger
+    // would trap mid-write instead of validating.
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addAgentJob("* * * * *", "Summarize incidents", null, .{});
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /cron/update HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{{\"id\":\"{s}\",\"timeout_secs\":2147483648}}",
+        .{job.id},
+    );
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/update",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronUpdate(&ctx);
+
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "invalid timeout_secs") != null);
+}
+
+test "handleCronUpdate accepts timeout_secs up to i32 max" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/cron_timeout_upd.db", .{base});
+    defer std.testing.allocator.free(db_path_str);
+    const db_path = try std.testing.allocator.dupeZ(u8, db_path_str);
+    defer std.testing.allocator.free(db_path);
+
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    scheduler.db_path = db_path;
+    defer scheduler.deinit();
+    const job = try scheduler.addAgentJob("* * * * *", "Summarize incidents", null, .{});
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.scheduler_mutex.lock();
+    state.scheduler = &scheduler;
+    state.scheduler_mutex.unlock();
+
+    const raw = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /cron/update HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{{\"id\":\"{s}\",\"timeout_secs\":2147483647}}",
+        .{job.id},
+    );
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/update",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronUpdate(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    try std.testing.expectEqual(@as(u32, 2147483647), scheduler.listJobs()[0].timeout_secs.?);
 }
 
 test "constants are set correctly" {

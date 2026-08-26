@@ -1530,9 +1530,21 @@ fn parseCronAddSkillOptions(allocator: std.mem.Allocator, sub_args: []const []co
             args_buf.appendSlice(allocator, "--deliver-to ") catch {};
             args_buf.appendSlice(allocator, sub_args[i + 1]) catch {};
             i += 1;
-        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--timeout")) {
-            options.timeout_secs = std.fmt.parseInt(u32, sub_args[i + 1], 10) catch null;
+        } else if (std.mem.eql(u8, sub_args[i], "--timeout")) {
+            // Strict on purpose, matching `cron update`: a missing or unparseable
+            // value must exit rather than silently fall back to the default
+            // budget, and maxInt(i32) is what sqlite3_bind_int (c_int) can hold.
+            if (i + 1 >= sub_args.len) {
+                std.debug.print("Invalid --timeout: expected seconds as an integer between 1 and 2147483647\n", .{});
+                std_compat.process.exit(1);
+            }
             i += 1;
+            const parsed_timeout = std.fmt.parseInt(u32, sub_args[i], 10) catch 0;
+            if (parsed_timeout == 0 or parsed_timeout > std.math.maxInt(i32)) {
+                std.debug.print("Invalid --timeout: expected seconds as an integer between 1 and 2147483647\n", .{});
+                std_compat.process.exit(1);
+            }
+            options.timeout_secs = parsed_timeout;
         } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--account")) {
             options.account_id = sub_args[i + 1];
             // Keep --account in skill_args for the script
@@ -7841,6 +7853,24 @@ test "parseCronAddSkillOptions preserves account and deliver-to in both config a
     try std.testing.expect(std.mem.indexOf(u8, sa, "--location") != null);
     // --timeout should NOT appear in skill_args
     try std.testing.expect(std.mem.indexOf(u8, sa, "--timeout") == null);
+}
+
+test "parseCronAddSkillOptions accepts timeout at the persistence bound" {
+    // maxInt(i32) is what sqlite3_bind_int (c_int) can hold; larger or
+    // unparseable values exit(1) and are covered by CLI smoke runs.
+    const args = [_][]const u8{
+        "add-skill",
+        "5 4 1 1 *",
+        "cct",
+        "--timeout",
+        "2147483647",
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const options = parseCronAddSkillOptions(arena.allocator(), &args);
+
+    try std.testing.expectEqual(@as(u32, 2147483647), options.timeout_secs.?);
 }
 
 test "VerificationMode.parseStrict accepts valid values and rejects typos" {
