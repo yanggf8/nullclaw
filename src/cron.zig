@@ -2216,6 +2216,16 @@ const LoadPolicy = enum {
     strict,
 };
 
+/// Clamp a JSON integer to the storable timeout range.
+/// Non-positive means "no budget"; anything above maxInt(i32) cannot survive
+/// sqlite3_bind_int (c_int) and would trap mid-cast — both degrade to null so
+/// one bad field costs one job's budget, never the whole load. Callers are
+/// expected to log a warning when an over-bound value is dropped.
+fn timeoutSecsFromJsonInt(v: i64) ?u32 {
+    if (v <= 0 or v > std.math.maxInt(i32)) return null;
+    return @intCast(v);
+}
+
 fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
     const path = try cronJsonPath(scheduler.allocator);
     defer scheduler.allocator.free(path);
@@ -2443,7 +2453,15 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
         };
         const timeout_secs_json: ?u32 = blk: {
             if (obj.get("timeout_secs")) |v| {
-                if (v == .integer and v.integer > 0) break :blk @intCast(v.integer);
+                if (v == .integer) {
+                    // Persistence binds timeout via sqlite3_bind_int (c_int); an
+                    // over-bound value must degrade this job only, never trap
+                    // the whole legacy-cron.json load.
+                    if (v.integer > std.math.maxInt(i32)) {
+                        log.warn("cron.json job '{s}': ignoring timeout_secs={d} outside storable range 1..2147483647", .{ id, v.integer });
+                    }
+                    break :blk timeoutSecsFromJsonInt(v.integer);
+                }
             }
             break :blk null;
         };
@@ -3108,10 +3126,15 @@ fn dbLoadAllJobs(db: *c.sqlite3, allocator: std.mem.Allocator, scheduler: *CronS
         const delivery_to = try dbColumnTextOpt(stmt, 17, allocator);
         const created_at_s = c.sqlite3_column_int64(stmt, 18);
         const last_output_opt = try dbColumnTextOpt(stmt, 19, allocator);
-        const timeout_secs: ?u32 = if (c.sqlite3_column_type(stmt, 20) == c.SQLITE_NULL)
-            null
-        else
-            @intCast(c.sqlite3_column_int(stmt, 20));
+        const timeout_secs: ?u32 = blk: {
+            if (c.sqlite3_column_type(stmt, 20) == c.SQLITE_NULL) break :blk null;
+            // Mirror src/cron/db.zig's reader: old writers could store
+            // non-positive sentinels (-1), which degrade to "no budget"
+            // rather than trapping the cast.
+            const v = c.sqlite3_column_int(stmt, 20);
+            if (v <= 0) break :blk null;
+            break :blk @intCast(v);
+        };
         const skill_name_opt = try dbColumnTextOpt(stmt, 21, allocator);
         const skill_args_opt = try dbColumnTextOpt(stmt, 22, allocator);
         const delivery_best_effort = c.sqlite3_column_int(stmt, 23) != 0;
@@ -7437,7 +7460,14 @@ fn cliInitSeedAtPath(
         };
 
         const timeout: ?u32 = if (obj.get("timeout_secs")) |v| switch (v) {
-            .integer => |i| if (i > 0) @intCast(i) else null,
+            .integer => |i| blk: {
+                // This path runs after destructive DELETEs; errdefer does not
+                // catch a panic, so clamp instead of trapping mid-seed.
+                if (i > std.math.maxInt(i32)) {
+                    log.warn("seed job '{s}': ignoring timeout_secs={d} outside storable range 1..2147483647", .{ expression, i });
+                }
+                break :blk timeoutSecsFromJsonInt(i);
+            },
             else => null,
         } else null;
 
@@ -10456,6 +10486,19 @@ test "tick reschedules anchored recurring job using cron expression" {
     try std.testing.expectEqual(@as(i64, 4080), scheduler.jobs.items[0].next_run_secs);
 }
 
+test "timeoutSecsFromJsonInt accepts values up to i32 max" {
+    try std.testing.expectEqual(@as(u32, 120), timeoutSecsFromJsonInt(120).?);
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(i32)), timeoutSecsFromJsonInt(std.math.maxInt(i32)).?);
+}
+
+test "timeoutSecsFromJsonInt degrades zero negative and over-bound to null" {
+    // sqlite3_bind_int (c_int) cannot hold more than maxInt(i32); an unchecked
+    // @intCast would trap mid-load instead of dropping one job's budget.
+    try std.testing.expectEqual(@as(?u32, null), timeoutSecsFromJsonInt(std.math.maxInt(i32) + 1));
+    try std.testing.expectEqual(@as(?u32, null), timeoutSecsFromJsonInt(0));
+    try std.testing.expectEqual(@as(?u32, null), timeoutSecsFromJsonInt(-1));
+}
+
 // ── SQLite DB persistence tests ──────────────────────────────────
 
 test "db save and load roundtrip" {
@@ -10498,6 +10541,41 @@ test "db save and load roundtrip" {
     try std.testing.expect(lj.last_run_secs != null);
     try std.testing.expectEqual(@as(i64, 1_772_455_140), lj.last_run_secs.?);
     try std.testing.expectEqualStrings("ok", lj.last_status.?);
+}
+
+test "db load degrades non-positive stored timeout instead of trapping" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const db_path_str = try std.fmt.allocPrint(std.testing.allocator, "{s}/cron_neg_timeout.db", .{base});
+    defer std.testing.allocator.free(db_path_str);
+    const db_path_z = try std.testing.allocator.dupeZ(u8, db_path_str);
+    defer std.testing.allocator.free(db_path_z);
+
+    const db = try openCronDbAtPath(db_path_z);
+    defer _ = c.sqlite3_close(db);
+    try ensureCronTable(db);
+
+    var temp = CronScheduler.init(std.testing.allocator, 10, true);
+    defer temp.deinit();
+    const job = try temp.addJob("*/10 * * * *", "echo bad-timeout");
+    try dbSaveJob(db, temp.getMutableJob(job.id).?);
+
+    // Corrupt the stored value the way an old writer could have (-1 sentinel).
+    if (c.sqlite3_exec(db, "UPDATE cron_jobs SET timeout_secs = -1", null, null, null) != c.SQLITE_OK)
+        return error.ExecFailed;
+
+    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    defer loaded.deinit();
+    try dbLoadAllJobs(db, std.testing.allocator, &loaded);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.jobs.items.len);
+    try std.testing.expectEqual(@as(?u32, null), loaded.jobs.items[0].timeout_secs);
 }
 
 test "db save and load agent job with delivery" {
