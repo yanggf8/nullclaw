@@ -5913,6 +5913,7 @@ pub fn cliUpdateJob(
     tz_offset_s: ?i32,
     verification_mode: ?VerificationMode,
     repair_policy: ?RepairPolicy,
+    timeout_secs: ?u32,
 ) !void {
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
@@ -5957,6 +5958,11 @@ pub fn cliUpdateJob(
             body_buf.appendSlice(allocator, ",") catch {};
             json_util.appendJsonKeyValue(&body_buf, allocator, "repair_policy", rp.asStr()) catch {};
         }
+        if (timeout_secs) |t| {
+            var t_buf: [32]u8 = undefined;
+            const t_str = std.fmt.bufPrint(&t_buf, ",\"timeout_secs\":{d}", .{t}) catch "";
+            body_buf.appendSlice(allocator, t_str) catch {};
+        }
         body_buf.appendSlice(allocator, "}") catch {};
         if (gatewayPost(allocator, url, "/cron/update", body_buf.items)) return;
     }
@@ -5985,6 +5991,7 @@ pub fn cliUpdateJob(
         .tz_offset_s = tz_offset_s,
         .verification_mode = verification_mode,
         .repair_policy = repair_policy,
+        .timeout_secs = timeout_secs,
     };
     if (scheduler.updateJob(allocator, id, patch)) {
         // If SQLite is enabled, write only the updated row directly to the DB
@@ -9666,6 +9673,24 @@ test "updateJob modifies job fields" {
     try std.testing.expect(!updated.enabled);
     try std.testing.expect(updated.paused);
     try std.testing.expectEqual(SessionTarget.main, updated.session_target);
+}
+
+test "updateJob applies timeout_secs patch" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+    _ = try scheduler.addJob("* * * * *", "echo timed");
+    const id = scheduler.listJobs()[0].id;
+    try std.testing.expect(scheduler.getJob(id).?.timeout_secs == null);
+
+    try std.testing.expect(scheduler.updateJob(allocator, id, .{ .timeout_secs = 45 }));
+    try std.testing.expectEqual(@as(?u32, 45), scheduler.getJob(id).?.timeout_secs);
+
+    // Patch semantics: an update that omits --timeout must keep the stored value.
+    try std.testing.expect(scheduler.updateJob(allocator, id, .{ .command = "echo retimed" }));
+    const updated = scheduler.getJob(id).?;
+    try std.testing.expectEqual(@as(?u32, 45), updated.timeout_secs);
+    try std.testing.expectEqualStrings("echo retimed", updated.command);
 }
 
 test "updateJob keeps agent command and prompt in sync" {

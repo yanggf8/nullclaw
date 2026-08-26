@@ -102,7 +102,7 @@
 | `nullclaw cron show <id> [--runs N] [--json]` | 顯示單一任務的完整規格、下次觸發時間，以及最近 N 筆執行（預設 10 筆） |
 | `nullclaw cron pause <id>` / `resume <id>` | 暫停 / 恢復任務 |
 | `nullclaw cron remove <id>` | 刪除任務 |
-| `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>] [--verify <mode>] [--repair <policy>]` | 更新已有任務；`--enable` 同時清除 paused 標誌，`--disable` 同時設定 |
+| `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>] [--verify <mode>] [--repair <policy>] [--timeout <secs>]` | 更新已有任務；`--enable` 同時清除 paused 標誌，`--disable` 同時設定 |
 | `nullclaw cron runs <id> [--limit N] [--json]` | 查看任務最近執行記錄（包含 exit code、failure class、repair action、verified 狀態與 trace ID） |
 | `nullclaw cron trace <id> [--limit N] [--event <substr>]` | 從 `~/.nullclaw/skill-traces.jsonl` 排版列出 job_id 前綴符合 `<id>` 的逐事件診斷。`--event` 以事件名稱子字串收斂；`--limit` 只保留最近 N 筆 |
 | `nullclaw cron degraded [--hours N] [--job <id>] [--json]` | 列出時間窗內（預設 24 小時）所有失敗或降級的執行；比對條件為 `status=error` 或 `verified>=2`。有結果時附帶 `run-by-trace` 提示 |

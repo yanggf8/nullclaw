@@ -125,7 +125,7 @@ Notes:
 | `nullclaw cron explain <id> [--json]` | Show resolved execution, delivery, verification/repair, and trace environment for a job |
 | `nullclaw cron pause <id>` / `resume <id>` | Pause or resume a task |
 | `nullclaw cron remove <id>` | Delete a task |
-| `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>] [--verify <mode>] [--repair <policy>]` | Update an existing task; `--enable` also clears the paused flag, `--disable` sets it |
+| `nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <p>] [--model <m>] [--session-target isolated\|main] [--enable\|--disable] [--tz <offset>] [--verify <mode>] [--repair <policy>] [--timeout <secs>]` | Update an existing task; `--enable` also clears the paused flag, `--disable` sets it |
 | `nullclaw cron runs <id> [--limit N] [--json]` | Show recent run history for a task (includes exit code, failure class, repair action, verified state, and trace ID) |
 | `nullclaw cron trace <id> [--limit N] [--event <substr>]` | Pretty-print per-event diagnostics from `~/.nullclaw/skill-traces.jsonl` for jobs whose ID starts with `<id>`. `--event` narrows by event-name substring; `--limit` keeps the most-recent N events |
 | `nullclaw cron degraded [--hours N] [--job <id>] [--json]` | List failed or degraded runs across all jobs in a time window (default 24h). Matches runs where `status=error` OR `verified>=2`. Prints a `run-by-trace` hint when results are found |

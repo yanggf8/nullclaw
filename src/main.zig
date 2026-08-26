@@ -1763,7 +1763,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         \\  update <id> [--expression <expr>] [--command <cmd>] [--prompt <text>]
         \\             [--model <model>] [--session-target <isolated|main>]
         \\             [--enable] [--disable] [--tz <offset>]
-        \\             [--verify <mode>] [--repair <policy>]
+        \\             [--verify <mode>] [--repair <policy>] [--timeout <secs>]
         \\                                Update a cron job. --expression also recomputes next run time.
         \\  runs <id> [--limit N] [--json]
         \\                                List run history for a specific job (from cron_runs table)
@@ -1996,7 +1996,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliRunJob(allocator, run_id.?, dry_run);
     } else if (std.mem.eql(u8, subcmd, "update")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <prompt>] [--model <model>] [--session-target <isolated|main>] [--enable] [--disable] [--tz <offset>] [--verify <mode>] [--repair <policy>]\n", .{});
+            std.debug.print("Usage: nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <prompt>] [--model <model>] [--session-target <isolated|main>] [--enable] [--disable] [--tz <offset>] [--verify <mode>] [--repair <policy>] [--timeout <secs>]\n", .{});
             std_compat.process.exit(1);
         }
         const id = sub_args[1];
@@ -2009,6 +2009,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         var session_target: ?yc.cron.SessionTarget = null;
         var verification_mode: ?yc.cron.VerificationMode = null;
         var repair_policy: ?yc.cron.RepairPolicy = null;
+        var timeout_secs: ?u32 = null;
         var i: usize = 2;
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--expression") and i + 1 < sub_args.len) {
@@ -2044,6 +2045,23 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             } else if (std.mem.eql(u8, sub_args[i], "--repair") and i + 1 < sub_args.len) {
                 i += 1;
                 repair_policy = parseCronRepairArg(sub_args[i]);
+            } else if (std.mem.eql(u8, sub_args[i], "--timeout")) {
+                // Strict on purpose: unlike the add path's lenient `catch null`,
+                // a silent no-op on update would lie to the operator — including
+                // when the value is simply missing. The upper bound is what the
+                // persistence layer can hold (sqlite3_bind_int takes c_int);
+                // anything larger would trap mid-write instead of validating.
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Invalid --timeout: expected seconds as an integer between 1 and 2147483647\n", .{});
+                    std_compat.process.exit(1);
+                }
+                i += 1;
+                const parsed_timeout = std.fmt.parseInt(u32, sub_args[i], 10) catch 0;
+                if (parsed_timeout == 0 or parsed_timeout > std.math.maxInt(i32)) {
+                    std.debug.print("Invalid --timeout: expected seconds as an integer between 1 and 2147483647\n", .{});
+                    std_compat.process.exit(1);
+                }
+                timeout_secs = parsed_timeout;
             }
         }
         yc.cron.cliUpdateJob(
@@ -2058,6 +2076,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             tz_offset_s,
             verification_mode,
             repair_policy,
+            timeout_secs,
         ) catch |err| switch (err) {
             error.SessionTargetRequiresAgentJob => {
                 std.debug.print("session_target can only be updated for agent jobs\n", .{});
