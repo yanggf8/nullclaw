@@ -8354,6 +8354,131 @@ pub fn dbCompleteJob(
     }
 }
 
+/// Outcome of the consecutive-failure streak check for one job.
+pub const StreakInfo = struct {
+    /// Scheduled (manual=0) non-ok runs ending at the current run, inclusive.
+    streak: u32 = 0,
+    /// True exactly when this run newly crossed the threshold — edge
+    /// trigger. The 4th consecutive non-ok run does not fire again; an ok
+    /// run re-arms.
+    trigger: bool = false,
+};
+
+/// Row-level half of the canonical non-ok predicate — `(verified >= 2 OR
+/// status='error')` — because shell/legacy rows carry verified=0 while still
+/// failing. Reads status from column 0 and verified from column 1.
+fn streakRowNonOk(stmt: ?*c.sqlite3_stmt) bool {
+    if (c.sqlite3_column_int(stmt, 1) >= 2) return true;
+    const st = c.sqlite3_column_text(stmt, 0) orelse return false;
+    return std.mem.eql(u8, std.mem.sliceTo(st, 0), "error");
+}
+
+/// Edge-triggered consecutive-failure detector over cron_runs history.
+///
+/// Call only AFTER dbCompleteJob has written the current run — the walk
+/// anchors on `current_trace_id` and counts it as streak position one. The
+/// window is bounded by the current row's own id (`id <= … WHERE trace_id=?`),
+/// not by a wall-clock bound: rows inserted after this run started (a
+/// concurrent completion, or the next fire of the same job) carry a larger id
+/// and are excluded outright. Rows are ordered by id DESC — AUTOINCREMENT
+/// insertion order IS the completion order (dbCompleteJob is the only
+/// production writer), so the anchor, the window's highest id, always sorts
+/// first no matter what `finished_at` the writer persisted. Clock skew cannot
+/// hide the anchor row.
+///
+/// The anchor row must itself satisfy the non-ok predicate: an ok current run
+/// has no streak to report. Under repair_policy=retry_once the scheduler
+/// re-execs with a byte-identical NULLCLAW_JOB_ID, so one logical run writes
+/// up to two rows sharing one trace_id; adjacent rows carrying the same
+/// trace are collapsed into a single logical run — the streak counts runs,
+/// not rows, and LIMIT (threshold+1)*2 covers every row the walk may need.
+///
+/// Rows are filtered to scheduled executions with manual=0 in the SQL WHERE
+/// clause (not in Zig): a manual run interleaved mid-streak must neither
+/// extend nor break the count, and Zig-side filtering under LIMIT could
+/// exhaust the fetch window on manual rows before enough scheduled rows are
+/// visible. Caveat kept honest: runs enqueued over the gateway HTTP API are
+/// completed through the same worker with manual hardwired false and source
+/// 'cron_scheduler_skill', so the CLI's manual flag is the exception, not the
+/// rule — HTTP-triggered failures count toward this streak today.
+pub fn detectRunStreak(
+    db: *c.sqlite3,
+    job_id: []const u8,
+    threshold: u8,
+    current_trace_id: []const u8,
+) !StreakInfo {
+    // Zero disables entirely; without a trace anchor there is nothing to
+    // stand on — never guess which run is being evaluated.
+    if (threshold == 0 or current_trace_id.len == 0) return .{};
+
+    const sql = "SELECT status, verified, trace_id FROM cron_runs " ++
+        "WHERE job_id=?1 AND manual=0 AND id<=(SELECT MAX(id) FROM cron_runs " ++
+        "WHERE job_id=?1 AND trace_id=?2) " ++
+        "ORDER BY id DESC LIMIT ?3";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_text(stmt, 2, current_trace_id.ptr, @intCast(current_trace_id.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_int(stmt, 3, (@as(c_int, threshold) + 1) * 2);
+
+    // First examined row MUST be the anchor itself — anything else means the
+    // anchor row is missing and we refuse to guess which run is evaluated.
+    var anchored = false;
+    var prior_non_ok: u32 = 0;
+    // The previous row's trace, copied out of sqlite's row buffer on every
+    // step — a column_text pointer is invalid after the next step, so the
+    // adjacent-row comparison must never carry the slice across iterations.
+    // len 0 = none (first row, NULL trace, or a trace longer than the buffer;
+    // oversized traces simply never collapse).
+    var prev_trace_buf: [512]u8 = undefined;
+    var prev_trace_len: usize = 0;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return .{}; // step error: partial data never triggers
+        const trace_opt: ?[]const u8 = blk: {
+            if (c.sqlite3_column_type(stmt, 2) == c.SQLITE_NULL) break :blk null;
+            const ptr = c.sqlite3_column_text(stmt, 2) orelse break :blk null;
+            break :blk std.mem.sliceTo(ptr, 0);
+        };
+        // Adjacent rows sharing a trace are one logical run's attempts
+        // (retry_once reruns with a byte-identical trace) — count them once.
+        if (trace_opt) |tr| {
+            if (prev_trace_len > 0 and tr.len == prev_trace_len and
+                std.mem.eql(u8, tr, prev_trace_buf[0..prev_trace_len]))
+            {
+                continue;
+            }
+            if (tr.len <= prev_trace_buf.len) {
+                @memcpy(prev_trace_buf[0..tr.len], tr);
+                prev_trace_len = tr.len;
+            } else {
+                prev_trace_len = 0;
+            }
+        } else {
+            prev_trace_len = 0;
+        }
+        if (!anchored) {
+            if (trace_opt == null or !std.mem.eql(u8, trace_opt.?, current_trace_id)) return .{};
+            // The anchor is the current run itself. An ok anchor has no
+            // streak to report (an ok run re-arms) — re-check here so the
+            // detector stays self-consistent even if a caller forgets the
+            // non-ok gate.
+            if (!streakRowNonOk(stmt)) return .{};
+            anchored = true;
+            continue;
+        }
+        if (streakRowNonOk(stmt)) {
+            prior_non_ok += 1;
+        } else break;
+    }
+
+    if (!anchored) return .{};
+    const streak: u32 = 1 + prior_non_ok;
+    return .{ .streak = streak, .trigger = streak == threshold };
+}
+
 /// Reset any in_progress rows back to pending on worker startup (crash recovery).
 pub fn dbResetInProgressJobs(db: *c.sqlite3) !void {
     const sql = "UPDATE cron_run_queue SET status='pending', started_at=NULL WHERE status='in_progress'";
@@ -11637,6 +11762,318 @@ test "cron_runs pruning removes rows older than 30 days" {
     _ = c.sqlite3_bind_text(cnt_stmt, 1, jid.ptr, @intCast(jid.len), SQLITE_STATIC);
     _ = c.sqlite3_step(cnt_stmt);
     try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(cnt_stmt, 0));
+}
+
+// ── detectRunStreak tests ────────────────────────────────────────────────────
+
+const StreakSeedRow = struct {
+    ts: i64,
+    status: []const u8 = "error",
+    failure_class: ?[]const u8 = null,
+    verified: i32,
+    trace_id: ?[]const u8 = null,
+    manual: i32 = 0,
+    source: []const u8 = "cron_scheduler_skill",
+};
+
+const streak_seed_sql =
+    "INSERT INTO cron_runs(job_id, started_at, finished_at, status, exit_code, " ++
+    "failure_class, repair_action, verified, trace_id, manual, source) " ++
+    "VALUES(?1,?2,?2,?3,0,?4,NULL,?5,?6,?7,?8)";
+
+fn seedStreakRuns(db: *c.sqlite3, jid: []const u8, rows: []const StreakSeedRow) !void {
+    for (rows) |r| {
+        var stmt: ?*c.sqlite3_stmt = null;
+        try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_prepare_v2(db, streak_seed_sql, -1, &stmt, null));
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, jid.ptr, @intCast(jid.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(stmt, 2, r.ts);
+        _ = c.sqlite3_bind_text(stmt, 3, r.status.ptr, @intCast(r.status.len), SQLITE_STATIC);
+        if (r.failure_class) |fc| {
+            _ = c.sqlite3_bind_text(stmt, 4, fc.ptr, @intCast(fc.len), SQLITE_STATIC);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 4);
+        }
+        _ = c.sqlite3_bind_int(stmt, 5, r.verified);
+        if (r.trace_id) |tid| {
+            _ = c.sqlite3_bind_text(stmt, 6, tid.ptr, @intCast(tid.len), SQLITE_STATIC);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 6);
+        }
+        _ = c.sqlite3_bind_int(stmt, 7, r.manual);
+        _ = c.sqlite3_bind_text(stmt, 8, r.source.ptr, @intCast(r.source.len), SQLITE_STATIC);
+        try std.testing.expectEqual(@as(c_int, c.SQLITE_DONE), c.sqlite3_step(stmt));
+    }
+}
+
+test "detectRunStreak fires once when a fresh streak reaches the threshold" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    try seedStreakRuns(db, "streak-job", &.{
+        .{ .ts = 100, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 101, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 102, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:7" },
+    });
+
+    const info = try detectRunStreak(db, "streak-job", 3, "streak-job:7");
+    try std.testing.expectEqual(@as(u32, 3), info.streak);
+    try std.testing.expect(info.trigger);
+}
+
+test "detectRunStreak stays quiet while a streak continues past the threshold" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    try seedStreakRuns(db, "streak-job", &.{
+        .{ .ts = 99, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 100, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 101, .failure_class = "timeout", .verified = 3 },
+        .{ .ts = 102, .failure_class = "exec_error", .verified = 3, .trace_id = "streak-job:9" },
+    });
+
+    const info = try detectRunStreak(db, "streak-job", 3, "streak-job:9");
+    try std.testing.expectEqual(@as(u32, 4), info.streak);
+    try std.testing.expect(!info.trigger);
+}
+
+test "detectRunStreak re-arms after an ok run resets the count" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    try seedStreakRuns(db, "streak-job", &.{
+        .{ .ts = 99, .status = "ok", .failure_class = null, .verified = 1, .trace_id = "streak-job:4" },
+        .{ .ts = 100, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 101, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 102, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:8" },
+    });
+
+    const info = try detectRunStreak(db, "streak-job", 3, "streak-job:8");
+    try std.testing.expectEqual(@as(u32, 3), info.streak);
+    try std.testing.expect(info.trigger);
+}
+
+test "detectRunStreak skips interleaved manual runs entirely" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    // Manual runs — whether ok or failing — are operator ad-hoc invocations
+    // and must neither extend nor break the scheduled-run streak. The filter
+    // has to live in the SQL WHERE clause: with Zig-side filtering a raw
+    // LIMIT window can fill up on manual rows before enough scheduled rows
+    // are visible.
+    try seedStreakRuns(db, "streak-job", &.{
+        .{ .ts = 100, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 101, .status = "ok", .verified = 1, .manual = 1, .source = "cron_manual_skill", .trace_id = "streak-job:m1" },
+        .{ .ts = 102, .failure_class = "exec_error", .verified = 3, .manual = 1, .source = "cron_manual_skill", .trace_id = "streak-job:m2" },
+        .{ .ts = 103, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 104, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:6" },
+    });
+
+    const info = try detectRunStreak(db, "streak-job", 3, "streak-job:6");
+    try std.testing.expectEqual(@as(u32, 3), info.streak);
+    try std.testing.expect(info.trigger);
+}
+
+test "detectRunStreak counts legacy zero-verified error rows as non-ok" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    // Shell/legacy rows carry verified=0 with status='error'; the canonical
+    // predicate must still count them toward the streak.
+    try seedStreakRuns(db, "streak-job", &.{
+        .{ .ts = 100, .verified = 0 },
+        .{ .ts = 101, .failure_class = "exec_error", .verified = 3, .trace_id = "streak-job:3" },
+    });
+
+    const info = try detectRunStreak(db, "streak-job", 3, "streak-job:3");
+    try std.testing.expectEqual(@as(u32, 2), info.streak);
+    try std.testing.expect(!info.trigger);
+}
+
+test "detectRunStreak is quiet before the threshold is met" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    try seedStreakRuns(db, "streak-job", &.{
+        .{ .ts = 101, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 102, .failure_class = "contract_degraded", .verified = 2, .trace_id = "streak-job:2" },
+    });
+
+    const info = try detectRunStreak(db, "streak-job", 3, "streak-job:2");
+    try std.testing.expectEqual(@as(u32, 2), info.streak);
+    try std.testing.expect(!info.trigger);
+}
+
+test "detectRunStreak treats threshold zero as disabled" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    try seedStreakRuns(db, "streak-job", &.{
+        .{ .ts = 100, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 101, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 102, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:5" },
+    });
+
+    const info = try detectRunStreak(db, "streak-job", 0, "streak-job:5");
+    try std.testing.expectEqual(@as(u32, 0), info.streak);
+    try std.testing.expect(!info.trigger);
+}
+
+test "detectRunStreak bails out when its own run row is missing" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    try seedStreakRuns(db, "streak-job", &.{
+        .{ .ts = 100, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 101, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 102, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:other" },
+    });
+
+    // Defensive anchor: without the current run's own row the detector must
+    // not guess which run it is evaluating.
+    const info = try detectRunStreak(db, "streak-job", 3, "streak-job:missing");
+    try std.testing.expectEqual(@as(u32, 0), info.streak);
+    try std.testing.expect(!info.trigger);
+}
+
+test "detectRunStreak ignores scheduled rows inserted after its own run" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    try seedStreakRuns(db, "streak-job", &.{
+        .{ .ts = 100, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 101, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 102, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:7" },
+    });
+    // A concurrent completion of the same job lands with a larger id AFTER
+    // this evaluation starts. The id anchor must exclude it — it may neither
+    // break the streak nor eat the LIMIT window.
+    try seedStreakRuns(db, "streak-job", &.{
+        .{ .ts = 105, .failure_class = "timeout", .verified = 3, .trace_id = "streak-job:11" },
+    });
+
+    const info = try detectRunStreak(db, "streak-job", 3, "streak-job:7");
+    try std.testing.expectEqual(@as(u32, 3), info.streak);
+    try std.testing.expect(info.trigger);
+}
+
+test "detectRunStreak returns zero when the anchor run itself is ok" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    try seedStreakRuns(db, "streak-job", &.{
+        .{ .ts = 100, .failure_class = "contract_failed", .verified = 3 },
+        .{ .ts = 101, .failure_class = "contract_failed", .verified = 3 },
+        .{ .ts = 102, .status = "ok", .verified = 1, .trace_id = "streak-job:8" },
+    });
+
+    // The caller normally gates on verified != 1, but the detector must not
+    // count an ok current run as streak position one on its own.
+    const info = try detectRunStreak(db, "streak-job", 3, "streak-job:8");
+    try std.testing.expectEqual(@as(u32, 0), info.streak);
+    try std.testing.expect(!info.trigger);
+}
+
+test "detectRunStreak counts a retried run once per trace pair" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    // retry_once reruns with a byte-identical NULLCLAW_JOB_ID: every failing
+    // run writes TWO rows sharing one trace. Three failed runs, the third
+    // being the anchor — the streak must read 3 logical runs, not 6 rows.
+    try seedStreakRuns(db, "streak-job", &.{
+        .{ .ts = 100, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:1" },
+        .{ .ts = 101, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:1" },
+        .{ .ts = 102, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:2" },
+        .{ .ts = 103, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:2" },
+        .{ .ts = 104, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:3" },
+        .{ .ts = 105, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:3" },
+    });
+
+    const info = try detectRunStreak(db, "streak-job", 3, "streak-job:3");
+    try std.testing.expectEqual(@as(u32, 3), info.streak);
+    try std.testing.expect(info.trigger);
+}
+
+test "detectRunStreak stays quiet past the threshold when runs carry retry pairs" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    try seedStreakRuns(db, "streak-job", &.{
+        .{ .ts = 100, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:1" },
+        .{ .ts = 101, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:1" },
+        .{ .ts = 102, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:2" },
+        .{ .ts = 103, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:2" },
+        .{ .ts = 104, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:3" },
+        .{ .ts = 105, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:3" },
+        .{ .ts = 106, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:4" },
+        .{ .ts = 107, .failure_class = "contract_failed", .verified = 3, .trace_id = "streak-job:4" },
+    });
+
+    const info = try detectRunStreak(db, "streak-job", 3, "streak-job:4");
+    try std.testing.expectEqual(@as(u32, 4), info.streak);
+    try std.testing.expect(!info.trigger);
 }
 
 test "cron_runs started_at differs from finished_at when worker delays" {

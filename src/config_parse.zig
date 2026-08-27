@@ -1719,6 +1719,22 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (sch.object.get("agent_timeout_secs")) |v| {
                 if (v == .integer and v.integer >= 0) self.scheduler.agent_timeout_secs = @intCast(v.integer);
             }
+            if (sch.object.get("alert_channel")) |v| {
+                if (v == .string and v.string.len > 0)
+                    self.scheduler.alert_channel = try self.allocator.dupe(u8, v.string);
+            }
+            if (sch.object.get("alert_to")) |v| {
+                if (v == .string and v.string.len > 0)
+                    self.scheduler.alert_to = try self.allocator.dupe(u8, v.string);
+            }
+            if (sch.object.get("alert_account")) |v| {
+                if (v == .string and v.string.len > 0)
+                    self.scheduler.alert_account = try self.allocator.dupe(u8, v.string);
+            }
+            if (sch.object.get("alert_streak")) |v| {
+                if (v == .integer and v.integer >= 0 and v.integer <= 255)
+                    self.scheduler.alert_streak = @intCast(v.integer);
+            }
         }
     }
 
@@ -3204,4 +3220,94 @@ test "parseJson keeps fallback-only custom url provider refs in defaults" {
     try std.testing.expectEqualStrings("custom:https://fb.example.com/qianfan", cfg.default_provider);
     try std.testing.expect(cfg.default_model != null);
     try std.testing.expectEqualStrings("custom-model", cfg.default_model.?);
+}
+
+test "parseJson fills scheduler operator alert fields" {
+    // Regression: the alert_channel/alert_to/alert_account keys existed in
+    // config_types.zig and gateway.zig read them, but parseJson never filled
+    // them — state.alert_delivery stayed null forever and every operator
+    // fallback alert was silently skipped by deliverResult.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+    };
+
+    const json =
+        \\{
+        \\  "scheduler": {
+        \\    "enabled": true,
+        \\    "alert_channel": "telegram",
+        \\    "alert_to": "ops-chat",
+        \\    "alert_account": "ops-account"
+        \\  }
+        \\}
+    ;
+
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.scheduler.alert_channel != null);
+    try std.testing.expectEqualStrings("telegram", cfg.scheduler.alert_channel.?);
+    try std.testing.expect(cfg.scheduler.alert_to != null);
+    try std.testing.expectEqualStrings("ops-chat", cfg.scheduler.alert_to.?);
+    try std.testing.expect(cfg.scheduler.alert_account != null);
+    try std.testing.expectEqualStrings("ops-account", cfg.scheduler.alert_account.?);
+}
+
+test "parseJson rejects empty scheduler alert strings" {
+    // An empty string is still Some, and deliverResult only guards against a
+    // null channel — an empty one would be published to nowhere while looking
+    // configured.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = arena.allocator(),
+    };
+    try cfg.parseJson(
+        \\{"scheduler":{"alert_channel":"","alert_to":"","alert_account":""}}
+    );
+    try std.testing.expect(cfg.scheduler.alert_channel == null);
+    try std.testing.expect(cfg.scheduler.alert_to == null);
+    try std.testing.expect(cfg.scheduler.alert_account == null);
+}
+
+test "parseJson scheduler alert_streak accepts zero and defaults to three" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg_zero = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+    };
+    try cfg_zero.parseJson(
+        \\{"scheduler":{"alert_streak":0}}
+    );
+    try std.testing.expectEqual(@as(u8, 0), cfg_zero.scheduler.alert_streak);
+
+    var cfg_absent = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+    };
+    try cfg_absent.parseJson(
+        \\{"scheduler":{"agent_timeout_secs":30}}
+    );
+    try std.testing.expectEqual(@as(u8, 3), cfg_absent.scheduler.alert_streak);
+
+    // Out-of-range values leave the default untouched rather than truncating.
+    var cfg_over = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+    };
+    try cfg_over.parseJson(
+        \\{"scheduler":{"alert_streak":300}}
+    );
+    try std.testing.expectEqual(@as(u8, 3), cfg_over.scheduler.alert_streak);
 }

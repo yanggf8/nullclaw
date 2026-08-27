@@ -345,6 +345,9 @@ pub const SchedulerConfig = struct {
     alert_to: ?[]const u8 = null,
     /// Bot account to use for operator failure alerts (e.g. "main").
     alert_account: ?[]const u8 = null,
+    /// Consecutive scheduled non-ok runs after which one aggregated
+    /// escalation alert goes to the operator destination. 0 disables.
+    alert_streak: u8 = 3,
 };
 
 // ── Tool filter groups ──────────────────────────────────────────

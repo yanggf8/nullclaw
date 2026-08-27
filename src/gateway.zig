@@ -595,6 +595,11 @@ pub const GatewayState = struct {
     // Mirrors CronScheduler.alert_delivery for the run queue worker path.
     alert_delivery: ?cron_mod.DeliveryConfig = null,
 
+    // Consecutive scheduled non-ok runs after which one aggregated escalation
+    // alert goes to the operator destination. DB-direct skill worker only —
+    // the legacy in-memory CronScheduler has no equivalent. 0 disables.
+    cron_alert_streak: u8 = 3,
+
     // Job run queue — handleCronRun enqueues job IDs here; a single worker
     // thread pops and executes them sequentially to avoid concurrent Telegram
     // deliveries racing each other.
@@ -4545,6 +4550,7 @@ fn runQueueWorker(state: *GatewayState) void {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' resolution failed: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
+                        maybeAlertSkillStreak(state, arena, spec, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     defer arena.free(raw_skill_cmd);
@@ -4556,12 +4562,14 @@ fn runQueueWorker(state: *GatewayState) void {
                     }) catch |err| {
                         log.err("[{s}] skill env setup failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_skill");
+                        maybeAlertSkillStreak(state, arena, spec, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     defer skill_env.deinit();
                     cron_mod.putSkillBudgetEnv(&skill_env, timeout, skill_started_s) catch |err| {
                         log.err("[{s}] skill env setup failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_skill");
+                        maybeAlertSkillStreak(state, arena, spec, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     var skill_child = std_compat.process.Child.init(
@@ -4580,6 +4588,7 @@ fn runQueueWorker(state: *GatewayState) void {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' failed to start: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
+                        maybeAlertSkillStreak(state, arena, spec, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     errdefer {
@@ -4605,6 +4614,7 @@ fn runQueueWorker(state: *GatewayState) void {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' output collection failed: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
+                        maybeAlertSkillStreak(state, arena, spec, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     const skill_term = skill_child.wait() catch |err| {
@@ -4614,6 +4624,7 @@ fn runQueueWorker(state: *GatewayState) void {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' wait failed: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
+                        maybeAlertSkillStreak(state, arena, spec, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     if (skill_timed_out) log.warn("[{s}] skill timed out after {d}s", .{ spec.id, timeout });
@@ -4707,6 +4718,14 @@ fn runQueueWorker(state: *GatewayState) void {
                             ) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
+                    }
+                    // Aggregated operator escalation: when this run newly makes
+                    // N consecutive scheduled non-ok runs, send ONE streak
+                    // alert — routed operator-first — beside the per-run alert
+                    // above. Edge-triggered by detectRunStreak; an ok run
+                    // re-arms without any stored state.
+                    if (run_result.verified != 1) {
+                        maybeAlertSkillStreak(state, arena, spec, run_result, run_trace_id);
                     }
                     // Log status with first line of output for delivery observability.
                     // Stdout is typically a delivery confirmation; stderr is errors.
@@ -5132,6 +5151,61 @@ fn sendCronRepairAlert(
     ) catch return;
     defer allocator.free(msg);
     _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
+}
+
+/// Operator-first destination selector for the streak escalation alert.
+///
+/// `cronRepairAlertDelivery` and the skill branch's inline `alert_del` are
+/// deliberately JOB-FIRST — product-report visibility wins there, and both
+/// are locked by existing behaviour/tests. The escalation inverts that:
+/// the operator channel (state.alert_delivery) is where "this job keeps
+/// failing" belongs; the job's own delivery config is only a fallback for
+/// hosts without scheduler alert settings. An empty result is safe —
+/// deliverResult skips it as mode .none / null channel.
+fn alertDeliveryOperatorFirst(state: *const GatewayState, spec: anytype) cron_mod.DeliveryConfig {
+    if (state.alert_delivery) |ad| return ad;
+    if (spec.delivery.mode != .none) {
+        return .{
+            // .always, not the job's own mode: this alert only ever reports a
+            // failure, and deliverResult drops a failure under .on_success —
+            // which would silently swallow the escalation on such a job.
+            .mode = .always,
+            .channel = spec.delivery.channel,
+            .account_id = spec.delivery.account_id,
+            .to = spec.delivery.to,
+            .best_effort = true,
+        };
+    }
+    return cron_mod.DeliveryConfig{};
+}
+
+/// Fire ONE aggregated escalation when the current run newly makes
+/// `cron_alert_streak` consecutive scheduled non-ok runs. Call after
+/// complete() has written the current run row — detectRunStreak anchors on
+/// its trace id. Edge-triggered: no state to store, an ok run re-arms.
+fn maybeAlertSkillStreak(
+    state: *const GatewayState,
+    arena: std.mem.Allocator,
+    spec: anytype,
+    run_result: cron_mod.RunResult,
+    run_trace_id: []const u8,
+) void {
+    const threshold = state.cron_alert_streak;
+    if (threshold == 0) return;
+    const db_path = state.cron_db_path orelse return;
+    const eb = state.event_bus orelse return;
+    const db = cron_mod.openCronDbAtPath(db_path) catch return;
+    defer cron_mod.closeCronDb(db);
+    const info = cron_mod.detectRunStreak(db, spec.id, threshold, run_trace_id) catch return;
+    if (!info.trigger) return;
+    const fc = run_result.failure_class orelse "unknown";
+    const ra = run_result.repair_action orelse "none";
+    const msg = std.fmt.allocPrint(
+        arena,
+        "[cron] skill '{s}' non-ok for {d} consecutive scheduled runs (threshold {d}): failure={s} repair={s} trace={s}",
+        .{ spec.skill_name orelse spec.id, info.streak, threshold, fc, ra, run_trace_id },
+    ) catch return;
+    _ = cron_mod.deliverResult(state.allocator, alertDeliveryOperatorFirst(state, spec), msg, false, eb) catch {};
 }
 
 fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
@@ -7470,6 +7544,8 @@ pub fn run(
                 .best_effort = true,
             };
         }
+        // Streak escalation threshold for skill jobs; 0 disables.
+        state.cron_alert_streak = cfg.scheduler.alert_streak;
     }
 
     // Stack storage for audit logger. Declared early so it can be wired into the heap policy
@@ -9401,6 +9477,293 @@ test "sendCronRepairAlert uses alert delivery fallback for alert_only shell fail
     try std.testing.expect(std.mem.indexOf(u8, msg.content, "repair=alert_sent") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg.content, "trace=trace-shell-1") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg.content, "stderr preview") != null);
+}
+
+/// Seed scheduled cron_runs rows through dbCompleteJob — the same writer the
+/// scheduler itself uses — so detector reads what production writes.
+fn seedStreakHistory(
+    db_path_z: [:0]const u8,
+    rows: []const struct { ts: i64, verified: u8, trace_id: ?[]const u8 },
+) !void {
+    const db = try cron_mod.openCronDbAtPath(db_path_z);
+    defer cron_mod.closeCronDb(db);
+    try cron_mod.ensureCronTable(db);
+    for (rows) |r| {
+        const rr: ?cron_mod.RunResult = switch (r.verified) {
+            1 => .{ .exit_code = 0, .timed_out = false, .verified = 1 },
+            else => .{
+                .exit_code = 0,
+                .timed_out = false,
+                .failure_class = "contract_degraded",
+                .verified = r.verified,
+            },
+        };
+        try cron_mod.dbCompleteJob(
+            db,
+            "cct-job",
+            @intCast(r.ts),
+            r.ts,
+            if (r.verified == 1) "ok" else "error",
+            null,
+            false,
+            rr,
+            r.trace_id,
+            false,
+            "cron_scheduler_skill",
+            null,
+        );
+    }
+}
+
+test "skill streak escalation alerts the operator channel once at threshold" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/streak_alert.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    // Two scheduled non-ok runs already recorded; the third (the current run)
+    // crosses the threshold.
+    try seedStreakHistory(db_path_z, &.{
+        .{ .ts = 100, .verified = 2, .trace_id = "cct-job:1" },
+        .{ .ts = 101, .verified = 2, .trace_id = "cct-job:2" },
+        .{ .ts = 102, .verified = 2, .trace_id = "cct-job:3" },
+    });
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    state.cron_db_path = db_path_z;
+    state.cron_alert_streak = 3;
+
+    var test_bus = bus_mod.Bus.init();
+    defer test_bus.close();
+    state.event_bus = &test_bus;
+
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    state.alert_delivery = .{
+        .mode = .always,
+        .channel = try a.dupe(u8, "telegram"),
+        .to = try a.dupe(u8, "ops-chat"),
+        .best_effort = true,
+    };
+
+    // The job owns its product-report delivery too — operator-first routing
+    // must win over it, that is the entire point of the escalation.
+    const spec = struct {
+        id: []const u8 = "cct-job",
+        skill_name: ?[]const u8 = "cct",
+        repair_policy: cron_mod.RepairPolicy = .none,
+        delivery: cron_mod.DeliveryConfig = .{
+            .mode = .always,
+            .channel = "telegram",
+            .to = "job-chat",
+            .best_effort = true,
+        },
+    }{};
+    const run_result = cron_mod.RunResult{
+        .exit_code = 0,
+        .timed_out = false,
+        .failure_class = "contract_degraded",
+        .verified = 2,
+    };
+
+    maybeAlertSkillStreak(&state, a, spec, run_result, "cct-job:3");
+
+    try std.testing.expectEqual(@as(usize, 1), test_bus.outboundDepth());
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("ops-chat", msg.chat_id);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "non-ok for 3 consecutive scheduled runs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "failure=contract_degraded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "trace=cct-job:3") != null);
+}
+
+test "skill streak escalation stays quiet below the threshold" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/streak_quiet.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    try seedStreakHistory(db_path_z, &.{
+        .{ .ts = 101, .verified = 2, .trace_id = "cct-job:1" },
+        .{ .ts = 102, .verified = 2, .trace_id = "cct-job:2" },
+    });
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    state.cron_db_path = db_path_z;
+    state.cron_alert_streak = 3;
+
+    var test_bus = bus_mod.Bus.init();
+    defer test_bus.close();
+    state.event_bus = &test_bus;
+
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    state.alert_delivery = .{
+        .mode = .always,
+        .channel = try a.dupe(u8, "telegram"),
+        .to = try a.dupe(u8, "ops-chat"),
+        .best_effort = true,
+    };
+
+    const spec = struct {
+        id: []const u8 = "cct-job",
+        skill_name: ?[]const u8 = "cct",
+        repair_policy: cron_mod.RepairPolicy = .none,
+        delivery: cron_mod.DeliveryConfig = .{},
+    }{};
+    const run_result = cron_mod.RunResult{
+        .exit_code = 0,
+        .timed_out = false,
+        .failure_class = "contract_degraded",
+        .verified = 2,
+    };
+
+    maybeAlertSkillStreak(&state, a, spec, run_result, "cct-job:2");
+
+    try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+}
+
+test "skill streak escalation fires for repeated pre-exec failures" {
+    // Regression: the six early-exit paths (resolution/env/budget/spawn/
+    // collect/wait) write a scheduled verified=3 row and `continue`. A skill
+    // that never starts — broken SKILL.md, missing binary — is exactly what
+    // the operator escalation exists to catch, so those exits must run the
+    // detector too, not just the classify-after-wait path.
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/streak_preexec.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    try seedStreakHistory(db_path_z, &.{
+        .{ .ts = 100, .verified = 3, .trace_id = "cct-job:1" },
+        .{ .ts = 101, .verified = 3, .trace_id = "cct-job:2" },
+        .{ .ts = 102, .verified = 3, .trace_id = "cct-job:3" },
+    });
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    state.cron_db_path = db_path_z;
+    state.cron_alert_streak = 3;
+
+    var test_bus = bus_mod.Bus.init();
+    defer test_bus.close();
+    state.event_bus = &test_bus;
+
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    state.alert_delivery = .{
+        .mode = .always,
+        .channel = try a.dupe(u8, "telegram"),
+        .to = try a.dupe(u8, "ops-chat"),
+        .best_effort = true,
+    };
+
+    const spec = struct {
+        id: []const u8 = "cct-job",
+        skill_name: ?[]const u8 = "cct",
+        repair_policy: cron_mod.RepairPolicy = .none,
+        delivery: cron_mod.DeliveryConfig = .{},
+    }{};
+
+    maybeAlertSkillStreak(&state, a, spec, cron_mod.execErrorRunResult(), "cct-job:3");
+
+    try std.testing.expectEqual(@as(usize, 1), test_bus.outboundDepth());
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("ops-chat", msg.chat_id);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "failure=exec_error") != null);
+}
+
+test "skill streak escalation falls back to the job channel without operator config" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/streak_fallback.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    try seedStreakHistory(db_path_z, &.{
+        .{ .ts = 100, .verified = 3, .trace_id = "cct-job:1" },
+        .{ .ts = 101, .verified = 2, .trace_id = "cct-job:2" },
+        .{ .ts = 102, .verified = 2, .trace_id = "cct-job:3" },
+    });
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    state.cron_db_path = db_path_z;
+    state.cron_alert_streak = 3;
+    // No state.alert_delivery — operator channel unconfigured.
+
+    var test_bus = bus_mod.Bus.init();
+    defer test_bus.close();
+    state.event_bus = &test_bus;
+
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    const spec = struct {
+        id: []const u8 = "cct-job",
+        skill_name: ?[]const u8 = "cct",
+        repair_policy: cron_mod.RepairPolicy = .none,
+        delivery: cron_mod.DeliveryConfig = .{
+            .mode = .always,
+            .channel = "telegram",
+            .to = "job-chat",
+            .best_effort = true,
+        },
+    }{};
+    const run_result = cron_mod.RunResult{
+        .exit_code = 0,
+        .timed_out = false,
+        .failure_class = "contract_failed",
+        .verified = 3,
+    };
+
+    maybeAlertSkillStreak(&state, a, spec, run_result, "cct-job:3");
+
+    try std.testing.expectEqual(@as(usize, 1), test_bus.outboundDepth());
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("job-chat", msg.chat_id);
 }
 
 // ── Bearer Token Validation tests ───────────────────────────────
