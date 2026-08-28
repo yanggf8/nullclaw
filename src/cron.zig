@@ -2568,10 +2568,15 @@ pub fn deliverResult(
 // ── SQLite Persistence ───────────────────────────────────────────
 
 /// Get the path to the cron SQLite DB: ~/.nullclaw/cron.db
+/// Path of the cron DB, always inside the directory ensureCronDir creates —
+/// both resolve through config_paths.defaultConfigDir (NULLCLAW_HOME when
+/// set, else $HOME/.nullclaw). Resolving this through $HOME alone while
+/// ensureCronDir honoured NULLCLAW_HOME left the parent uncreated and every
+/// DB open failing with SqliteOpenFailed.
 fn cronDbPath(allocator: std.mem.Allocator) ![]const u8 {
-    const home = try platform.getHomeDir(allocator);
-    defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron.db" });
+    const dir = try config_paths.defaultConfigDir(allocator);
+    defer allocator.free(dir);
+    return std.fs.path.join(allocator, &.{ dir, "cron.db" });
 }
 
 /// Close a cron SQLite DB handle returned by openCronDbAtPath.
@@ -12074,6 +12079,33 @@ test "detectRunStreak stays quiet past the threshold when runs carry retry pairs
     const info = try detectRunStreak(db, "streak-job", 3, "streak-job:4");
     try std.testing.expectEqual(@as(u32, 4), info.streak);
     try std.testing.expect(!info.trigger);
+}
+
+test "cronDbPath stays inside the directory ensureCronDir creates under NULLCLAW_HOME" {
+    // setenv/unsetenv are POSIX-only; Windows has no cimport member for them.
+    // Matches the guard on the other env-override tests (see config.zig).
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const libc = @cImport({
+        @cInclude("stdlib.h");
+    });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const base_z = try std.testing.allocator.dupeZ(u8, base);
+    defer std.testing.allocator.free(base_z);
+    try std.testing.expectEqual(@as(c_int, 0), libc.setenv("NULLCLAW_HOME", base_z.ptr, 1));
+    defer _ = libc.unsetenv("NULLCLAW_HOME");
+
+    const path = try cronDbPath(std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    // The DB must live inside the directory ensureCronDir creates. Resolving
+    // the two through different homes (NULLCLAW_HOME vs $HOME) left the
+    // parent uncreated and every open failing with SqliteOpenFailed
+    // (streak-acceptance run, 2026-08-28).
+    const dir = try config_paths.defaultConfigDir(std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    try std.testing.expectEqualStrings(dir, std.fs.path.dirname(path).?);
 }
 
 test "cron_runs started_at differs from finished_at when worker delays" {
