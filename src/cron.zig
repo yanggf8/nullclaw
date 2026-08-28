@@ -7191,13 +7191,16 @@ pub fn cliFindRunByTrace(allocator: std.mem.Allocator, trace_id: []const u8, jso
     }
 }
 
-/// CLI: backup cron.db to ~/.nullclaw/backup/cron.db.<timestamp>
+/// CLI: backup cron.db to <instance dir>/backup/cron.db.<timestamp>
 pub fn cliBackup(allocator: std.mem.Allocator) !void {
-    const home = try platform.getHomeDir(allocator);
-    defer allocator.free(home);
-    const db_path = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron.db" });
+    // The instance dir — the same one cronDbPath and ensureCronDir resolve
+    // through (NULLCLAW_HOME when set, else $HOME/.nullclaw). Naming $HOME
+    // directly would back up another install's DB.
+    const dir = try config_paths.defaultConfigDir(allocator);
+    defer allocator.free(dir);
+    const db_path = try std.fs.path.join(allocator, &.{ dir, "cron.db" });
     defer allocator.free(db_path);
-    const backup_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "backup" });
+    const backup_dir = try std.fs.path.join(allocator, &.{ dir, "backup" });
     defer allocator.free(backup_dir);
 
     std_compat.fs.cwd().makePath(backup_dir) catch {};
@@ -7233,9 +7236,9 @@ pub fn cliBackup(allocator: std.mem.Allocator) !void {
 
 /// CLI: restore cron.db from a backup file. If no file specified, uses the latest backup.
 pub fn cliRestore(allocator: std.mem.Allocator, file_arg: ?[]const u8) !void {
-    const home = try platform.getHomeDir(allocator);
-    defer allocator.free(home);
-    const db_path = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron.db" });
+    const instance_dir = try config_paths.defaultConfigDir(allocator);
+    defer allocator.free(instance_dir);
+    const db_path = try std.fs.path.join(allocator, &.{ instance_dir, "cron.db" });
     defer allocator.free(db_path);
 
     if (file_arg) |file| {
@@ -7249,7 +7252,7 @@ pub fn cliRestore(allocator: std.mem.Allocator, file_arg: ?[]const u8) !void {
     }
 
     // Find latest backup
-    const backup_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "backup" });
+    const backup_dir = try std.fs.path.join(allocator, &.{ instance_dir, "backup" });
     defer allocator.free(backup_dir);
     var dir = std_compat.fs.cwd().openDir(backup_dir, .{ .iterate = true }) catch |err| {
         log.err("Cannot open backup dir: {s}", .{@errorName(err)});
@@ -7282,11 +7285,11 @@ pub fn cliRestore(allocator: std.mem.Allocator, file_arg: ?[]const u8) !void {
     }
 }
 
-/// CLI: export all enabled DB jobs to ~/.nullclaw/cron-seed.json
+/// CLI: export all enabled DB jobs to <instance dir>/cron-seed.json
 pub fn cliExportSeed(allocator: std.mem.Allocator) !void {
-    const home = try platform.getHomeDir(allocator);
-    defer allocator.free(home);
-    const seed_path = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron-seed.json" });
+    const dir = try config_paths.defaultConfigDir(allocator);
+    defer allocator.free(dir);
+    const seed_path = try std.fs.path.join(allocator, &.{ dir, "cron-seed.json" });
     defer allocator.free(seed_path);
 
     // Load all jobs from DB
@@ -7536,14 +7539,14 @@ fn cliInitSeedAtPath(
     log.info("Loaded {d} jobs from {s}", .{ count, seed_path });
 }
 
-/// CLI: load jobs from ~/.nullclaw/cron-seed.json into DB (DB-direct, no gateway).
+/// CLI: load jobs from <instance dir>/cron-seed.json into DB (DB-direct, no gateway).
 /// Initialize cron DB from seed file. DESTRUCTIVE with --rebuild: clears jobs, run queue, and run history.
 /// Use only for fresh system setup. For operational changes, use add/update/remove/pause/resume.
 /// For recovery, use `cron restore`.
 pub fn cliInitSeed(allocator: std.mem.Allocator, rebuild: bool) !void {
-    const home = try platform.getHomeDir(allocator);
-    defer allocator.free(home);
-    const seed_path = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron-seed.json" });
+    const dir = try config_paths.defaultConfigDir(allocator);
+    defer allocator.free(dir);
+    const seed_path = try std.fs.path.join(allocator, &.{ dir, "cron-seed.json" });
     defer allocator.free(seed_path);
 
     const db_path_z = try getCronDbPathZ(allocator);
