@@ -633,3 +633,13 @@ When working in fast iterative mode:
 - Do not "ship and hope" on security-sensitive paths.
 - If uncertain about Zig 0.16 API, check `src/` for existing usage patterns before guessing.
 - If uncertain about architecture, read the vtable interface definition before implementing.
+
+## Deployment (production on this box)
+
+The gateway runs as the user systemd unit **`nullclaw.service`**
+(`ExecStart=zig-out/bin/nullclaw gateway`, env from `~/.nullclaw/.env`, logs to
+the user journal). To ship a change: `zig build -Doptimize=ReleaseSmall`
+(that is the profile the running binary matches — Debug builds are ~200 MB and
+ReleaseSafe doubles the deployed size, so do not move the service to either),
+then `systemctl --user restart nullclaw`. Give it the ~2 minutes it takes to
+report "Gateway listening on 127.0.0.1:3000" before probing `/health`.

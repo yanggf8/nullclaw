@@ -5191,21 +5191,59 @@ fn maybeAlertSkillStreak(
     run_trace_id: []const u8,
 ) void {
     const threshold = state.cron_alert_streak;
-    if (threshold == 0) return;
-    const db_path = state.cron_db_path orelse return;
-    const eb = state.event_bus orelse return;
-    const db = cron_mod.openCronDbAtPath(db_path) catch return;
+    if (threshold == 0) {
+        log.debug("streak: alert_streak=0 disables escalation for job {s}", .{spec.id});
+        return;
+    }
+    const db_path = state.cron_db_path orelse {
+        log.warn("streak: no cron_db_path — cannot evaluate escalation for job {s}", .{spec.id});
+        return;
+    };
+    const eb = state.event_bus orelse {
+        log.warn("streak: no event_bus — cannot deliver escalation for job {s}", .{spec.id});
+        return;
+    };
+    // Until 2026-09-02 every path above returned silently, so "did the streak
+    // fire and was it delivered?" was not answerable from disk — the sleep
+    // that was supposed to catch a silent half-outage was itself silent. The
+    // decision and the delivery outcome are now logged (streak fired -> .warn).
+    const db = cron_mod.openCronDbAtPath(db_path) catch |err| {
+        log.warn("streak: openCronDbAtPath failed ({s}) — no escalation for job {s}", .{ @errorName(err), spec.id });
+        return;
+    };
     defer cron_mod.closeCronDb(db);
-    const info = cron_mod.detectRunStreak(db, spec.id, threshold, run_trace_id) catch return;
-    if (!info.trigger) return;
+    const info = cron_mod.detectRunStreak(db, spec.id, threshold, run_trace_id) catch |err| {
+        log.warn("streak: detectRunStreak failed ({s}) — no escalation for job {s}", .{ @errorName(err), spec.id });
+        return;
+    };
+    if (!info.trigger) {
+        log.debug("streak: job {s} at streak {d}, threshold {d} — quiet", .{ spec.id, info.streak, threshold });
+        return;
+    }
     const fc = run_result.failure_class orelse "unknown";
     const ra = run_result.repair_action orelse "none";
     const msg = std.fmt.allocPrint(
         arena,
         "[cron] skill '{s}' non-ok for {d} consecutive scheduled runs (threshold {d}): failure={s} repair={s} trace={s}",
         .{ spec.skill_name orelse spec.id, info.streak, threshold, fc, ra, run_trace_id },
-    ) catch return;
-    _ = cron_mod.deliverResult(state.allocator, alertDeliveryOperatorFirst(state, spec), msg, false, eb) catch {};
+    ) catch {
+        log.warn("streak: allocPrint failed for job {s}", .{spec.id});
+        return;
+    };
+    const delivered = cron_mod.deliverResult(
+        state.allocator,
+        alertDeliveryOperatorFirst(state, spec),
+        msg,
+        false,
+        eb,
+    ) catch |err| {
+        log.warn("streak: deliverResult threw ({s}) — escalation NOT sent for job {s}", .{ @errorName(err), spec.id });
+        return;
+    };
+    log.warn(
+        "streak escalation fired for job {s}: streak={d}/{d} trace={s} delivered={}",
+        .{ spec.id, info.streak, threshold, run_trace_id, delivered },
+    );
 }
 
 fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
