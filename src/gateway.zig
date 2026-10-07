@@ -4702,11 +4702,21 @@ fn runQueueWorker(state: *GatewayState) void {
                     const skill_status = if (skill_ok) "ok" else "error";
                     // Skills self-deliver — no cron delivery needed.
                     complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std_compat.time.timestamp(), skill_status, if (skill_output.len > 0) skill_output else null, spec.delete_after_run, false, run_result, run_trace_id, "cron_scheduler_skill");
+                    if (!skill_ok) {
+                        if (state.cron_db_path) |db_path| {
+                            const db = cron_mod.openCronDbAtPath(db_path) catch null;
+                            if (db) |handle| {
+                                defer cron_mod.closeCronDb(handle);
+                                _ = cron_mod.dbSetRunDiagnostic(handle, spec.id, run_trace_id, skill_stderr.items) catch false;
+                            }
+                        }
+                    }
                     // Alert operator on hard failure (verified=3) or degraded content (verified=2).
                     if (run_result.verified != 1) {
                         if (state.event_bus) |eb| {
-                            const stderr_preview = if (skill_stderr.items.len > 0)
-                                skill_stderr.items[0..@min(skill_stderr.items.len, 200)]
+                            const diagnostic = cron_mod.skillFailureDiagnostic(skill_stderr.items);
+                            const stderr_preview = if (diagnostic.len > 0)
+                                diagnostic[0..@min(diagnostic.len, 200)]
                             else
                                 "no stderr";
                             const fc = run_result.failure_class orelse "unknown";
@@ -4727,16 +4737,15 @@ fn runQueueWorker(state: *GatewayState) void {
                     if (run_result.verified != 1) {
                         maybeAlertSkillStreak(state, arena, spec, run_result, run_trace_id);
                     }
-                    // Log status with first line of output for delivery observability.
+                    // Log the final Telegram outcome on failure, not attempt 1.
                     // Stdout is typically a delivery confirmation; stderr is errors.
-                    // Use stderr for failures (more diagnostic), stdout for success.
                     const log_output = if (!skill_ok and skill_stderr.items.len > 0)
-                        skill_stderr.items
+                        cron_mod.skillFailureDiagnostic(skill_stderr.items)
                     else
                         skill_stdout.items;
                     if (log_output.len > 0) {
                         const nl = std.mem.indexOfScalar(u8, log_output, '\n') orelse log_output.len;
-                        log.info("[{s}] skill completed ({s}, verified={d}): {s}", .{ spec.id, skill_status, run_result.verified, log_output[0..@min(nl, 120)] });
+                        log.info("[{s}] skill completed ({s}, verified={d}): {s}", .{ spec.id, skill_status, run_result.verified, log_output[0..@min(nl, 200)] });
                     } else {
                         log.info("[{s}] skill completed ({s}, verified={d}): (no output)", .{ spec.id, skill_status, run_result.verified });
                     }

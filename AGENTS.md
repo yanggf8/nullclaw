@@ -378,12 +378,15 @@ CREATE TABLE IF NOT EXISTS cron_runs (
   repair_action  TEXT,
   verified       INTEGER NOT NULL DEFAULT 0,
   trace_id       TEXT,
+  diagnostic     TEXT,
   manual         INTEGER NOT NULL DEFAULT 0,
   source         TEXT
 );
 ```
 
 `source` records the execution path that spawned the run — one of `cron_scheduler_{agent,skill,shell}`, `cron_legacy_scheduler_{agent,skill,shell}`, or `cron_manual_{agent,skill,shell}`. It mirrors the `NULLCLAW_EXECUTION_SOURCE` env var injected into the subprocess and is `NULL` for pre-migration rows (the `manual` column is used as a display fallback in that case).
+
+`diagnostic` is a bounded, structured Telegram terminal summary for a failed skill run. Raw stderr and response bodies are not persisted there. It is `NULL` for old runs and failures without a matching safe summary.
 
 `dbCompleteJob` INSERTs the row and immediately prunes rows older than 30 days for that job (inline `DELETE`; no separate vacuum job needed).
 

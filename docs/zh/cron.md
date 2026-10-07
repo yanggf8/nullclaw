@@ -132,6 +132,10 @@ nullclaw cron list --match oil --json
 nullclaw cron run-by-trace <trace_id>
 ```
 
+新的 Telegram 傳送失敗紀錄會附上該次執行的 `diagnostic` 終局摘要，包含嘗試次數、
+錯誤類別與耗時，不包含請求網址或 bot token。舊紀錄的 `diagnostic` 為 `null`；
+資料庫不保存每次重試的個別訊息。
+
 若要查看 skill 自身寫入的逐事件診斷（cache 命中、LLM 呼叫耗時、substaging 事件、驗證失敗等），使用 `cron trace`。它會掃描 `~/.nullclaw/skill-traces.jsonl` 並排版列出符合的事件：
 
 ```bash

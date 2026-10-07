@@ -1787,7 +1787,8 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         \\                                List failed or degraded runs (status=error OR verified>=2) across all jobs.
         \\                                --hours defaults to 24.
         \\  run-by-trace <trace_id> [--json]
-        \\                                Find a run by trace_id (exact match).
+        \\                                Find a run by trace_id (exact match), including a safe
+        \\                                Telegram failure diagnostic when available.
         \\  backup                        Backup cron.db to ~/.nullclaw/backup/
         \\  restore [file]                Restore cron.db from latest backup or specified file
         \\  export-seed                   Export enabled jobs to ~/.nullclaw/cron-seed.json

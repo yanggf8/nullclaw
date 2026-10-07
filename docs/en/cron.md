@@ -131,6 +131,11 @@ To inspect one run by trace:
 nullclaw cron run-by-trace <trace_id>
 ```
 
+For new Telegram delivery failures, this command includes a bounded terminal
+`diagnostic` for the exact run. It records the final attempt count, error class,
+and elapsed time without the request URL or bot token. Older runs have
+`diagnostic: null`; the individual retry lines are not stored in the database.
+
 For per-event diagnostics from skills (cache hits, LLM call timings, substaging
 events, validation failures), use `cron trace`. It scans
 `~/.nullclaw/skill-traces.jsonl` and pretty-prints matching events:

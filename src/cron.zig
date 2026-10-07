@@ -382,6 +382,70 @@ pub fn captureStderrTail(allocator: std.mem.Allocator, stderr: []const u8) ?[]co
     return allocator.dupe(u8, stderr[start..]) catch null;
 }
 
+/// The final Telegram outcome is more useful than the first retry diagnostic.
+/// Fall back to the last non-empty stderr line for skills without Telegram.
+pub fn skillFailureDiagnostic(stderr: []const u8) []const u8 {
+    var rest = std.mem.trimEnd(u8, stderr, "\r\n");
+    var fallback: []const u8 = "";
+    while (rest.len > 0) {
+        const newline = std.mem.lastIndexOfScalar(u8, rest, '\n');
+        const line = std.mem.trim(u8, rest[if (newline) |i| i + 1 else 0..], "\r\n");
+        if (line.len > 0) {
+            if (std.mem.startsWith(u8, line, "[telegram]")) return line;
+            if (fallback.len == 0) fallback = line;
+        }
+        rest = if (newline) |i| rest[0..i] else break;
+    }
+    return fallback;
+}
+
+/// Only persist the terminal Telegram summary emitted by the current sender.
+/// Its fixed alphabet excludes URLs, bot-token punctuation, and response bodies.
+pub fn safeSkillRunDiagnostic(stderr: []const u8, trace_id: []const u8) ?[]const u8 {
+    const line = skillFailureDiagnostic(stderr);
+    if (line.len == 0 or line.len > 256) return null;
+    const prefix = "[telegram] trace=";
+    if (!std.mem.startsWith(u8, line, prefix)) return null;
+    const after_trace = line[prefix.len..];
+    const space = std.mem.indexOfScalar(u8, after_trace, ' ') orelse return null;
+    if (!std.mem.eql(u8, after_trace[0..space], trace_id)) return null;
+    const summary = after_trace[space + 1 ..];
+    if (!std.mem.startsWith(u8, summary, "send failed (attempts=")) return null;
+    if (std.mem.indexOf(u8, summary, " last=") == null or
+        std.mem.indexOf(u8, summary, " total_elapsed=") == null or
+        !std.mem.endsWith(u8, summary, "s)")) return null;
+    for (summary) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == ' ' or byte == '_' or
+            byte == '=' or byte == '.' or byte == '(' or byte == ')') continue;
+        return null;
+    }
+    return line;
+}
+
+test "skill failure diagnostic prefers final telegram outcome" {
+    // Regression: the gateway used the first stderr line, so a three-attempt
+    // Telegram failure surfaced only attempt 1 and hid the final cause.
+    const stderr =
+        "[telegram] trace=job:1 attempt 1/3 got transport ConnectionFailed\n" ++
+        "[telegram] trace=job:1 send failed (attempts=3 last=transport ConnectionFailed io=NetworkUnreachable total_elapsed=30.0s)\n" ++
+        "[delivery] telegram send failed for chat=chat account=main\n";
+    try std.testing.expectEqualStrings(
+        "[telegram] trace=job:1 send failed (attempts=3 last=transport ConnectionFailed io=NetworkUnreachable total_elapsed=30.0s)",
+        skillFailureDiagnostic(stderr),
+    );
+    try std.testing.expectEqualStrings("second", skillFailureDiagnostic("first\nsecond\n"));
+    try std.testing.expectEqualStrings("", skillFailureDiagnostic("\n"));
+}
+
+test "safe skill run diagnostic accepts only matching structured terminal line" {
+    const good = "[telegram] trace=job:1 send failed (attempts=3 last=transport ConnectionFailed io=NetworkUnreachable total_elapsed=30.0s)";
+    try std.testing.expectEqualStrings(good, safeSkillRunDiagnostic(good, "job:1").?);
+    try std.testing.expect(safeSkillRunDiagnostic(good, "job:2") == null);
+    try std.testing.expect(safeSkillRunDiagnostic("[telegram] trace=job:1 attempt 1/3 got transport ConnectionFailed", "job:1") == null);
+    try std.testing.expect(safeSkillRunDiagnostic("[telegram] trace=job:1 send failed (attempts=1 last=https://secret total_elapsed=1.0s)", "job:1") == null);
+    try std.testing.expect(safeSkillRunDiagnostic("[telegram] trace=job:1 send failed (attempts=1 last=HTTP 403 total_elapsed=1.0s)\n[delivery] failed", "job:1") != null);
+}
+
 /// Duration unit for "once" delay parsing.
 pub const DurationUnit = enum {
     seconds,
@@ -2729,6 +2793,7 @@ pub fn ensureCronRunsTable(db: *c.sqlite3) !void {
     _ = c.sqlite3_exec(db, "ALTER TABLE cron_runs ADD COLUMN repair_action TEXT", null, null, null);
     _ = c.sqlite3_exec(db, "ALTER TABLE cron_runs ADD COLUMN verified INTEGER NOT NULL DEFAULT 0", null, null, null);
     _ = c.sqlite3_exec(db, "ALTER TABLE cron_runs ADD COLUMN trace_id TEXT", null, null, null);
+    _ = c.sqlite3_exec(db, "ALTER TABLE cron_runs ADD COLUMN diagnostic TEXT", null, null, null);
     // Migration: distinguish runs spawned by the scheduler (manual=0, default)
     // from runs invoked manually via `nullclaw cron run`. Aggregate queries that
     // want "scheduled only" should add WHERE manual=0.
@@ -5742,6 +5807,9 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 "cron_manual_skill",
                 stderr_tail_for_db,
             ) catch {};
+            if (!skill_ok) {
+                _ = dbSetRunDiagnostic(db, spec.id, run_trace_id, skill_stderr.items) catch false;
+            }
 
             if (run_result.verified != 1) {
                 const fc = run_result.failure_class orelse "unknown";
@@ -7079,7 +7147,7 @@ pub fn cliFindRunByTrace(allocator: std.mem.Allocator, trace_id: []const u8, jso
 
     const sql =
         "SELECT id, job_id, started_at, finished_at, status, exit_code, " ++
-        "verified, failure_class, repair_action, output " ++
+        "verified, failure_class, repair_action, output, diagnostic " ++
         "FROM cron_runs WHERE trace_id = ?1 " ++
         "ORDER BY finished_at DESC LIMIT 10";
 
@@ -7139,6 +7207,16 @@ pub fn cliFindRunByTrace(allocator: std.mem.Allocator, trace_id: []const u8, jso
                 const out_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 9));
                 try appendJsonStr(&buf, allocator, out_ptr[0..out_len]);
             }
+            try buf.appendSlice(allocator, ",\"trace_id\":");
+            try appendJsonStr(&buf, allocator, trace_id);
+            try buf.appendSlice(allocator, ",\"diagnostic\":");
+            if (c.sqlite3_column_type(stmt, 10) == c.SQLITE_NULL) {
+                try buf.appendSlice(allocator, "null");
+            } else {
+                const diagnostic_ptr = c.sqlite3_column_text(stmt, 10);
+                const diagnostic_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 10));
+                try appendJsonStr(&buf, allocator, diagnostic_ptr[0..diagnostic_len]);
+            }
             try buf.append(allocator, '}');
         }
         try buf.append(allocator, ']');
@@ -7183,6 +7261,11 @@ pub fn cliFindRunByTrace(allocator: std.mem.Allocator, trace_id: []const u8, jso
             const ra_ptr = c.sqlite3_column_text(stmt, 8);
             const ra_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 8));
             log.info("       repair_action={s}", .{ra_ptr[0..ra_len]});
+        }
+        if (c.sqlite3_column_type(stmt, 10) != c.SQLITE_NULL) {
+            const diagnostic_ptr = c.sqlite3_column_text(stmt, 10);
+            const diagnostic_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 10));
+            log.info("       diagnostic={s}", .{diagnostic_ptr[0..diagnostic_len]});
         }
     }
     if (count == 0) {
@@ -8360,6 +8443,44 @@ pub fn dbCompleteJob(
         _ = c.sqlite3_step(prune_stmt);
         _ = c.sqlite3_finalize(prune_stmt);
     }
+}
+
+/// Attach only a bounded, structured terminal diagnostic to the exact run.
+/// Raw stderr is rejected by `safeSkillRunDiagnostic` before touching the DB.
+pub fn dbSetRunDiagnostic(db: *c.sqlite3, job_id: []const u8, trace_id: []const u8, stderr: []const u8) !bool {
+    const diagnostic = safeSkillRunDiagnostic(stderr, trace_id) orelse return false;
+    const sql = "UPDATE cron_runs SET diagnostic=?1 WHERE job_id=?2 AND trace_id=?3";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_text(stmt, 1, diagnostic.ptr, @intCast(diagnostic.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_text(stmt, 2, job_id.ptr, @intCast(job_id.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_text(stmt, 3, trace_id.ptr, @intCast(trace_id.len), SQLITE_STATIC);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
+    return c.sqlite3_changes(db) > 0;
+}
+
+test "run diagnostic stores only matching safe terminal summary" {
+    // Regression: run-by-trace had only exec_error while the actual Telegram
+    // failure vanished with the child stderr. Raw stderr must not be persisted.
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_exec(db, "INSERT INTO cron_runs(job_id,started_at,finished_at,status,trace_id) VALUES('job_test',1,2,'error','job_test:1')", null, null, null));
+    const good = "[telegram] trace=job_test:1 send failed (attempts=3 last=transport ConnectionFailed io=NetworkUnreachable total_elapsed=30.0s)";
+    try std.testing.expect(!(try dbSetRunDiagnostic(db, "job_test", "job_test:1", "https://secret.example/bot123:secret")));
+    try std.testing.expect(!(try dbSetRunDiagnostic(db, "job_test", "job_test:2", good)));
+    try std.testing.expect(try dbSetRunDiagnostic(db, "job_test", "job_test:1", good ++ "\n[delivery] failed\n"));
+    var stmt: ?*c.sqlite3_stmt = null;
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_prepare_v2(db, "SELECT diagnostic FROM cron_runs WHERE trace_id='job_test:1'", -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(stmt));
+    const ptr = c.sqlite3_column_text(stmt, 0);
+    const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    try std.testing.expectEqualStrings(good, ptr[0..len]);
 }
 
 /// Outcome of the consecutive-failure streak check for one job.
