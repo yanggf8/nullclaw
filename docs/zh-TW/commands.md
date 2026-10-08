@@ -29,6 +29,7 @@
 | `nullclaw onboard --api-key ... --provider ... --model ... --memory ...` | 一次性指定 provider、model、memory backend |
 | `nullclaw onboard --channels-only` | 只重設 channel / allowlist |
 | `nullclaw agent -m "..."` | 單條訊息模式 |
+| `nullclaw agent --skill <名稱> --skill-state --session <ID> -m "..."` | 啟用[結構化 skill 狀態](skill-state.md)；skill 目錄須有 `state-schema.json` |
 | `nullclaw agent` | 互動會話模式 |
 
 ### 互動式模型路由

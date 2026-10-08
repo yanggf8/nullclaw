@@ -45,6 +45,7 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 | `nullclaw agent -m "..."` | Run a single prompt |
 | `nullclaw agent --workspace /path/to/workspace -m "..."` | Run the agent against a specific workspace for this process |
 | `nullclaw agent --skill news-digest -m "..."` | Run a single prompt with a named skill active |
+| `nullclaw agent --skill <name> --skill-state --session <id> -m "..."` | Run an opt-in [structured skill turn](skill-state.md); the skill directory must contain `state-schema.json` |
 | `nullclaw agent` | Start interactive chat mode |
 | `nullclaw acp` | Run the Agent Client Protocol stdio adapter for ACP-compatible editors |
 | `nullclaw acp --provider openai --model gpt-5.2` | Pin the ACP adapter to a provider/model for editor-launched sessions |

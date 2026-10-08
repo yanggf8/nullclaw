@@ -16,6 +16,8 @@ const fs_compat = @import("fs_compat.zig");
 const agent_routing = @import("agent_routing.zig");
 const agent_mod = @import("agent/root.zig");
 const turn_persistence = @import("agent/turn_persistence.zig");
+const skill_state = @import("agent/skill_state.zig");
+const agent_commands = @import("agent/commands.zig");
 const Agent = agent_mod.Agent;
 const NamedAgentConfig = @import("config_types.zig").NamedAgentConfig;
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
@@ -274,6 +276,31 @@ pub const Session = struct {
         return duped;
     }
 };
+
+fn runSessionTurn(session: *Session, session_key: []const u8, content: []const u8) ![]const u8 {
+    if (!session.agent.active_skill_interactive or agent_commands.planTurnInput(content).invoke_local_handler) {
+        return session.agent.turn(content);
+    }
+    const skill_path = session.agent.active_skill_path orelse return session.agent.turn(content);
+    const schema_path = try std.fs.path.join(session.agent.allocator, &.{ skill_path, "state-schema.json" });
+    defer session.agent.allocator.free(schema_path);
+    fs_compat.accessPath(schema_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return session.agent.turn(content),
+        else => return err,
+    };
+
+    // JSON envelopes are validated before display; streaming them would leak
+    // implementation output to the channel before validation.
+    const prior_callback = session.agent.stream_callback;
+    const prior_ctx = session.agent.stream_ctx;
+    session.agent.stream_callback = null;
+    session.agent.stream_ctx = null;
+    defer {
+        session.agent.stream_callback = prior_callback;
+        session.agent.stream_ctx = prior_ctx;
+    }
+    return skill_state.turn(&session.agent, session_key, content);
+}
 
 const AgentRuntime = struct {
     agent_id: []const u8,
@@ -1910,7 +1937,7 @@ pub const SessionManager = struct {
             }
         }
 
-        var response = try session.agent.turn(content);
+        var response = try runSessionTurn(session, session_key, content);
         var completed_turns: u64 = 1;
 
         var late_drain_count: u32 = 0;
@@ -1919,7 +1946,7 @@ pub const SessionManager = struct {
             defer self.allocator.free(late_content);
 
             const previous_response = response;
-            response = session.agent.turn(late_content) catch |err| {
+            response = runSessionTurn(session, session_key, late_content) catch |err| {
                 self.allocator.free(previous_response);
                 return err;
             };

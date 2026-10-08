@@ -37,6 +37,7 @@ const redaction = @import("../redaction.zig");
 const Agent = @import("root.zig").Agent;
 const turn_persistence = @import("turn_persistence.zig");
 const commands = @import("commands.zig");
+const skill_state = @import("skill_state.zig");
 const cost_mod = @import("../cost.zig");
 
 const CliStreamCtx = struct {
@@ -375,6 +376,7 @@ const ParsedAgentArgs = struct {
     agent_name: ?[]const u8 = null,
     workspace_override: ?[]const u8 = null,
     skill_name: ?[]const u8 = null,
+    skill_state: bool = false,
     verbose: bool = false,
     isolated: bool = false,
 };
@@ -423,6 +425,8 @@ fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
             if (i + 1 >= args.len) return .{ .missing_value = arg };
             i += 1;
             parsed.skill_name = args[i];
+        } else if (std.mem.eql(u8, arg, "--skill-state")) {
+            parsed.skill_state = true;
         } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             parsed.verbose = true;
         } else if (std.mem.eql(u8, arg, "--isolated") or std.mem.eql(u8, arg, "--no-history")) {
@@ -435,6 +439,9 @@ fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
 fn agentArgConflict(parsed: ParsedAgentArgs) ?[]const u8 {
     if (parsed.isolated and parsed.session_id != null) {
         return "--isolated cannot be combined with --session";
+    }
+    if (parsed.skill_state and (parsed.skill_name == null or parsed.session_id == null or parsed.isolated)) {
+        return "--skill-state requires --skill and --session, and cannot use --isolated";
     }
     return null;
 }
@@ -751,7 +758,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         if (runtime_provider) |*bundle| bundle else null,
     );
 
-    const supports_streaming = provider_i.supportsStreaming();
+    const supports_streaming = provider_i.supportsStreaming() and !parsed_args.skill_state;
 
     // Single message mode: nullclaw agent -m "hello"
     if (message_arg) |message| {
@@ -822,7 +829,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
         stream_ctx.emitted_text = false;
         logCliTiming(timing_enabled, cli_start_ms, "turn_start");
-        const response = agent.turn(effective_message) catch |err| {
+        const response = (if (parsed_args.skill_state and !commands.planTurnInput(effective_message).invoke_local_handler)
+            skill_state.turn(&agent, session_id.?, effective_message)
+        else
+            agent.turn(effective_message)) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
                 try w.flush();
@@ -1028,7 +1038,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
         stream_ctx.emitted_text = false;
         stream_ctx.suppress_live = shouldSuppressLiveForRedaction(agent.redactor, debounced_input.current);
-        const response = agent.turn(debounced_input.current) catch |err| {
+        const response = (if (parsed_args.skill_state and !commands.planTurnInput(debounced_input.current).invoke_local_handler)
+            skill_state.turn(&agent, session_id.?, debounced_input.current)
+        else
+            agent.turn(debounced_input.current)) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
             } else if (err == error.RateLimited) {
@@ -1513,6 +1526,18 @@ test "parseAgentArgs parses --skill" {
     };
     try std.testing.expectEqualStrings("news-digest", parsed.skill_name.?);
     try std.testing.expectEqualStrings("go", parsed.message_arg.?);
+}
+
+test "parseAgentArgs requires skill and session for skill state" {
+    const args = [_][]const u8{ "--skill", "inventory", "--skill-state", "--session", "job-42", "-m", "start" };
+    const parsed = switch (parseAgentArgs(&args)) {
+        .ok => |value| value,
+        else => return error.UnexpectedParseResult,
+    };
+    try std.testing.expect(parsed.skill_state);
+    try std.testing.expect(agentArgConflict(parsed) == null);
+    try std.testing.expect(agentArgConflict(.{ .skill_state = true }) != null);
+    try std.testing.expect(agentArgConflict(.{ .skill_state = true, .skill_name = "inventory", .session_id = "job-42", .isolated = true }) != null);
 }
 
 test "parseAgentArgs returns missing value for --skill" {
