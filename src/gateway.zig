@@ -4207,6 +4207,7 @@ fn runQueueWorker(state: *GatewayState) void {
                 const legacy_spec = legacy_spec_opt orelse break :blk null;
                 break :blk cron_backend_mod.DequeueResult{
                     .queue_row_id = legacy_item.queue_row_id,
+                    .manual = legacy_item.manual,
                     .spec = cron_backend_mod.CronJobSpec{
                         .id = legacy_item.job_id,
                         .job_type = @enumFromInt(@intFromEnum(legacy_spec.job_type)),
@@ -4264,15 +4265,18 @@ fn runQueueWorker(state: *GatewayState) void {
                     delivered: bool,
                     run_result_opt: ?cron_mod.RunResult,
                     trace_id: ?[]const u8,
+                    manual: bool,
                     source: ?[]const u8,
                 ) void {
                     if (run_result_opt != null or trace_id != null) {
                         // Runs carrying observability data (classification or trace id) must
-                        // bypass the vtable path because CronBackend.complete lacks both fields.
+                        // bypass the vtable path because CronBackend.complete lacks both fields
+                        // (and the run's origin). Every call in this worker passes both, so this
+                        // is the branch that records them.
                         if (db_path_opt) |dp| {
                             const db2 = cron_mod.openCronDbAtPath(dp) catch return;
                             defer cron_mod.closeCronDb(db2);
-                            cron_mod.dbCompleteJob(db2, job_id, row_id, ts, status_str, output_str, dar, run_result_opt, trace_id, false, source, null) catch {};
+                            cron_mod.dbCompleteJob(db2, job_id, row_id, ts, status_str, output_str, dar, run_result_opt, trace_id, manual, source, null) catch {};
                         }
                     } else if (be_opt.*) |*be| {
                         be.backend().complete(job_id, row_id, ts, status_str, output_str, delivered) catch |e|
@@ -4280,7 +4284,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     } else if (db_path_opt) |dp| {
                         const db2 = cron_mod.openCronDbAtPath(dp) catch return;
                         defer cron_mod.closeCronDb(db2);
-                        cron_mod.dbCompleteJob(db2, job_id, row_id, ts, status_str, output_str, dar, null, trace_id, false, source, null) catch {};
+                        cron_mod.dbCompleteJob(db2, job_id, row_id, ts, status_str, output_str, dar, null, trace_id, manual, source, null) catch {};
                     }
                 }
             }.call;
@@ -4298,16 +4302,16 @@ fn runQueueWorker(state: *GatewayState) void {
                             log.warn("[{s}] shell blocked by policy: {s}", .{ spec.id, @errorName(blocked.err) });
                             var bad_result = cron_mod.execErrorRunResult();
                             bad_result.failure_class = blocked.failure_class;
-                            complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, bad_result, run_trace_id, "cron_scheduler_shell");
-                            maybeAlertJobStreak(state, arena, spec, .shell, bad_result, run_trace_id);
+                            complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, bad_result, run_trace_id, dr.manual, "cron_scheduler_shell");
+                            maybeAlertJobStreak(state, arena, spec, .shell, bad_result, run_trace_id, dr.manual);
                             continue;
                         },
                         .fail_closed => {
                             log.err("[{s}] security policy not available for shell job - failing closed", .{spec.id});
                             var bad_result = cron_mod.execErrorRunResult();
                             bad_result.failure_class = "policy_denied";
-                            complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, bad_result, run_trace_id, "cron_scheduler_shell");
-                            maybeAlertJobStreak(state, arena, spec, .shell, bad_result, run_trace_id);
+                            complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, bad_result, run_trace_id, dr.manual, "cron_scheduler_shell");
+                            maybeAlertJobStreak(state, arena, spec, .shell, bad_result, run_trace_id, dr.manual);
                             continue;
                         },
                     }
@@ -4317,8 +4321,8 @@ fn runQueueWorker(state: *GatewayState) void {
                         .trace_id = run_trace_id,
                     }) catch |err| {
                         log.err("[{s}] env setup failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_shell");
-                        maybeAlertJobStreak(state, arena, spec, .shell, cron_mod.execErrorRunResult(), run_trace_id);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, dr.manual, "cron_scheduler_shell");
+                        maybeAlertJobStreak(state, arena, spec, .shell, cron_mod.execErrorRunResult(), run_trace_id, dr.manual);
                         continue;
                     };
                     defer shell_env.deinit();
@@ -4333,8 +4337,8 @@ fn runQueueWorker(state: *GatewayState) void {
                     shell_child.env_map = &shell_env;
                     shell_child.spawn() catch |err| {
                         log.err("[{s}] exec failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_shell");
-                        maybeAlertJobStreak(state, arena, spec, .shell, cron_mod.execErrorRunResult(), run_trace_id);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, dr.manual, "cron_scheduler_shell");
+                        maybeAlertJobStreak(state, arena, spec, .shell, cron_mod.execErrorRunResult(), run_trace_id, dr.manual);
                         continue;
                     };
                     errdefer {
@@ -4355,14 +4359,14 @@ fn runQueueWorker(state: *GatewayState) void {
                         shell_start_ns,
                     ) catch |err| {
                         log.err("[{s}] collect failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_shell");
-                        maybeAlertJobStreak(state, arena, spec, .shell, cron_mod.execErrorRunResult(), run_trace_id);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, dr.manual, "cron_scheduler_shell");
+                        maybeAlertJobStreak(state, arena, spec, .shell, cron_mod.execErrorRunResult(), run_trace_id, dr.manual);
                         continue;
                     };
                     const shell_term = shell_child.wait() catch |err| {
                         log.err("[{s}] wait failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_shell");
-                        maybeAlertJobStreak(state, arena, spec, .shell, cron_mod.execErrorRunResult(), run_trace_id);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, dr.manual, "cron_scheduler_shell");
+                        maybeAlertJobStreak(state, arena, spec, .shell, cron_mod.execErrorRunResult(), run_trace_id, dr.manual);
                         continue;
                     };
                     if (shell_timed_out) log.warn("[{s}] timed out after {d}s", .{ spec.id, timeout });
@@ -4443,7 +4447,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         }
                     }
                     const status = if (success) "ok" else "error";
-                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std_compat.time.timestamp(), status, if (raw_output.len > 0) raw_output else null, spec.delete_after_run, delivered, run_result, run_trace_id, "cron_scheduler_shell");
+                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std_compat.time.timestamp(), status, if (raw_output.len > 0) raw_output else null, spec.delete_after_run, delivered, run_result, run_trace_id, dr.manual, "cron_scheduler_shell");
                     if (spec.repair_policy == .alert_only and run_result.verified != 1) {
                         const preview = if (raw_output.len > 0)
                             raw_output[0..@min(raw_output.len, 200)]
@@ -4456,7 +4460,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     // newly makes N consecutive scheduled non-ok runs,
                     // beside any per-run alert above.
                     if (run_result.verified != 1) {
-                        maybeAlertJobStreak(state, arena, spec, .shell, run_result, run_trace_id);
+                        maybeAlertJobStreak(state, arena, spec, .shell, run_result, run_trace_id, dr.manual);
                     }
                     log.info("[{s}] completed ({s})", .{ spec.id, status });
                 },
@@ -4471,8 +4475,8 @@ fn runQueueWorker(state: *GatewayState) void {
                         .trace_id = run_trace_id,
                     }) catch |err| {
                         log.err("[{s}] agent failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_agent");
-                        maybeAlertJobStreak(state, arena, spec, .agent, cron_mod.execErrorRunResult(), run_trace_id);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, dr.manual, "cron_scheduler_agent");
+                        maybeAlertJobStreak(state, arena, spec, .agent, cron_mod.execErrorRunResult(), run_trace_id, dr.manual);
                         continue;
                     };
                     var raw_agent = agent_result.output;
@@ -4527,7 +4531,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         }
                     }
                     const status = if (success) "ok" else "error";
-                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std_compat.time.timestamp(), status, if (raw_agent.len > 0) raw_agent else null, spec.delete_after_run, delivered, run_result, run_trace_id, "cron_scheduler_agent");
+                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std_compat.time.timestamp(), status, if (raw_agent.len > 0) raw_agent else null, spec.delete_after_run, delivered, run_result, run_trace_id, dr.manual, "cron_scheduler_agent");
                     if (spec.repair_policy == .alert_only and run_result.verified != 1) {
                         const preview = if (raw_agent.len > 0)
                             raw_agent[0..@min(raw_agent.len, 200)]
@@ -4540,7 +4544,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     // newly makes N consecutive scheduled non-ok runs,
                     // beside any per-run alert above.
                     if (run_result.verified != 1) {
-                        maybeAlertJobStreak(state, arena, spec, .agent, run_result, run_trace_id);
+                        maybeAlertJobStreak(state, arena, spec, .agent, run_result, run_trace_id, dr.manual);
                     }
                     log.info("[{s}] completed ({s})", .{ spec.id, status });
                 },
@@ -4566,12 +4570,12 @@ fn runQueueWorker(state: *GatewayState) void {
                     defer if (run_trace_id.ptr != spec.id.ptr) arena.free(run_trace_id);
                     const raw_skill_cmd = cron_mod.resolveSkillExec(arena, spec.skill_name, spec.skill_args) catch |err| {
                         log.err("[{s}] skill resolution failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_skill");
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, dr.manual, "cron_scheduler_skill");
                         if (state.event_bus) |eb| {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' resolution failed: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
-                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id);
+                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id, dr.manual);
                         continue;
                     };
                     defer arena.free(raw_skill_cmd);
@@ -4582,15 +4586,15 @@ fn runQueueWorker(state: *GatewayState) void {
                         .trace_id = run_trace_id,
                     }) catch |err| {
                         log.err("[{s}] skill env setup failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_skill");
-                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, dr.manual, "cron_scheduler_skill");
+                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id, dr.manual);
                         continue;
                     };
                     defer skill_env.deinit();
                     cron_mod.putSkillBudgetEnv(&skill_env, timeout, skill_started_s) catch |err| {
                         log.err("[{s}] skill env setup failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_skill");
-                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id);
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, dr.manual, "cron_scheduler_skill");
+                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id, dr.manual);
                         continue;
                     };
                     var skill_child = std_compat.process.Child.init(
@@ -4604,12 +4608,12 @@ fn runQueueWorker(state: *GatewayState) void {
                     skill_child.env_map = &skill_env;
                     skill_child.spawn() catch |err| {
                         log.err("[{s}] skill exec failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_skill");
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, dr.manual, "cron_scheduler_skill");
                         if (state.event_bus) |eb| {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' failed to start: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
-                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id);
+                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id, dr.manual);
                         continue;
                     };
                     errdefer {
@@ -4630,22 +4634,22 @@ fn runQueueWorker(state: *GatewayState) void {
                         skill_start_ns,
                     ) catch |err| {
                         log.err("[{s}] skill collect failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_skill");
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, dr.manual, "cron_scheduler_skill");
                         if (state.event_bus) |eb| {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' output collection failed: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
-                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id);
+                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id, dr.manual);
                         continue;
                     };
                     const skill_term = skill_child.wait() catch |err| {
                         log.err("[{s}] skill wait failed: {s}", .{ spec.id, @errorName(err) });
-                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_skill");
+                        complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, dr.manual, "cron_scheduler_skill");
                         if (state.event_bus) |eb| {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' wait failed: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
-                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id);
+                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id, dr.manual);
                         continue;
                     };
                     if (skill_timed_out) log.warn("[{s}] skill timed out after {d}s", .{ spec.id, timeout });
@@ -4722,7 +4726,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     const skill_output = if (skill_stdout.items.len > 0) skill_stdout.items else skill_stderr.items;
                     const skill_status = if (skill_ok) "ok" else "error";
                     // Skills self-deliver — no cron delivery needed.
-                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std_compat.time.timestamp(), skill_status, if (skill_output.len > 0) skill_output else null, spec.delete_after_run, false, run_result, run_trace_id, "cron_scheduler_skill");
+                    complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, std_compat.time.timestamp(), skill_status, if (skill_output.len > 0) skill_output else null, spec.delete_after_run, false, run_result, run_trace_id, dr.manual, "cron_scheduler_skill");
                     if (!skill_ok) {
                         if (state.cron_db_path) |db_path| {
                             const db = cron_mod.openCronDbAtPath(db_path) catch null;
@@ -4756,7 +4760,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     // above. Edge-triggered by detectRunStreak; an ok run
                     // re-arms without any stored state.
                     if (run_result.verified != 1) {
-                        maybeAlertJobStreak(state, arena, spec, .skill, run_result, run_trace_id);
+                        maybeAlertJobStreak(state, arena, spec, .skill, run_result, run_trace_id, dr.manual);
                     }
                     // Log the final Telegram outcome on failure, not attempt 1.
                     // Stdout is typically a delivery confirmation; stderr is errors.
@@ -5236,6 +5240,13 @@ fn streakCommandPreview(cmd: []const u8) struct { text: []const u8, truncated: b
 /// kind has: a skill is named by skill_name (falling back to the id), shell
 /// and agent jobs by id — skill_name is null for them — and a shell alert
 /// also carries a one-line command preview.
+///
+/// `manual` is the dequeued run's origin (POST /cron/run). A manual run is
+/// not part of the scheduled streak, so it never evaluates the detector: it
+/// can neither fire the escalation nor count toward it, and since its
+/// cron_runs row is manual=1 the detector's scheduled-only window skips it,
+/// so it cannot break or reset the scheduled count either. Its per-run alert
+/// (alert_only / skill degraded) is unaffected — the operator asked for it.
 fn maybeAlertJobStreak(
     state: *const GatewayState,
     arena: std.mem.Allocator,
@@ -5243,7 +5254,12 @@ fn maybeAlertJobStreak(
     comptime job_kind: cron_mod.JobType,
     run_result: cron_mod.RunResult,
     run_trace_id: []const u8,
+    manual: bool,
 ) void {
+    if (manual) {
+        log.debug("streak: job {s} run {s} is manual — not part of the scheduled streak", .{ spec.id, run_trace_id });
+        return;
+    }
     const threshold = state.cron_alert_streak;
     if (threshold == 0) {
         log.debug("streak: alert_streak=0 disables escalation for job {s}", .{spec.id});
@@ -9692,7 +9708,7 @@ test "skill streak escalation alerts the operator channel once at threshold" {
         .verified = 2,
     };
 
-    maybeAlertJobStreak(&state, a, spec, .skill, run_result, "cct-job:3");
+    maybeAlertJobStreak(&state, a, spec, .skill, run_result, "cct-job:3", false);
 
     try std.testing.expectEqual(@as(usize, 1), test_bus.outboundDepth());
     var msg = test_bus.consumeOutbound().?;
@@ -9755,7 +9771,7 @@ test "skill streak escalation stays quiet below the threshold" {
         .verified = 2,
     };
 
-    maybeAlertJobStreak(&state, a, spec, .skill, run_result, "cct-job:2");
+    maybeAlertJobStreak(&state, a, spec, .skill, run_result, "cct-job:2", false);
 
     try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
 }
@@ -9812,7 +9828,7 @@ test "skill streak escalation fires for repeated pre-exec failures" {
         delivery: cron_mod.DeliveryConfig = .{},
     }{};
 
-    maybeAlertJobStreak(&state, a, spec, .skill, cron_mod.execErrorRunResult(), "cct-job:3");
+    maybeAlertJobStreak(&state, a, spec, .skill, cron_mod.execErrorRunResult(), "cct-job:3", false);
 
     try std.testing.expectEqual(@as(usize, 1), test_bus.outboundDepth());
     var msg = test_bus.consumeOutbound().?;
@@ -9873,7 +9889,7 @@ test "skill streak escalation falls back to the job channel without operator con
         .verified = 3,
     };
 
-    maybeAlertJobStreak(&state, a, spec, .skill, run_result, "cct-job:3");
+    maybeAlertJobStreak(&state, a, spec, .skill, run_result, "cct-job:3", false);
 
     try std.testing.expectEqual(@as(usize, 1), test_bus.outboundDepth());
     var msg = test_bus.consumeOutbound().?;
@@ -9927,7 +9943,7 @@ fn runStreakScenario(
         .best_effort = true,
     };
 
-    maybeAlertJobStreak(&state, a, spec, job_kind, run_result, anchor);
+    maybeAlertJobStreak(&state, a, spec, job_kind, run_result, anchor, false);
 
     const depth = test_bus.outboundDepth();
     if (depth == 0) return null;
@@ -10093,8 +10109,9 @@ fn waitForOutbound(test_bus: *bus_mod.Bus, want: usize) void {
 }
 
 /// End-to-end through runQueueWorker's shell branch: seed two prior
-/// scheduled failures for a real cron_jobs row, enqueue it, let the worker
-/// run it under `policy`, and return the one message it published.
+/// scheduled failures for a real cron_jobs row, enqueue it as the scheduler
+/// does, let the worker run it under `policy`, and return the one message it
+/// published.
 fn runShellJobThroughWorker(policy: security.SecurityPolicy) !struct { job_id: []u8, content: []u8 } {
     const allocator = std.testing.allocator;
 
@@ -10127,7 +10144,11 @@ fn runShellJobThroughWorker(policy: security.SecurityPolicy) !struct { job_id: [
         .{ .ts = now - 200, .verified = 3, .trace_id = try std.fmt.allocPrint(a, "{s}:prev-1", .{job.id}) },
         .{ .ts = now - 100, .verified = 3, .trace_id = try std.fmt.allocPrint(a, "{s}:prev-2", .{job.id}) },
     });
-    try cron_mod.dbManualEnqueueJob(db_path_z, job.id, now);
+    // The scheduler's own enqueue (make the job due, tick) — a scheduled run.
+    // dbManualEnqueueJob would queue it as an operator run, which never
+    // escalates.
+    _ = try backend.backend().update(job.id, .{ .next_run_secs = now - 1 });
+    try std.testing.expectEqual(@as(usize, 1), try backend.backend().tick(now));
 
     var test_bus = bus_mod.Bus.init();
     defer test_bus.close();
@@ -10204,6 +10225,231 @@ test "run-queue worker escalates a shell streak on a policy-blocked run" {
     );
     defer std.testing.allocator.free(want);
     try std.testing.expectEqualStrings(want, r.content);
+}
+
+const origin_test_sqlite = if (build_options.enable_sqlite)
+    @import("memory/engines/sqlite.zig")
+else
+    @import("memory/engines/sqlite_disabled.zig");
+
+/// Run-origin worker fixture: a real cron_jobs shell row shaped like
+/// job-dc786668 (`exit 127`, verify none, repair none, no delivery) with two
+/// prior scheduled failures, a streak threshold of 3 and an operator alert
+/// destination. `use_backend` picks the worker's dequeue path: DbCronBackend
+/// (what gateway.run wires in production) or the raw dbDequeueNextJob
+/// fallback. Initialised in place — the worker thread holds &self.state.
+const OriginWorkerFixture = struct {
+    tmp: std.testing.TmpDir,
+    db_path_z: [:0]u8,
+    scratch: std.heap.ArenaAllocator,
+    test_bus: bus_mod.Bus,
+    state: GatewayState,
+    job_id: []const u8,
+
+    const Row = struct { trace_id: []const u8, manual: bool, source: []const u8 };
+
+    fn init(self: *OriginWorkerFixture, use_backend: bool) !void {
+        const allocator = std.testing.allocator;
+        self.tmp = std.testing.tmpDir(.{});
+        const base = try @import("compat").fs.Dir.wrap(self.tmp.dir).realpathAlloc(allocator, ".");
+        defer allocator.free(base);
+        const db_path_str = try std.fmt.allocPrint(allocator, "{s}/origin_worker.db", .{base});
+        defer allocator.free(db_path_str);
+        self.db_path_z = try allocator.dupeZ(u8, db_path_str);
+        self.scratch = std.heap.ArenaAllocator.init(allocator);
+        const a = self.scratch.allocator();
+
+        var adder = try cron_db_mod.DbCronBackend.init(allocator, self.db_path_z);
+        defer adder.deinit();
+        const job = try adder.backend().add(a, .{
+            .expression = "0 4 1 1 1",
+            .job_type = .shell,
+            .command = "exit 127",
+        });
+        self.job_id = job.id;
+
+        const now = std_compat.time.timestamp();
+        try seedStreakHistoryFor(self.db_path_z, job.id, "cron_scheduler_shell", "exec_error", &.{
+            .{ .ts = now - 200, .verified = 3, .trace_id = try std.fmt.allocPrint(a, "{s}:prev-1", .{job.id}) },
+            .{ .ts = now - 100, .verified = 3, .trace_id = try std.fmt.allocPrint(a, "{s}:prev-2", .{job.id}) },
+        });
+
+        self.test_bus = bus_mod.Bus.init();
+        self.state = GatewayState.init(allocator);
+        self.state.cron_db_path = self.db_path_z;
+        if (use_backend) self.state.cron_db_backend = try cron_db_mod.DbCronBackend.init(allocator, self.db_path_z);
+        self.state.cron_alert_streak = 3;
+        self.state.event_bus = &self.test_bus;
+        self.state.alert_delivery = .{
+            .mode = .always,
+            .channel = try a.dupe(u8, "telegram"),
+            .to = try a.dupe(u8, "ops-chat"),
+            .best_effort = true,
+        };
+        // GatewayState.deinit frees both with state.allocator.
+        const tracker = try allocator.create(security.RateTracker);
+        tracker.* = security.RateTracker.init(allocator, 100);
+        self.state.security_tracker = tracker;
+        const pol = try allocator.create(security.SecurityPolicy);
+        pol.* = .{
+            .autonomy = .full,
+            .allowed_commands = &.{"*"},
+            .block_medium_risk_commands = false,
+            .block_high_risk_commands = false,
+        };
+        pol.tracker = tracker;
+        self.state.security_policy = pol;
+    }
+
+    fn deinit(self: *OriginWorkerFixture) void {
+        self.state.deinit(); // joins the worker first
+        if (self.state.cron_db_backend) |*be| be.deinit();
+        self.test_bus.close();
+        self.scratch.deinit();
+        std.testing.allocator.free(self.db_path_z);
+        self.tmp.cleanup();
+    }
+
+    /// POST /cron/run through the real handler — the operator origin.
+    fn postCronRun(self: *OriginWorkerFixture) !void {
+        const a = self.scratch.allocator();
+        const body = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{self.job_id});
+        const raw = try std.fmt.allocPrint(a, "POST /cron/run HTTP/1.1\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+        var ctx = WebhookHandlerContext{
+            .root_allocator = a,
+            .req_allocator = a,
+            .raw_request = raw,
+            .method = "POST",
+            .target = "/cron/run",
+            .config_opt = null,
+            .state = &self.state,
+            .session_mgr_opt = null,
+        };
+        handleCronRun(&ctx);
+        try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    }
+
+    /// The scheduler's own enqueue: make the job due at `now` and tick.
+    fn scheduledFire(self: *OriginWorkerFixture, now: i64) !void {
+        var be = try cron_db_mod.DbCronBackend.init(std.testing.allocator, self.db_path_z);
+        defer be.deinit();
+        _ = try be.backend().update(self.job_id, .{ .next_run_secs = now - 1 });
+        try std.testing.expectEqual(@as(usize, 1), try be.backend().tick(now));
+    }
+
+    /// Run the worker until the job has `want` cron_runs rows (bounded),
+    /// then stop it. Stopping joins the thread after its current iteration,
+    /// so every alert of the last run is on the bus when this returns.
+    fn drain(self: *OriginWorkerFixture, want: usize) !void {
+        try self.state.startRunQueue();
+        var waited_ms: u64 = 0;
+        while (waited_ms < 15_000) : (waited_ms += 50) {
+            const rows = try self.runRows();
+            if (rows.len >= want) break;
+            std_compat.thread.sleep(50 * std.time.ns_per_ms);
+        }
+        self.state.stopRunQueue();
+    }
+
+    /// The job's cron_runs rows in completion order (scratch-allocated).
+    fn runRows(self: *OriginWorkerFixture) ![]Row {
+        const sq = origin_test_sqlite.c;
+        const a = self.scratch.allocator();
+        const db = try cron_mod.openCronDbAtPath(self.db_path_z);
+        defer cron_mod.closeCronDb(db);
+        var stmt: ?*sq.sqlite3_stmt = null;
+        if (sq.sqlite3_prepare_v2(db, "SELECT trace_id, manual, source FROM cron_runs WHERE job_id=?1 ORDER BY id", -1, &stmt, null) != sq.SQLITE_OK)
+            return error.PrepareFailed;
+        defer _ = sq.sqlite3_finalize(stmt);
+        _ = sq.sqlite3_bind_text(stmt, 1, self.job_id.ptr, @intCast(self.job_id.len), origin_test_sqlite.SQLITE_STATIC);
+        var rows: std.ArrayList(Row) = .empty;
+        while (sq.sqlite3_step(stmt) == sq.SQLITE_ROW) {
+            const trace_ptr = sq.sqlite3_column_text(stmt, 0);
+            const source_ptr = sq.sqlite3_column_text(stmt, 2);
+            try rows.append(a, .{
+                .trace_id = if (trace_ptr == null) "" else try a.dupe(u8, std.mem.sliceTo(trace_ptr, 0)),
+                .manual = sq.sqlite3_column_int(stmt, 1) != 0,
+                .source = if (source_ptr == null) "" else try a.dupe(u8, std.mem.sliceTo(source_ptr, 0)),
+            });
+        }
+        return rows.items;
+    }
+
+    fn trace(self: *OriginWorkerFixture, n: u32) ![]const u8 {
+        return std.fmt.allocPrint(self.scratch.allocator(), "{s}:{d}", .{ self.job_id, n });
+    }
+};
+
+/// A run queued by POST /cron/run is an operator run all the way through the
+/// worker: its cron_runs row says manual=1 (the source stays the worker's
+/// code path), and with two scheduled failures already on record it does
+/// not complete the streak.
+fn expectPostedRunRecordedManual(use_backend: bool) !void {
+    var fx: OriginWorkerFixture = undefined;
+    try fx.init(use_backend);
+    defer fx.deinit();
+
+    try fx.postCronRun();
+    try fx.drain(3);
+
+    const rows = try fx.runRows();
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    try std.testing.expect(!rows[0].manual);
+    try std.testing.expect(!rows[1].manual);
+    try std.testing.expectEqualStrings(try fx.trace(1), rows[2].trace_id);
+    try std.testing.expect(rows[2].manual);
+    try std.testing.expectEqualStrings("cron_scheduler_shell", rows[2].source);
+    try std.testing.expectEqual(@as(usize, 0), fx.test_bus.outboundDepth());
+}
+
+test "run-queue worker records a POST /cron/run run as manual" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    try expectPostedRunRecordedManual(true);
+}
+
+test "run-queue worker records a POST /cron/run run as manual on the raw dequeue fallback" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    try expectPostedRunRecordedManual(false);
+}
+
+test "run-queue worker keeps a manual failure out of the scheduled shell streak" {
+    // Regression: POST /cron/run runs were recorded manual=0, so a manual
+    // failure after two scheduled ones fired the escalation and the next
+    // real scheduled failure (streak 4) stayed silent.
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    var fx: OriginWorkerFixture = undefined;
+    try fx.init(true);
+    defer fx.deinit();
+
+    // Queue row 1 is the operator's run, row 2 the next scheduled fire; the
+    // later enqueued_at keeps the worker's order fixed.
+    try fx.postCronRun();
+    try fx.scheduledFire(std_compat.time.timestamp() + 1);
+    try fx.drain(4);
+
+    const rows = try fx.runRows();
+    try std.testing.expectEqual(@as(usize, 4), rows.len);
+    try std.testing.expectEqualStrings(try fx.trace(1), rows[2].trace_id);
+    try std.testing.expect(rows[2].manual);
+    try std.testing.expectEqualStrings(try fx.trace(2), rows[3].trace_id);
+    try std.testing.expect(!rows[3].manual);
+    try std.testing.expectEqualStrings("cron_scheduler_shell", rows[3].source);
+
+    // Exactly one escalation, on the scheduled run, counting three scheduled
+    // failures: the manual run neither fired it nor broke the count.
+    try std.testing.expectEqual(@as(usize, 1), fx.test_bus.outboundDepth());
+    var msg = fx.test_bus.consumeOutbound().?;
+    defer msg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ops-chat", msg.chat_id);
+    const want = try std.fmt.allocPrint(
+        fx.scratch.allocator(),
+        "[cron] shell '{s}' non-ok for 3 consecutive scheduled runs (threshold 3): failure=exec_error repair=none trace={s}\ncmd: exit 127",
+        .{ fx.job_id, try fx.trace(2) },
+    );
+    try std.testing.expectEqualStrings(want, msg.content);
 }
 
 // ── Bearer Token Validation tests ───────────────────────────────

@@ -2761,7 +2761,8 @@ const CRON_RUN_QUEUE_SQL =
     \\  job_id       TEXT NOT NULL,
     \\  enqueued_at  INTEGER NOT NULL DEFAULT 0,
     \\  status       TEXT NOT NULL DEFAULT 'pending',
-    \\  started_at   INTEGER
+    \\  started_at   INTEGER,
+    \\  manual       INTEGER NOT NULL DEFAULT 0
     \\);
     \\CREATE INDEX IF NOT EXISTS idx_run_queue_status ON cron_run_queue(status, enqueued_at);
 ;
@@ -2809,6 +2810,65 @@ pub fn ensureRunQueueTable(db: *c.sqlite3) !void {
         if (err_msg) |msg| c.sqlite3_free(msg);
         return error.RunQueueTableCreateFailed;
     }
+    // Migration: carry a run's origin from enqueue to completion. Rows queued
+    // by POST /cron/run (dbManualEnqueueJob) carry manual=1 so the worker can
+    // record cron_runs.manual=1; scheduler-queued rows keep the default 0.
+    // Additive with a default: every writer and reader lists its columns, so
+    // an older binary on a migrated DB is unaffected (ignore if present).
+    _ = c.sqlite3_exec(db, "ALTER TABLE cron_run_queue ADD COLUMN manual INTEGER NOT NULL DEFAULT 0", null, null, null);
+    // The ALTER's error is ignored because "duplicate column" is the normal
+    // case, but any other failure (e.g. SQLITE_BUSY past the busy timeout)
+    // must not pass as success: DbCronBackend.openDb caches a successful
+    // schema setup and never re-runs it, and every dequeue SELECTs `manual`,
+    // so a silently missing column would stall the queue until restart.
+    // Fail instead, so the caller retries the migration on its next open.
+    var probe: ?*c.sqlite3_stmt = null;
+    const probe_rc = c.sqlite3_prepare_v2(db, "SELECT manual FROM cron_run_queue LIMIT 0", -1, &probe, null);
+    _ = c.sqlite3_finalize(probe);
+    if (probe_rc != c.SQLITE_OK) return error.RunQueueTableCreateFailed;
+}
+
+test "ensureRunQueueTable reports a migration it could not apply, then applies it on retry" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/locked.db", .{base});
+    defer std.testing.allocator.free(path);
+    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    defer std.testing.allocator.free(path_z);
+
+    // A pre-origin queue table, as an older binary created it.
+    const holder = try openCronDbAtPath(path_z);
+    defer closeCronDb(holder);
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(holder,
+        \\CREATE TABLE cron_run_queue (
+        \\  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  job_id       TEXT NOT NULL,
+        \\  enqueued_at  INTEGER NOT NULL DEFAULT 0,
+        \\  status       TEXT NOT NULL DEFAULT 'pending',
+        \\  started_at   INTEGER
+        \\);
+        \\CREATE INDEX IF NOT EXISTS idx_run_queue_status ON cron_run_queue(status, enqueued_at);
+    , null, null, null));
+
+    const migrator = try openCronDbAtPath(path_z);
+    defer closeCronDb(migrator);
+    _ = c.sqlite3_busy_timeout(migrator, 0); // fail fast instead of waiting 5s
+
+    // Another connection holds the write lock (IMMEDIATE: readers still get
+    // through, so the CREATE ... IF NOT EXISTS no-ops succeed and only the
+    // ALTER is refused — the case the probe exists for).
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(holder, "BEGIN IMMEDIATE", null, null, null));
+    try std.testing.expectError(error.RunQueueTableCreateFailed, ensureRunQueueTable(migrator));
+
+    // Lock released: the next attempt applies the migration.
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(holder, "COMMIT", null, null, null));
+    try ensureRunQueueTable(migrator);
+    var probe: ?*c.sqlite3_stmt = null;
+    defer _ = c.sqlite3_finalize(probe);
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(migrator, "SELECT manual FROM cron_run_queue LIMIT 0", -1, &probe, null));
 }
 
 pub fn ensureCronTable(db: *c.sqlite3) !void {
@@ -5394,8 +5454,8 @@ fn jobHasInflightQueue(db: *c.sqlite3, job_id: []const u8) !bool {
 /// scheduler worker won't dequeue it. Returns the new row's id.
 fn insertManualQueueRow(db: *c.sqlite3, job_id: []const u8, now: i64) !i64 {
     const sql =
-        "INSERT INTO cron_run_queue (job_id, enqueued_at, status, started_at) " ++
-        "VALUES (?1, ?2, 'in_progress', ?2)";
+        "INSERT INTO cron_run_queue (job_id, enqueued_at, status, started_at, manual) " ++
+        "VALUES (?1, ?2, 'in_progress', ?2, 1)";
     var stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
     defer _ = c.sqlite3_finalize(stmt);
@@ -7829,8 +7889,9 @@ pub fn dbManualEnqueueJob(db_path: [:0]const u8, job_id: []const u8, now: i64) !
     const expr_len: usize = @intCast(c.sqlite3_column_bytes(sel_stmt, 0));
     const expr_str = expr_ptr[0..expr_len];
 
-    // Insert into run queue.
-    const ins_sql = "INSERT INTO cron_run_queue (job_id, enqueued_at, status) VALUES (?1, ?2, 'pending')";
+    // Insert into run queue, marked manual so the worker records the run as
+    // an operator-triggered one (cron_runs.manual=1), not a scheduled fire.
+    const ins_sql = "INSERT INTO cron_run_queue (job_id, enqueued_at, status, manual) VALUES (?1, ?2, 'pending', 1)";
     var ins_stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(db, ins_sql, -1, &ins_stmt, null) != c.SQLITE_OK)
         return error.PrepareFailed;
@@ -7972,11 +8033,11 @@ pub fn dbTickAndEnqueueWithDb(db: *c.sqlite3, now: i64) !usize {
 /// Dequeue the next pending job from cron_run_queue, marking it in_progress.
 /// Returns null if the queue is empty.
 /// Caller owns the returned strings (duped into allocator).
-pub fn dbDequeueNextJob(db: *c.sqlite3, allocator: std.mem.Allocator) !?struct { queue_row_id: i64, job_id: []const u8 } {
+pub fn dbDequeueNextJob(db: *c.sqlite3, allocator: std.mem.Allocator) !?struct { queue_row_id: i64, job_id: []const u8, manual: bool } {
     _ = c.sqlite3_exec(db, "PRAGMA journal_mode=WAL", null, null, null);
 
     const sql =
-        "SELECT id, job_id FROM cron_run_queue WHERE status='pending' " ++
+        "SELECT id, job_id, manual FROM cron_run_queue WHERE status='pending' " ++
         "ORDER BY enqueued_at ASC LIMIT 1";
     var stmt: ?*c.sqlite3_stmt = null;
     var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
@@ -7994,6 +8055,7 @@ pub fn dbDequeueNextJob(db: *c.sqlite3, allocator: std.mem.Allocator) !?struct {
     const job_id_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
     const job_id = try allocator.dupe(u8, job_id_ptr[0..job_id_len]);
     errdefer allocator.free(job_id);
+    const manual = c.sqlite3_column_int(stmt, 2) != 0;
 
     // Mark as in_progress.
     const upd_sql = "UPDATE cron_run_queue SET status='in_progress', started_at=?1 WHERE id=?2";
@@ -8005,7 +8067,7 @@ pub fn dbDequeueNextJob(db: *c.sqlite3, allocator: std.mem.Allocator) !?struct {
         _ = c.sqlite3_finalize(upd_stmt);
     }
 
-    return .{ .queue_row_id = queue_row_id, .job_id = job_id };
+    return .{ .queue_row_id = queue_row_id, .job_id = job_id, .manual = manual };
 }
 
 /// Load a job spec from cron_jobs by ID into arena-allocated memory.
@@ -8526,10 +8588,12 @@ fn streakRowNonOk(stmt: ?*c.sqlite3_stmt) bool {
 /// clause (not in Zig): a manual run interleaved mid-streak must neither
 /// extend nor break the count, and Zig-side filtering under LIMIT could
 /// exhaust the fetch window on manual rows before enough scheduled rows are
-/// visible. Caveat kept honest: runs enqueued over the gateway HTTP API are
-/// completed through the same worker with manual hardwired false and source
-/// 'cron_scheduler_skill', so the CLI's manual flag is the exception, not the
-/// rule — HTTP-triggered failures count toward this streak today.
+/// visible. Runs enqueued over the gateway HTTP API (POST /cron/run) carry
+/// cron_run_queue.manual=1 through the worker into cron_runs.manual=1, so they
+/// are filtered here like CLI runs (their source stays 'cron_scheduler_*' —
+/// manual is the origin flag, source the code path). If the anchor itself is
+/// a manual row it is outside the window, the first examined row is not the
+/// anchor, and the walk refuses: a manual run never triggers.
 pub fn detectRunStreak(
     db: *c.sqlite3,
     job_id: []const u8,
@@ -11345,6 +11409,79 @@ test "ensureRunQueueTable creates table" {
     try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 0));
 }
 
+test "ensureRunQueueTable adds manual to a pre-origin queue and old writers keep working" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+
+    // The queue as binaries before the origin column created it, with a row
+    // already waiting.
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(db,
+        \\CREATE TABLE cron_run_queue (
+        \\  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  job_id       TEXT NOT NULL,
+        \\  enqueued_at  INTEGER NOT NULL DEFAULT 0,
+        \\  status       TEXT NOT NULL DEFAULT 'pending',
+        \\  started_at   INTEGER
+        \\);
+        \\INSERT INTO cron_run_queue (job_id, enqueued_at, status) VALUES ('queued-before', 100, 'pending');
+    , null, null, null));
+
+    try ensureRunQueueTable(db);
+    try ensureRunQueueTable(db); // idempotent: the repeated ALTER is a no-op
+
+    // The row that predates the column reads back as scheduled.
+    const before = (try dbDequeueNextJob(db, std.testing.allocator)).?;
+    defer std.testing.allocator.free(before.job_id);
+    try std.testing.expectEqualStrings("queued-before", before.job_id);
+    try std.testing.expect(!before.manual);
+
+    // An older binary's insert — explicit column list, no manual — still
+    // works on the migrated table and lands as scheduled.
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(db, "INSERT INTO cron_run_queue (job_id, enqueued_at, status) VALUES ('old-writer', 200, 'pending')", null, null, null));
+    const old_writer = (try dbDequeueNextJob(db, std.testing.allocator)).?;
+    defer std.testing.allocator.free(old_writer.job_id);
+    try std.testing.expectEqualStrings("old-writer", old_writer.job_id);
+    try std.testing.expect(!old_writer.manual);
+}
+
+test "dbDequeueNextJob carries the queue row's origin" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const sched = &iso.scheduler;
+
+    const j = try sched.addJob("* * * * *", "echo origin-test");
+    const jid = try std.testing.allocator.dupe(u8, j.id);
+    defer std.testing.allocator.free(jid);
+    if (sched.getMutableJob(jid)) |mj| mj.next_run_secs = 1;
+    try dbUpsertAndVerify(sched, sched.getJob(jid).?);
+
+    // Scheduler tick first, operator trigger one second later.
+    const now = std_compat.time.timestamp();
+    try std.testing.expectEqual(@as(usize, 1), try dbTickAndEnqueue(iso.db_path_buf, std.testing.allocator, now));
+    try dbManualEnqueueJob(iso.db_path_buf, jid, now + 1);
+
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+
+    const scheduled = (try dbDequeueNextJob(db, std.testing.allocator)).?;
+    defer std.testing.allocator.free(scheduled.job_id);
+    try std.testing.expectEqualStrings(jid, scheduled.job_id);
+    try std.testing.expect(!scheduled.manual);
+
+    const manual = (try dbDequeueNextJob(db, std.testing.allocator)).?;
+    defer std.testing.allocator.free(manual.job_id);
+    try std.testing.expectEqualStrings(jid, manual.job_id);
+    try std.testing.expect(manual.manual);
+
+    try std.testing.expect((try dbDequeueNextJob(db, std.testing.allocator)) == null);
+}
+
 test "dbTickAndEnqueue enqueues due jobs and updates next_run_secs" {
     if (!build_options.enable_sqlite) return error.SkipZigTest;
 
@@ -12022,6 +12159,29 @@ test "detectRunStreak skips interleaved manual runs entirely" {
     const info = try detectRunStreak(db, "streak-job", 3, "streak-job:6");
     try std.testing.expectEqual(@as(u32, 3), info.streak);
     try std.testing.expect(info.trigger);
+}
+
+test "detectRunStreak never triggers on a manual anchor" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
+    var iso = try makeIsolatedTestScheduler();
+    defer iso.deinit();
+    const db = try openCronDbAtPath(iso.db_path_buf);
+    defer closeCronDb(db);
+    try ensureCronTable(db);
+
+    // Two scheduled failures, then an operator run that also fails: the
+    // operator run is outside the scheduled window, so it is not the first
+    // row the walk sees and the detector refuses instead of counting it.
+    try seedStreakRuns(db, "streak-job", &.{
+        .{ .ts = 100, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 101, .failure_class = "contract_degraded", .verified = 2 },
+        .{ .ts = 102, .failure_class = "exec_error", .verified = 3, .manual = 1, .source = "cron_scheduler_skill", .trace_id = "streak-job:3" },
+    });
+
+    const info = try detectRunStreak(db, "streak-job", 3, "streak-job:3");
+    try std.testing.expectEqual(@as(u32, 0), info.streak);
+    try std.testing.expect(!info.trigger);
 }
 
 test "detectRunStreak counts legacy zero-verified error rows as non-ok" {

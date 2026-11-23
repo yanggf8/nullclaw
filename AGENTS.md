@@ -301,6 +301,8 @@ Routine job changes go through `nullclaw cron add|update|remove|pause|resume`, n
 
 POST `/cron/run` with `{"id": "<job-id>"}` to trigger a job immediately. The DB-direct path uses `dbManualEnqueueJob` which atomically inserts into `cron_run_queue` **and** advances `next_run_secs` to the next scheduled occurrence in one `BEGIN IMMEDIATE` transaction. This prevents the scheduler tick from re-firing the job immediately after a manual run.
 
+The queue row is written with `cron_run_queue.manual=1`; the run-queue worker carries it through dequeue (`DequeueResult.manual`) into `cron_runs.manual=1`, so an HTTP-triggered run is excluded from "scheduled only" aggregates and from the streak escalation — it neither fires it nor breaks the scheduled count. Its `source` stays `cron_scheduler_{agent,skill,shell}` (the code path that ran it); `manual` is the origin. Scheduler-queued rows keep the default `manual=0`.
+
 Never call `dbEnqueueJob` for manual triggers — it is a raw queue insert that does not advance the schedule.
 
 #### Scheduler tick merge invariant

@@ -287,6 +287,9 @@ pub const MemoryCronBackend = struct {
         return types.DequeueResult{
             .queue_row_id = entry.id,
             .spec = spec,
+            // No manual-trigger path reaches this backend: POST /cron/run
+            // enqueues through dbManualEnqueueJob, which is DB-only.
+            .manual = false,
         };
     }
 
