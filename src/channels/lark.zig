@@ -3,6 +3,7 @@ const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
+const process_util = @import("../tools/process_util.zig");
 const bus = @import("../bus.zig");
 const http_util = @import("../http_util.zig");
 const outbound = @import("../outbound.zig");
@@ -919,8 +920,7 @@ pub const LarkChannel = struct {
         child.spawn() catch return error.LarkApiError;
 
         const stdout = child.stdout.?.readToEndAlloc(allocator, LARK_API_MAX_BYTES) catch {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            process_util.abortChild(&child);
             return error.LarkApiError;
         };
         errdefer allocator.free(stdout);

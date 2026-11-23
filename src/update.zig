@@ -6,6 +6,7 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
+const process_util = @import("tools/process_util.zig");
 
 const log = std.log.scoped(.update);
 
@@ -378,8 +379,7 @@ fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, file: *std_comp
     while (true) {
         const bytes_read = stdout.read(&buffer) catch |err| {
             logDownloadToFileError("curl read failed: {}", .{err});
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            process_util.abortChild(&child);
             return error.CurlFailed;
         };
 
@@ -387,8 +387,7 @@ fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, file: *std_comp
 
         file.writeAll(buffer[0..bytes_read]) catch |err| {
             logDownloadToFileError("download write failed: {}", .{err});
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            process_util.abortChild(&child);
             return err;
         };
         total_bytes += bytes_read;

@@ -320,10 +320,7 @@ test "collectChildOutputWithTimeout disables timeout when set to zero" {
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
     try child.spawn();
-    errdefer {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-    }
+    errdefer process_util.abortChild(&child);
 
     var stdout: std.ArrayList(u8) = .empty;
     defer stdout.deinit(allocator);
@@ -358,10 +355,7 @@ test "collectChildOutputWithTimeout kills process after deadline" {
     child.stderr_behavior = .Pipe;
     process_util.applyProcessGroupPolicy(&child, false);
     try child.spawn();
-    errdefer {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-    }
+    errdefer process_util.abortChild(&child);
 
     var stdout: std.ArrayList(u8) = .empty;
     defer stdout.deinit(allocator);
@@ -411,10 +405,7 @@ test "collectChildOutputWithTimeout kills the timed-out child's descendants" {
     child.stderr_behavior = .Pipe;
     process_util.applyProcessGroupPolicy(&child, false);
     try child.spawn();
-    errdefer {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-    }
+    errdefer process_util.abortChild(&child);
 
     var stdout: std.ArrayList(u8) = .empty;
     defer stdout.deinit(allocator);
@@ -472,10 +463,7 @@ test "collectChildOutputWithTimeout does not wait for a descendant that left the
     child.stderr_behavior = .Pipe;
     process_util.applyProcessGroupPolicy(&child, false);
     try child.spawn();
-    errdefer {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-    }
+    errdefer process_util.abortChild(&child);
 
     var stdout: std.ArrayList(u8) = .empty;
     defer stdout.deinit(allocator);

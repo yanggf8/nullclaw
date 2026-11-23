@@ -6,6 +6,7 @@ const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
 const secrets = @import("../security/secrets.zig");
 const thread_stacks = @import("../thread_stacks.zig");
+const process_util = @import("../tools/process_util.zig");
 
 const log = std.log.scoped(.nostr);
 
@@ -332,10 +333,7 @@ pub const NostrChannel = struct {
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Inherit; // avoid deadlock from unread pipe buffer
         try child.spawn();
-        errdefer {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-        }
+        errdefer process_util.abortChild(&child);
 
         if (stdin_data) |data| {
             if (child.stdin) |stdin_file| {
@@ -801,9 +799,19 @@ pub const NostrChannel = struct {
     // ── Helper methods ──────────────────────────────────────────────
 
     pub fn stopListener(self: *NostrChannel) void {
+        // Terminate and reap the listener boundedly, but keep its stdout open
+        // until the reader thread — which may be blocked reading it, and reads
+        // EOF once the listener is gone — has been joined: closing a pipe
+        // another thread is reading lets its fd number be reused under it.
         if (self.listener) |*child| {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            process_util.terminateProcessGroupAndReap(child, process_util.shutdown_term_grace_ns);
+        }
+        if (self.reader_thread) |t| {
+            t.join();
+            self.reader_thread = null;
+        }
+        if (self.listener) |*child| {
+            process_util.stopChild(child, process_util.shutdown_term_grace_ns); // already reaped: releases the pipes
             self.listener = null;
         }
     }

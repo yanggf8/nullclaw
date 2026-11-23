@@ -7,6 +7,7 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const net_security = @import("../root.zig").net_security;
 const http_util = @import("../http_util.zig");
+const process_util = @import("process_util.zig");
 
 const log = std.log.scoped(.http_request);
 
@@ -328,7 +329,9 @@ fn runCurlRequestWithStatus(
                     if (comptime @import("builtin").os.tag == .windows) {
                         _ = ctx.child.kill() catch {};
                     } else {
-                        std.posix.kill(ctx.child.id, std.posix.SIG.TERM) catch {};
+                        // The calling thread owns the child and is blocked on
+                        // its pipes: signal only, it reaps.
+                        process_util.signalChildStop(ctx.child.id, ctx.done, process_util.timeout_term_grace_ns);
                     }
                     break;
                 }
@@ -353,22 +356,19 @@ fn runCurlRequestWithStatus(
             stdin_file.writeAll(b) catch {
                 stdin_file.close();
                 child.stdin = null;
-                _ = child.kill() catch {};
-                _ = child.wait() catch {};
+                process_util.abortChild(&child);
                 return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
             };
             stdin_file.close();
             child.stdin = null;
         } else {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            process_util.abortChild(&child);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
         }
     }
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, max_response_size + 64) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        process_util.abortChild(&child);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
     };
     errdefer allocator.free(stdout);

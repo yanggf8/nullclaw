@@ -13,6 +13,7 @@ const http_util = @import("http_util.zig");
 const fs_compat = @import("fs_compat.zig");
 const providers = @import("providers/root.zig");
 const security = @import("security/root.zig");
+const process_util = @import("tools/process_util.zig");
 
 const SERVICE_LABEL = "com.nullclaw.daemon";
 const WINDOWS_SERVICE_NAME = "nullclaw";
@@ -1192,15 +1193,13 @@ fn runCaptureStatus(allocator: std.mem.Allocator, argv: []const []const u8) !Cap
     };
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        process_util.abortChild(&child);
         return error.CommandFailed;
     };
     errdefer allocator.free(stdout);
     const stderr = child.stderr.?.readToEndAlloc(allocator, 1024 * 1024) catch {
         allocator.free(stdout);
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        process_util.abortChild(&child);
         return error.CommandFailed;
     };
     errdefer allocator.free(stderr);
@@ -1338,8 +1337,7 @@ fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
         else => return err,
     };
     const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        process_util.abortChild(&child);
         return error.CommandFailed;
     };
     errdefer allocator.free(stdout);

@@ -2,6 +2,7 @@ const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
+const process_util = @import("../tools/process_util.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
@@ -118,9 +119,11 @@ pub const GeminiCliProvider = struct {
 
     fn stopInternal(self: *GeminiCliProvider) void {
         if (self.child) |child| {
+            // Close stdin first so the CLI sees EOF, and forget it so it is
+            // not closed a second time with the other pipes.
             if (child.stdin) |stdin| stdin.close();
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            child.stdin = null;
+            process_util.stopChild(child, process_util.shutdown_term_grace_ns);
             self.allocator.destroy(child);
             self.child = null;
         }

@@ -7,6 +7,7 @@ const root = @import("root.zig");
 const error_classify = @import("error_classify.zig");
 const config_types = @import("../config_types.zig");
 const http_util = @import("../http_util.zig");
+const process_util = @import("../tools/process_util.zig");
 const sse = @import("sse.zig");
 
 const Provider = root.Provider;
@@ -848,15 +849,13 @@ pub const GeminiProvider = struct {
             stdin_file.writeAll(body) catch {
                 stdin_file.close();
                 child.stdin = null;
-                _ = child.kill() catch {};
-                _ = child.wait() catch {};
+                process_util.abortChild(&child);
                 return error.GeminiApiError;
             };
             stdin_file.close();
             child.stdin = null;
         } else {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            process_util.abortChild(&child);
             return error.GeminiApiError;
         }
 

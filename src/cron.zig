@@ -8379,10 +8379,7 @@ fn runTimedOutShellForTest(allocator: std.mem.Allocator, prefix: []const u8, std
     child.stderr_behavior = .Pipe;
     process_util.applyProcessGroupPolicy(&child, stdin_is_tty);
     try child.spawn();
-    errdefer {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-    }
+    errdefer process_util.abortChild(&child);
 
     var stdout: std.ArrayList(u8) = .empty;
     defer stdout.deinit(allocator);

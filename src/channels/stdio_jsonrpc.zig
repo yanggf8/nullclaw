@@ -1,6 +1,7 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const root = @import("root.zig");
+const process_util = @import("../tools/process_util.zig");
 
 const log = std.log.scoped(.stdio_jsonrpc);
 
@@ -107,8 +108,7 @@ pub const StdioJsonRpc = struct {
         }
 
         const stdout_file = child.stdout orelse {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            process_util.abortChild(&child);
             return Error.MissingPluginStdout;
         };
 
@@ -138,7 +138,11 @@ pub const StdioJsonRpc = struct {
                 stdin_file.close();
                 child.stdin = null;
             }
-            _ = child.kill() catch {};
+            // Terminate and reap boundedly, but leave stdout open: the reader
+            // thread may be blocked reading it and reads EOF once the child is
+            // gone. It is closed below, after the join, so no fd is closed
+            // under a thread still reading it.
+            process_util.terminateProcessGroupAndReap(child, process_util.shutdown_term_grace_ns);
         }
 
         if (self.reader_thread) |thread| {
@@ -151,7 +155,7 @@ pub const StdioJsonRpc = struct {
         }
 
         if (self.child) |*child| {
-            _ = child.wait() catch {};
+            process_util.stopChild(child, process_util.shutdown_term_grace_ns); // already reaped: releases the pipes
         }
         self.child = null;
         self.reader_alive.store(false, .release);
@@ -487,4 +491,31 @@ test "stdio_jsonrpc buildJsonRpcRequest includes finalized body" {
     const body = try buildJsonRpcRequest(alloc, 7, "tools/call", "{\"name\":\"x\"}");
     defer alloc.free(body);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"x\"}}", body);
+}
+
+test "stdio_jsonrpc stop ends a TERM-ignoring plugin boundedly while the reader thread is blocked on its stdout" {
+    if (comptime @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    // Regression: stop() called child.kill(), which SIGTERMs the plugin and
+    // waits for it without bound, and closes its stdout under the reader
+    // thread still blocked reading it.
+    const alloc = std.testing.allocator;
+    var client = StdioJsonRpc.init(alloc);
+    try client.start(.{ .command = "sh", .args = &.{ "-c", "trap '' TERM; exec sleep 30" } }, null, null);
+    const pid = client.child.?.id;
+    defer if (client.child != null) {
+        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+        client.stop();
+    };
+    std_compat.thread.sleep(100 * std.time.ns_per_ms); // let the trap take effect
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    client.stop();
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+
+    try std.testing.expect(client.child == null);
+    try std.testing.expect(client.reader_thread == null);
+    try std.testing.expect(!client.reader_alive.load(.acquire));
+    try std.testing.expect(elapsed_ns >= process_util.shutdown_term_grace_ns); // TERM first, with its grace
+    try std.testing.expect(elapsed_ns < process_util.shutdown_term_grace_ns + 1 * std.time.ns_per_s);
+    try std.testing.expect(!process_util.processExists(pid)); // reaped, not a zombie
 }

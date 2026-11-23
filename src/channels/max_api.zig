@@ -10,6 +10,7 @@ const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const url_percent = @import("../url_percent.zig");
+const process_util = @import("../tools/process_util.zig");
 
 const log = std.log.scoped(.max_api);
 
@@ -477,8 +478,7 @@ fn curlDelete(allocator: std.mem.Allocator, url: []const u8, auth_header: []cons
     try child.spawn();
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, 256 * 1024) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        process_util.abortChild(&child);
         return error.CurlReadError;
     };
     defer allocator.free(stdout);

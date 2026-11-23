@@ -333,6 +333,23 @@ pub fn closeChildStdio(child: *std_compat.process.Child) void {
 /// it only releases any pipes still held. Afterwards `child.term` is set, so a
 /// later `wait()`/`kill()` returns at once.
 pub fn abortChild(child: *std_compat.process.Child) void {
+    stopChild(child, timeout_term_grace_ns);
+}
+
+/// How long an intentionally stopped long-lived child (a tunnel, an MCP or
+/// stdio plugin server, a channel helper) gets between SIGTERM and SIGKILL.
+/// Longer than `timeout_term_grace_ns` because such a child may need to
+/// deregister or flush on the way out; paid only by a child that outlives
+/// TERM — the wait ends as soon as it is gone.
+pub const shutdown_term_grace_ns: u64 = 2 * std.time.ns_per_s;
+
+/// `abortChild` with the SIGTERM→SIGKILL grace chosen by the caller: the
+/// bounded replacement for `child.kill(); child.wait();` when shutting down a
+/// child on purpose (`shutdown_term_grace_ns`). Same guarantees as
+/// `abortChild`: never waits unboundedly, idempotent, releases the stdio
+/// pipes. Only for a child no other thread is still reading from — see
+/// `signalChildStop` for that case. Windows keeps `kill()` + `wait()`.
+pub fn stopChild(child: *std_compat.process.Child, grace_ns: u64) void {
     if (comptime builtin.os.tag == .wasi) return;
     if (comptime builtin.os.tag == .windows) {
         // Unchanged Windows behaviour: TerminateProcess, then the reap.
@@ -340,8 +357,49 @@ pub fn abortChild(child: *std_compat.process.Child) void {
         _ = child.wait() catch {};
         return;
     }
-    if (child.term == null) terminateProcessGroupAndReap(child, timeout_term_grace_ns);
+    if (child.term == null) terminateProcessGroupAndReap(child, grace_ns);
     closeChildStdio(child);
+}
+
+/// Stop a child that ANOTHER thread owns, from a timeout or cancel watcher,
+/// while the owner is blocked reading the child's pipes or in `wait()`.
+///
+/// Signals only: SIGTERM to the child's process group (the pid alone when it
+/// has none); then, unless the child and its group are gone or the owner has
+/// set `owner_done` within `grace_ns`, SIGKILL the same way. It never reaps and
+/// never closes the child's pipes — reaping here races the owner's `wait()`
+/// for the same pid, and closing a pipe another thread is reading lets its fd
+/// number be reused under that thread. Once the child is gone the owner's
+/// read sees EOF and the owner's own `wait()` reaps it promptly, so the owner
+/// is bounded by `grace_ns` plus the SIGKILL.
+///
+/// `owner_done` must be set by the owner once it has reaped the child (e.g.
+/// in the defer that joins the watcher): after that the pid may name another
+/// process, so nothing more is sent. A residual window remains between the
+/// liveness check and the SIGKILL in which the owner could reap and the
+/// kernel reuse the pid; it needs the pid space to wrap within microseconds.
+///
+/// POSIX only; Windows/WASI callers keep their own platform path.
+pub fn signalChildStop(pid: std.posix.pid_t, owner_done: *const AtomicBool, grace_ns: u64) void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (owner_done.load(.acquire)) return;
+    signalGroupAndLeader(pid, std.posix.SIG.TERM);
+
+    var waited_ns: u64 = 0;
+    while (waited_ns < grace_ns) {
+        if (owner_done.load(.acquire) or childAndGroupGone(pid)) return;
+        std_compat.thread.sleep(group_poll_ns);
+        waited_ns +|= group_poll_ns;
+    }
+    if (owner_done.load(.acquire) or childAndGroupGone(pid)) return;
+    signalGroupAndLeader(pid, std.posix.SIG.KILL);
+}
+
+/// The child has exited (a zombie counts) and no process is left in a group
+/// it leads — a child that leads no group has none. A leader that exited
+/// while its group lives on still has descendants holding the owner's pipes.
+fn childAndGroupGone(pid: std.posix.pid_t) bool {
+    return processExitedOrZombie(pid) and !processGroupAlive(pid);
 }
 
 fn processWatcherMain(ctx: *ProcessWatcherCtx) void {
@@ -1028,6 +1086,173 @@ test "abortChild bounds a TERM-ignoring child and is a no-op once the child is r
     try std.testing.expectEqual(std_compat.process.Child.Term{ .exited = 3 }, try done.wait());
     abortChild(&done);
     try std.testing.expectEqual(@as(?std_compat.process.Child.Term, .{ .exited = 3 }), done.term);
+}
+
+/// Test aid: read one '\n'-terminated line (without the newline) into `buf`.
+fn readLineForTest(file: std_compat.fs.File, buf: []u8) ![]const u8 {
+    var len: usize = 0;
+    while (len < buf.len) {
+        var byte: [1]u8 = undefined;
+        if (try file.read(&byte) == 0) return error.EndOfStream;
+        if (byte[0] == '\n') return buf[0..len];
+        buf[len] = byte[0];
+        len += 1;
+    }
+    return error.StreamTooLong;
+}
+
+test "stopChild ends a TERM-ignoring child after the caller's grace and releases its pipes" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var child = std_compat.process.Child.init(&.{ "sh", "-c", "trap '' TERM; echo ready; exec sleep 30" }, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+    const pid = child.id;
+    defer if (child.term == null) {
+        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+        _ = child.wait() catch {};
+    };
+    var line_buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("ready", try readLineForTest(child.stdout.?, &line_buf));
+
+    // Shorter than timeout_term_grace_ns, so a stopChild that ignored its
+    // argument would overrun the upper bound below.
+    const grace_ns: u64 = 100 * std.time.ns_per_ms;
+    const start_ns = std_compat.time.nanoTimestamp();
+    stopChild(&child, grace_ns);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+
+    try std.testing.expectEqual(@as(?std_compat.process.Child.Term, .{ .signal = std.posix.SIG.KILL }), child.term);
+    try std.testing.expect(child.stdin == null and child.stdout == null and child.stderr == null);
+    try std.testing.expect(elapsed_ns >= grace_ns); // TERM first, and its grace honoured
+    try std.testing.expect(elapsed_ns < grace_ns + 300 * std.time.ns_per_ms);
+    try std.testing.expect(!processExists(pid)); // reaped, not a zombie
+    stopChild(&child, grace_ns); // idempotent
+    try std.testing.expectEqual(std_compat.process.Child.Term{ .signal = std.posix.SIG.KILL }, try child.wait());
+}
+
+const SignalChildStopForTest = struct {
+    pid: std.posix.pid_t,
+    owner_done: *const AtomicBool,
+    grace_ns: u64,
+
+    fn run(self: *const SignalChildStopForTest) void {
+        signalChildStop(self.pid, self.owner_done, self.grace_ns);
+    }
+};
+
+test "signalChildStop kills a TERM-ignoring child another thread is reading, leaving the reap and the pipes to that thread" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var child = std_compat.process.Child.init(&.{ "sh", "-c", "trap '' TERM; echo ready; exec sleep 30" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    const pid = child.id;
+    defer if (child.term == null) {
+        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+        _ = child.wait() catch {};
+    };
+    var line_buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("ready", try readLineForTest(child.stdout.?, &line_buf));
+
+    var owner_done = AtomicBool.init(false);
+    const ctx = SignalChildStopForTest{ .pid = pid, .owner_done = &owner_done, .grace_ns = 100 * std.time.ns_per_ms };
+    const start_ns = std_compat.time.nanoTimestamp();
+    const watcher = try std.Thread.spawn(.{}, SignalChildStopForTest.run, .{&ctx});
+    defer watcher.join();
+    defer owner_done.store(true, .release);
+
+    // The owner blocks reading; the watcher's signals must end that read
+    // with EOF — not with EBADF from a pipe closed under it.
+    const rest = try child.stdout.?.readToEndAlloc(allocator, 1024);
+    defer allocator.free(rest);
+    try std.testing.expectEqualStrings("", rest);
+    // The owner's own wait() reaps the child: had the watcher reaped it,
+    // this wait would find no child to wait for.
+    try std.testing.expectEqual(std_compat.process.Child.Term{ .signal = std.posix.SIG.KILL }, try child.wait());
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+    try std.testing.expect(elapsed_ns < 100 * std.time.ns_per_ms + 1 * std.time.ns_per_s);
+}
+
+test "signalChildStop does not escalate to SIGKILL when the child exits on SIGTERM" {
+    // Linux only: elsewhere processExitedOrZombie cannot tell an unreaped
+    // zombie from a live process, so the early return waits out the grace.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var child = std_compat.process.Child.init(&.{ "sleep", "30" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    const pid = child.id;
+    defer if (child.term == null) {
+        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+        _ = child.wait() catch {};
+    };
+
+    var owner_done = AtomicBool.init(false);
+    const grace_ns: u64 = 2 * std.time.ns_per_s;
+    const start_ns = std_compat.time.nanoTimestamp();
+    signalChildStop(pid, &owner_done, grace_ns);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+
+    // Returned as soon as the child was gone, not after the whole grace.
+    try std.testing.expect(elapsed_ns < grace_ns / 2);
+    try std.testing.expectEqual(std_compat.process.Child.Term{ .signal = std.posix.SIG.TERM }, try child.wait());
+}
+
+test "signalChildStop kills the group when the child exits on SIGTERM but a descendant holding the pipe does not" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var child = std_compat.process.Child.init(&.{ "sh", "-c", "(trap '' TERM; echo ready; exec sleep 30) & wait" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    applyProcessGroupPolicy(&child, false);
+    try child.spawn();
+    const pid = child.id;
+    defer if (child.term == null) {
+        std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
+        _ = child.wait() catch {};
+    };
+    var line_buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("ready", try readLineForTest(child.stdout.?, &line_buf));
+
+    var owner_done = AtomicBool.init(false);
+    const ctx = SignalChildStopForTest{ .pid = pid, .owner_done = &owner_done, .grace_ns = 100 * std.time.ns_per_ms };
+    const start_ns = std_compat.time.nanoTimestamp();
+    const watcher = try std.Thread.spawn(.{}, SignalChildStopForTest.run, .{&ctx});
+    defer watcher.join();
+    defer owner_done.store(true, .release);
+
+    // The shell dies on TERM at once; the sleep keeps the pipe open until
+    // the group is killed.
+    const rest = try child.stdout.?.readToEndAlloc(allocator, 1024);
+    defer allocator.free(rest);
+    try std.testing.expectEqualStrings("", rest);
+    try std.testing.expectEqual(std_compat.process.Child.Term{ .signal = std.posix.SIG.TERM }, try child.wait());
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+    try std.testing.expect(elapsed_ns < 100 * std.time.ns_per_ms + 1 * std.time.ns_per_s);
+}
+
+test "signalChildStop sends nothing once the owner is done" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var child = std_compat.process.Child.init(&.{ "sleep", "30" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    defer abortChild(&child);
+
+    var owner_done = AtomicBool.init(true);
+    signalChildStop(child.id, &owner_done, 100 * std.time.ns_per_ms);
+    std_compat.thread.sleep(50 * std.time.ns_per_ms);
+    try std.testing.expect(!processExitedOrZombie(child.id));
 }
 
 test "isolateProcessGroup isolates only when stdin is not a terminal" {

@@ -5,6 +5,7 @@ const root = @import("root.zig");
 const gemini = @import("gemini.zig");
 const config_types = @import("../config_types.zig");
 const platform = @import("../platform.zig");
+const process_util = @import("../tools/process_util.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
@@ -557,8 +558,7 @@ fn signRsaSha256WithOpenSsl(
     };
     var waited = false;
     errdefer if (!waited) {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        process_util.abortChild(&child);
     };
 
     if (child.stdin) |stdin_file| {

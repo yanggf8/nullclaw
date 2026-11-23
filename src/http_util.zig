@@ -8,6 +8,7 @@ const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const AtomicBool = std.atomic.Value(bool);
 const net_security = @import("net_security.zig");
+const process_util = @import("tools/process_util.zig");
 
 const log = std.log.scoped(.http_util);
 threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
@@ -90,6 +91,22 @@ fn startStderrCapture(child: *std_compat.process.Child, capture: *StderrCapture)
     return std.Thread.spawn(.{}, stderrCaptureMain, .{capture}) catch null;
 }
 
+/// Error-path stop for a curl child whose stderr a capture thread is
+/// draining: terminate and reap it boundedly (process_util.abortChild's
+/// guarantees), but join the capture thread BEFORE the pipes are closed, so
+/// no fd is closed under a thread still reading it — the child being gone,
+/// that read ends with EOF. Windows keeps kill + wait.
+fn abortCurlChild(child: *std_compat.process.Child, stderr_thread: *?std.Thread) void {
+    if (comptime @import("builtin").os.tag != .windows and @import("builtin").os.tag != .wasi) {
+        process_util.terminateProcessGroupAndReap(child, process_util.timeout_term_grace_ns);
+        if (stderr_thread.*) |thread| {
+            thread.join();
+            stderr_thread.* = null;
+        }
+    }
+    process_util.abortChild(child);
+}
+
 fn finishStderrCapture(thread_opt: *?std.Thread, capture: *const StderrCapture) ?[]const u8 {
     if (thread_opt.*) |thread| {
         thread.join();
@@ -134,7 +151,10 @@ fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
             if (comptime @import("builtin").os.tag == .windows) {
                 _ = ctx.child.kill() catch {};
             } else {
-                std.posix.kill(ctx.child.id, std.posix.SIG.TERM) catch {};
+                // Another thread owns the child and is blocked on its pipes:
+                // signal only (TERM, then KILL if it outlives the grace), and
+                // leave the reap and the pipes to that thread.
+                process_util.signalChildStop(ctx.child.id, ctx.done, process_util.timeout_term_grace_ns);
             }
             break;
         }
@@ -440,26 +460,23 @@ fn curlRequestWithProxy(
         stdin_file.writeAll(body) catch {
             stdin_file.close();
             child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            abortCurlChild(&child, &stderr_thread);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
         };
         stdin_file.close();
         child.stdin = null;
     } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        abortCurlChild(&child, &stderr_thread);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
     }
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, DEFAULT_CURL_POST_MAX_BYTES) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        abortCurlChild(&child, &stderr_thread);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
     };
 
     const term = child.wait() catch |err| {
-        _ = child.kill() catch {};
+        abortCurlChild(&child, &stderr_thread);
         const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
         logCurlWaitFailure(method, err, stderr_msg);
         allocator.free(stdout);
@@ -605,27 +622,24 @@ pub fn curlPostWithStatusAndTimeoutAndResolve(
         stdin_file.writeAll(body) catch {
             stdin_file.close();
             child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            abortCurlChild(&child, &stderr_thread);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
         };
         stdin_file.close();
         child.stdin = null;
     } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        abortCurlChild(&child, &stderr_thread);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
     }
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, DEFAULT_CURL_POST_MAX_BYTES) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        abortCurlChild(&child, &stderr_thread);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
     };
     errdefer allocator.free(stdout);
 
     const term = child.wait() catch |err| {
-        _ = child.kill() catch {};
+        abortCurlChild(&child, &stderr_thread);
         const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
         logCurlWaitFailure("POST", err, stderr_msg);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
@@ -751,27 +765,24 @@ pub fn curlPostWithStatusHeadersAndTimeoutAndResolve(
         stdin_file.writeAll(body) catch {
             stdin_file.close();
             child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            abortCurlChild(&child, &stderr_thread);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
         };
         stdin_file.close();
         child.stdin = null;
     } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        abortCurlChild(&child, &stderr_thread);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
     }
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        abortCurlChild(&child, &stderr_thread);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
     };
     errdefer allocator.free(stdout);
 
     const term = child.wait() catch |err| {
-        _ = child.kill() catch {};
+        abortCurlChild(&child, &stderr_thread);
         const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
         logCurlWaitFailure("POST", err, stderr_msg);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
@@ -888,14 +899,13 @@ pub fn curlGetWithStatusAndTimeoutAndResolve(
     defer if (stderr_thread) |thread| thread.join();
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, DEFAULT_CURL_GET_MAX_BYTES) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        abortCurlChild(&child, &stderr_thread);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
     };
     errdefer allocator.free(stdout);
 
     const term = child.wait() catch |err| {
-        _ = child.kill() catch {};
+        abortCurlChild(&child, &stderr_thread);
         const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
         logCurlWaitFailure("GET", err, stderr_msg);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
@@ -1010,13 +1020,12 @@ fn curlGetWithProxyAndResolve(
     defer if (stderr_thread) |thread| thread.join();
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, max_bytes) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        abortCurlChild(&child, &stderr_thread);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
     };
 
     const term = child.wait() catch |err| {
-        _ = child.kill() catch {};
+        abortCurlChild(&child, &stderr_thread);
         const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
         logCurlWaitFailure("GET", err, stderr_msg);
         return error.CurlWaitError;
@@ -1245,13 +1254,12 @@ pub fn curlGetSSE(
     defer if (stderr_thread) |thread| thread.join();
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        abortCurlChild(&child, &stderr_thread);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
     };
 
     const term = child.wait() catch |err| {
-        _ = child.kill() catch {};
+        abortCurlChild(&child, &stderr_thread);
         const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
         logCurlWaitFailure("GET-SSE", err, stderr_msg);
         allocator.free(stdout);
@@ -1517,4 +1525,38 @@ test "initClientDefaultProxiesFromEnvMap parses proxy settings" {
     try std.testing.expectEqual(@as(u16, 8443), client.https_proxy.?.port);
     try std.testing.expect(client.http_proxy.?.host.eql(try std.Io.net.HostName.init("proxy-http.example")));
     try std.testing.expect(client.https_proxy.?.host.eql(try std.Io.net.HostName.init("proxy-https.example")));
+}
+
+test "abortCurlChild ends a TERM-ignoring child boundedly and joins the stderr reader before closing the pipes" {
+    if (comptime @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    // Regression: the curl error paths called child.kill(), which SIGTERMs the
+    // pid and waits for it without bound, and closes stderr under the capture
+    // thread still reading it.
+    const allocator = std.testing.allocator;
+    var child = std_compat.process.Child.init(&.{ "sh", "-c", "trap '' TERM; echo ready >&2; exec sleep 30" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+    const pid = child.id;
+    var stderr_capture = StderrCapture{};
+    var stderr_thread = startStderrCapture(&child, &stderr_capture);
+    defer if (stderr_thread) |thread| thread.join();
+    // Runs before the join above: a still-running child would hold the pipe.
+    defer if (child.term == null) {
+        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+        _ = child.wait() catch {};
+    };
+    std_compat.thread.sleep(100 * std.time.ns_per_ms); // let the trap take effect
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    abortCurlChild(&child, &stderr_thread);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+
+    try std.testing.expect(stderr_thread == null);
+    try std.testing.expectEqualStrings("ready", stderr_capture.trimmed().?);
+    try std.testing.expect(child.stdout == null and child.stderr == null);
+    try std.testing.expectEqual(std_compat.process.Child.Term{ .signal = std.posix.SIG.KILL }, try child.wait());
+    try std.testing.expect(elapsed_ns < process_util.timeout_term_grace_ns + 500 * std.time.ns_per_ms);
+    try std.testing.expect(!process_util.processExists(pid));
 }

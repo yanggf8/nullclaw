@@ -6,6 +6,7 @@ const bus_mod = @import("../bus.zig");
 const interaction_choices = @import("../interactions/choices.zig");
 const websocket = @import("../websocket.zig");
 const thread_stacks = @import("../thread_stacks.zig");
+const process_util = @import("../tools/process_util.zig");
 
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
@@ -503,21 +504,18 @@ pub const DiscordChannel = struct {
             stdin_file.writeAll(body) catch {
                 stdin_file.close();
                 child.stdin = null;
-                _ = child.kill() catch {};
-                _ = child.wait() catch {};
+                process_util.abortChild(&child);
                 return error.CurlWriteError;
             };
             stdin_file.close();
             child.stdin = null;
         } else {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            process_util.abortChild(&child);
             return error.CurlWriteError;
         }
 
         const stdout = child.stdout.?.readToEndAlloc(self.allocator, 64 * 1024) catch {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            process_util.abortChild(&child);
             return error.CurlReadError;
         };
         defer self.allocator.free(stdout);

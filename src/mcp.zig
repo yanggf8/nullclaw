@@ -13,6 +13,7 @@ const platform = @import("platform.zig");
 const http_util = @import("http_util.zig");
 const sse_client = @import("sse_client.zig");
 const util = @import("util.zig");
+const process_util = @import("tools/process_util.zig");
 const verbose = @import("verbose.zig");
 const Allocator = std.mem.Allocator;
 
@@ -172,8 +173,7 @@ pub const McpServer = struct {
                 stdin.close();
                 child.stdin = null;
             }
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            process_util.stopChild(child, process_util.shutdown_term_grace_ns);
         }
         self.child = null;
     }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
+const process_util = @import("tools/process_util.zig");
 
 // Tunnel -- ngrok/cloudflare/tailscale/custom tunnel management.
 //
@@ -232,7 +233,7 @@ fn detachChildArgv(child: *std_compat.process.Child) void {
 
 fn cleanupFailedStart(child: *?std_compat.process.Child, state: *TunnelState) void {
     if (child.*) |*running_child| {
-        _ = running_child.kill() catch {};
+        process_util.stopChild(running_child, process_util.shutdown_term_grace_ns);
     }
     child.* = null;
     state.* = .error_state;
@@ -337,7 +338,7 @@ pub const CloudflareTunnel = struct {
     fn cfStop(ptr: *anyopaque) void {
         const self = resolve(ptr);
         if (self.child) |*child| {
-            _ = child.kill() catch {};
+            process_util.stopChild(child, process_util.shutdown_term_grace_ns);
         }
         self.child = null;
         self.state = .stopped;
@@ -453,7 +454,7 @@ pub const NgrokTunnel = struct {
     fn ngrokStop(ptr: *anyopaque) void {
         const self = resolve(ptr);
         if (self.child) |*child| {
-            _ = child.kill() catch {};
+            process_util.stopChild(child, process_util.shutdown_term_grace_ns);
         }
         self.child = null;
         self.state = .stopped;
@@ -594,7 +595,7 @@ pub const TailscaleTunnel = struct {
         _ = reset_child.wait() catch {};
 
         if (self.child) |*child| {
-            _ = child.kill() catch {};
+            process_util.stopChild(child, process_util.shutdown_term_grace_ns);
         }
         self.child = null;
         self.state = .stopped;
@@ -707,7 +708,7 @@ pub const CustomTunnel = struct {
     fn customStop(ptr: *anyopaque) void {
         const self = resolve(ptr);
         if (self.child) |*child| {
-            _ = child.kill() catch {};
+            process_util.stopChild(child, process_util.shutdown_term_grace_ns);
         }
         self.child = null;
         self.state = .stopped;
@@ -940,7 +941,7 @@ pub const Tunnel = struct {
     /// Stop the tunnel.
     pub fn stop(self: *Tunnel) void {
         if (self.child) |*child| {
-            _ = child.kill() catch {};
+            process_util.stopChild(child, process_util.shutdown_term_grace_ns);
         }
         self.child = null;
         self.state = .stopped;

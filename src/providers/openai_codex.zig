@@ -11,6 +11,7 @@ const sse = @import("sse.zig");
 const auth = @import("../auth.zig");
 const codex_support = @import("../codex_support.zig");
 const http_util = @import("../http_util.zig");
+const process_util = @import("../tools/process_util.zig");
 
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
@@ -459,15 +460,13 @@ fn codexStreamRequest(
         stdin_file.writeAll(body) catch {
             stdin_file.close();
             child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            process_util.abortChild(&child);
             return error.CurlWriteError;
         };
         stdin_file.close();
         child.stdin = null;
     } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        process_util.abortChild(&child);
         return error.CurlWriteError;
     }
 
@@ -570,8 +569,7 @@ fn codexStreamRequest(
         // NOTE: No direct unit test covers the child-kill path here. Under the
         // current Zig/macOS test runner, PATH-based curl interception is not
         // reliable enough for a deterministic subprocess regression test.
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        process_util.abortChild(&child);
         if (accumulated.items.len == 0) return error.NoResponseContent;
         callback(ctx, root.StreamChunk.finalChunk());
         return finalizeCodexStreamResult(allocator, accumulated.items);

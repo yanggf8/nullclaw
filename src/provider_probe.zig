@@ -1,10 +1,12 @@
 const std = @import("std");
 const std_compat = @import("compat");
+const builtin = @import("builtin");
 const config_mod = @import("config.zig");
 const codex_support = @import("codex_support.zig");
 const net_security = @import("net_security.zig");
 const onboard = @import("onboard.zig");
 const providers = @import("providers/root.zig");
+const process_util = @import("tools/process_util.zig");
 
 const ProbeResult = struct {
     provider: []const u8,
@@ -92,7 +94,15 @@ fn runCommandProbe(allocator: std.mem.Allocator, argv: []const []const u8, timeo
             }
             if (ctx.finished.load(.acquire)) return;
             ctx.timed_out.store(true, .release);
-            _ = ctx.child.kill() catch {};
+            if (comptime builtin.os.tag == .windows) {
+                _ = ctx.child.kill() catch {};
+            } else {
+                // The probing thread is blocked in child.wait(): reaping here
+                // too would race it for the same pid. Signal only — TERM,
+                // then KILL if the child outlives the grace — and let that
+                // wait() reap.
+                process_util.signalChildStop(ctx.child.id, ctx.finished, process_util.timeout_term_grace_ns);
+            }
         }
     };
 
@@ -453,4 +463,20 @@ test "classifyProbeError maps curl transport errors" {
         try std.testing.expectEqualStrings("network_error", classified.reason);
         try std.testing.expectEqual(@as(?u16, null), classified.status_code);
     }
+}
+
+test "runCommandProbe ends a TERM-ignoring probe after its timeout and reaps it on the probing thread" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    // Regression: the watchdog called child.kill(), which SIGTERMs the pid and
+    // then waits for it itself — racing the probing thread's own wait() for the
+    // same pid, and waiting without bound for a child that ignores SIGTERM.
+    const timeout_secs: u64 = 1;
+    const start_ns = std_compat.time.nanoTimestamp();
+    try std.testing.expectError(
+        error.ComponentProbeTimeout,
+        runCommandProbe(std.testing.allocator, &.{ "sh", "-c", "trap '' TERM; exec sleep 30" }, timeout_secs),
+    );
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+    try std.testing.expect(elapsed_ns >= timeout_secs * std.time.ns_per_s);
+    try std.testing.expect(elapsed_ns < timeout_secs * std.time.ns_per_s + process_util.timeout_term_grace_ns + 1 * std.time.ns_per_s);
 }

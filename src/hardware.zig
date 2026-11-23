@@ -3,6 +3,7 @@ const std_compat = @import("compat");
 const builtin = @import("builtin");
 const config = @import("config.zig");
 const thread_stacks = @import("thread_stacks.zig");
+const process_util = @import("tools/process_util.zig");
 
 // Hardware discovery -- USB device enumeration and introspection.
 //
@@ -366,6 +367,15 @@ pub const HotplugMonitor = struct {
     allocator: std.mem.Allocator,
     callback: ?DeviceEventCallback = null,
     callback_ctx: ?*anyopaque = null,
+    /// Pid of the running monitor child (0 = none), so stopHotplugMonitor can
+    /// end it: the monitor thread sits in a blocking read of its stdout and
+    /// only notices `running` between reads.
+    child_pid: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
+    /// Set by the monitor thread once it has reaped the child; tells
+    /// stopHotplugMonitor's signalChildStop the pid is no longer ours.
+    child_reaped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Test seam: the command run instead of `udevadm monitor ...`.
+    argv_override: ?[]const []const u8 = null,
 };
 
 /// Start a hotplug monitor that calls `callback` on USB device events.
@@ -390,7 +400,16 @@ pub fn startHotplugMonitor(monitor: *HotplugMonitor) !void {
 
 /// Stop the hotplug monitor and wait for the thread to finish.
 pub fn stopHotplugMonitor(monitor: *HotplugMonitor) void {
-    monitor.running.store(false, .release);
+    monitor.running.store(false, .seq_cst);
+    // The thread may be blocked reading an idle monitor's stdout: end the
+    // child (TERM, then KILL after the grace) so that read sees EOF. Signal
+    // only — the thread reaps it and releases the pipes. Pairs with the
+    // seq_cst store-then-check in runLinuxMonitor: either this sees the pid,
+    // or the thread sees `running == false` before it first reads.
+    if (comptime builtin.os.tag == .linux) {
+        const pid = monitor.child_pid.load(.seq_cst);
+        if (pid != 0) process_util.signalChildStop(pid, &monitor.child_reaped, process_util.shutdown_term_grace_ns);
+    }
     if (monitor.thread) |t| {
         t.join();
         monitor.thread = null;
@@ -506,16 +525,22 @@ fn parseTimestampSecs(ts_str: []const u8) i64 {
 /// and parse header + property lines from its stdout.
 fn runLinuxMonitor(monitor: *HotplugMonitor) void {
     var child = std_compat.process.Child.init(
-        &.{ "udevadm", "monitor", "--udev", "--subsystem-match=usb", "--property" },
+        monitor.argv_override orelse &.{ "udevadm", "monitor", "--udev", "--subsystem-match=usb", "--property" },
         monitor.allocator,
     );
+    child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    // Nobody reads stderr; a monitor that filled that pipe would block.
+    child.stderr_behavior = .Ignore;
+    monitor.child_reaped.store(false, .seq_cst);
     child.spawn() catch return;
+    monitor.child_pid.store(child.id, .seq_cst);
     defer {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        process_util.stopChild(&child, process_util.shutdown_term_grace_ns);
+        monitor.child_pid.store(0, .seq_cst);
+        monitor.child_reaped.store(true, .seq_cst);
     }
+    if (!monitor.running.load(.seq_cst)) return;
 
     const cb = monitor.callback orelse return;
     const stdout = child.stdout orelse return;
@@ -1001,6 +1026,38 @@ test "startHotplugMonitor returns without error" {
     // On macOS: logs and returns (no thread). On Linux: udevadm may fail but ok.
     stopHotplugMonitor(&monitor);
     try std.testing.expect(monitor.thread == null);
+}
+
+test "stopHotplugMonitor ends an idle monitor child instead of waiting on its read forever" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    // Regression: stop cleared `running` and joined the thread, which sat in a
+    // blocking read of the idle monitor's stdout; the child was only stopped
+    // after that read returned, so shutdown never completed.
+    const Noop = struct {
+        fn cb(_: DeviceEvent, _: ?*anyopaque) void {}
+    };
+    var monitor = HotplugMonitor{
+        .allocator = std.testing.allocator,
+        .callback = Noop.cb,
+        .argv_override = &.{ "sh", "-c", "trap '' TERM; exec sleep 30" },
+    };
+    try startHotplugMonitor(&monitor);
+    // Wait until the child runs and the thread is in its read loop.
+    var waited: usize = 0;
+    while (monitor.child_pid.load(.seq_cst) == 0 and waited < 200) : (waited += 1) {
+        std_compat.thread.sleep(10 * std.time.ns_per_ms);
+    }
+    const pid = monitor.child_pid.load(.seq_cst);
+    try std.testing.expect(pid != 0);
+    std_compat.thread.sleep(100 * std.time.ns_per_ms); // let the trap take effect
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    stopHotplugMonitor(&monitor);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+
+    try std.testing.expect(monitor.thread == null);
+    try std.testing.expect(elapsed_ns < process_util.shutdown_term_grace_ns + 1 * std.time.ns_per_s);
+    try std.testing.expect(!process_util.processExists(pid)); // reaped, not a zombie
 }
 
 test "stopHotplugMonitor is safe to call twice" {
