@@ -12206,20 +12206,15 @@ test "detectRunStreak stays quiet past the threshold when runs carry retry pairs
 }
 
 test "cronDbPath stays inside the directory ensureCronDir creates under NULLCLAW_HOME" {
-    // setenv/unsetenv are POSIX-only; Windows has no cimport member for them.
     // Matches the guard on the other env-override tests (see config.zig).
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const libc = @cImport({
-        @cInclude("stdlib.h");
-    });
+    const test_env = @import("test_env.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const base_z = try std.testing.allocator.dupeZ(u8, base);
-    defer std.testing.allocator.free(base_z);
-    try std.testing.expectEqual(@as(c_int, 0), libc.setenv("NULLCLAW_HOME", base_z.ptr, 1));
-    defer _ = libc.unsetenv("NULLCLAW_HOME");
+    var home_env = try test_env.EnvOverride.init(std.testing.allocator, "NULLCLAW_HOME", base);
+    defer home_env.restore();
 
     const path = try cronDbPath(std.testing.allocator);
     defer std.testing.allocator.free(path);

@@ -4426,9 +4426,7 @@ test "save roundtrip preserves tools customization schema" {
 
 test "load merges relative tool_customizations_file with inline customizations" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
+    const test_env = @import("test_env.zig");
 
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4457,12 +4455,8 @@ test "load merges relative tool_customizations_file with inline customizations" 
 
     const home = try tmp_dir.realpathAlloc(allocator, "home");
     defer allocator.free(home);
-    const key_z = try allocator.dupeZ(u8, "NULLCLAW_HOME");
-    defer allocator.free(key_z);
-    const home_z = try allocator.dupeZ(u8, home);
-    defer allocator.free(home_z);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, home_z.ptr, 1));
-    defer _ = c.unsetenv(key_z.ptr);
+    var home_env = try test_env.EnvOverride.init(allocator, "NULLCLAW_HOME", home);
+    defer home_env.restore();
 
     var loaded = try Config.load(allocator);
     defer loaded.deinit();
@@ -8093,16 +8087,12 @@ test "reflection_config_env_reflect_after_turn" {
     // setenv/unsetenv are POSIX-only; Windows has no cimport member for them.
     // Matches the guard on the other env-override tests (see config.zig HOME test).
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
+    const test_env = @import("test_env.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const key_z = try allocator.dupeZ(u8, "NULLCLAW_AGENT_REFLECT_AFTER_TURN");
-    const value_z = try allocator.dupeZ(u8, "true");
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, value_z.ptr, 1));
-    defer _ = c.unsetenv(key_z.ptr);
+    var reflect_env = try test_env.EnvOverride.init(allocator, "NULLCLAW_AGENT_REFLECT_AFTER_TURN", "true");
+    defer reflect_env.restore();
     var cfg = Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
@@ -8117,20 +8107,14 @@ test "judge_config_env_overrides" {
     // setenv/unsetenv are POSIX-only; Windows has no cimport member for them.
     // Matches the guard on the other env-override tests (see config.zig HOME test).
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
+    const test_env = @import("test_env.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const bool_key_z = try allocator.dupeZ(u8, "NULLCLAW_AGENT_JUDGE_AFTER_TURN");
-    const bool_value_z = try allocator.dupeZ(u8, "true");
-    const count_key_z = try allocator.dupeZ(u8, "NULLCLAW_AGENT_MAX_JUDGE_CONTINUATIONS");
-    const count_value_z = try allocator.dupeZ(u8, "4");
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(bool_key_z.ptr, bool_value_z.ptr, 1));
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(count_key_z.ptr, count_value_z.ptr, 1));
-    defer _ = c.unsetenv(bool_key_z.ptr);
-    defer _ = c.unsetenv(count_key_z.ptr);
+    var judge_env = try test_env.EnvOverride.init(allocator, "NULLCLAW_AGENT_JUDGE_AFTER_TURN", "true");
+    defer judge_env.restore();
+    var count_env = try test_env.EnvOverride.init(allocator, "NULLCLAW_AGENT_MAX_JUDGE_CONTINUATIONS", "4");
+    defer count_env.restore();
     var cfg = Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",

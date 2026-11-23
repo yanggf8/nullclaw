@@ -697,9 +697,7 @@ test "delegate uses configured provider entry for key and base_url" {
 
 test "delegate fallback uses configured default provider through vtable path" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
+    const test_env = @import("../test_env.zig");
     const allocator = std.testing.allocator;
 
     test_complete_agent_prompt_override = testCompleteAgentPrompt;
@@ -731,23 +729,6 @@ test "delegate fallback uses configured default provider through vtable path" {
         test_expected_prompt = null;
     }
 
-    const env_name = try allocator.dupeZ(u8, "NULLCLAW_HOME");
-    defer allocator.free(env_name);
-    const previous_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => null,
-        else => return err,
-    };
-    defer {
-        if (previous_home) |value| {
-            defer allocator.free(value);
-            const value_z = allocator.dupeZ(u8, value) catch unreachable;
-            defer allocator.free(value_z);
-            _ = c.setenv(env_name.ptr, value_z.ptr, 1);
-        } else {
-            _ = c.unsetenv(env_name.ptr);
-        }
-    }
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
@@ -756,9 +737,8 @@ test "delegate fallback uses configured default provider through vtable path" {
     defer allocator.free(nullclaw_home);
     try std_compat.fs.makeDirAbsolute(nullclaw_home);
 
-    const home_z = try allocator.dupeZ(u8, nullclaw_home);
-    defer allocator.free(home_z);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, home_z.ptr, 1));
+    var home_env = try test_env.EnvOverride.init(allocator, "NULLCLAW_HOME", nullclaw_home);
+    defer home_env.restore();
 
     const config_path = try std_compat.fs.path.join(allocator, &.{ nullclaw_home, "config.json" });
     defer allocator.free(config_path);

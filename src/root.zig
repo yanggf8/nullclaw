@@ -5,6 +5,12 @@
 //!   hardware, health, heartbeat, memory, observability,
 //!   onboard, providers, security, skills, tools
 
+// Test-only process-environment override helper (src/test_env.zig). Declared
+// first so its tests run before any other test mutates the environment; it
+// reads std.testing.environ, so referencing it outside a test build is a
+// compile error.
+pub const test_env = @import("test_env.zig");
+
 // Shared utilities
 pub const json_util = @import("json_util.zig");
 pub const admin_output = @import("admin_output.zig");

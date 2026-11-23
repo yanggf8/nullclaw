@@ -193,30 +193,9 @@ test "bubblewrap sandbox availability requires executable in PATH" {
         return;
     }
 
-    const platform = @import("../platform.zig");
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
+    const test_env = @import("../test_env.zig");
 
-    const key_z = try std.testing.allocator.dupeZ(u8, "PATH");
-    defer std.testing.allocator.free(key_z);
-
-    const old_path = platform.getEnvOrNull(std.testing.allocator, "PATH");
-    defer if (old_path) |path| std.testing.allocator.free(path);
-
-    const old_path_z = if (old_path) |path| try std.testing.allocator.dupeZ(u8, path) else null;
-    defer if (old_path_z) |path| std.testing.allocator.free(path);
-
-    defer {
-        if (old_path_z) |path| {
-            _ = c.setenv(key_z.ptr, path.ptr, 1);
-        } else {
-            _ = c.unsetenv(key_z.ptr);
-        }
-    }
-
-    const empty_z = try std.testing.allocator.dupeZ(u8, "");
-    defer std.testing.allocator.free(empty_z);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, empty_z.ptr, 1));
+    var path_env = try test_env.EnvOverride.init(std.testing.allocator, "PATH", "");
+    defer path_env.restore();
     try std.testing.expect(!sb.isAvailable());
 }

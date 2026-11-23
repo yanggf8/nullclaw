@@ -196,10 +196,6 @@ pub const PushoverTool = struct {
     }
 };
 
-const env_c = @cImport({
-    @cInclude("stdlib.h");
-});
-
 const PushoverEnvGuard = struct {
     allocator: std.mem.Allocator,
     token: ?[]const u8,
@@ -231,22 +227,8 @@ const PushoverEnvGuard = struct {
 };
 
 fn setProcessEnv(allocator: std.mem.Allocator, name: []const u8, value: ?[]const u8) !void {
-    const name_z = try allocator.dupeZ(u8, name);
-    defer allocator.free(name_z);
-
-    const rc: c_int = if (value) |env_value| blk: {
-        const value_z = try allocator.dupeZ(u8, env_value);
-        defer allocator.free(value_z);
-        break :blk if (comptime builtin.os.tag == .windows)
-            env_c._putenv_s(name_z.ptr, value_z.ptr)
-        else
-            env_c.setenv(name_z.ptr, value_z.ptr, 1);
-    } else if (comptime builtin.os.tag == .windows)
-        env_c._putenv_s(name_z.ptr, "")
-    else
-        env_c.unsetenv(name_z.ptr);
-
-    if (rc != 0) return error.EnvMutationFailed;
+    // Test-only; PushoverEnvGuard saves and restores the previous values.
+    return @import("../test_env.zig").set(allocator, name, value);
 }
 
 fn restorePushoverEnvOrPanic(guard: *const PushoverEnvGuard) void {

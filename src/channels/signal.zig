@@ -2525,11 +2525,97 @@ test "process envelope attachment with text not skipped" {
     try std.testing.expectEqualStrings("Check this out", m.content);
 }
 
+/// One-shot local signal-cli JSON-RPC stand-in for tests: accepts a single
+/// connection, records whether it carried a getAttachment call, and answers
+/// with a JSON-RPC error so the caller falls back to "[Attachment]".
+/// Previously the test below POSTed to a fixed 127.0.0.1:8686 with no curl
+/// timeout, so a host where that port silently drops SYNs hung the suite.
+const TestSignalRpcStub = struct {
+    server: std_compat.net.Server,
+    stop: std.atomic.Value(bool) = .init(false),
+    saw_get_attachment: std.atomic.Value(bool) = .init(false),
+
+    const response_body = "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-1,\"message\":\"no such attachment\"},\"id\":\"2\"}";
+    const response = std.fmt.comptimePrint(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {d}\r\n\r\n",
+        .{response_body.len},
+    ) ++ response_body;
+
+    fn port(self: *const TestSignalRpcStub) u16 {
+        return self.server.listen_address.in.getPort();
+    }
+
+    fn requestComplete(req: []const u8) bool {
+        const header_end = std.mem.indexOf(u8, req, "\r\n\r\n") orelse return false;
+        const headers = req[0..header_end];
+        var content_length: usize = 0;
+        var lines = std.mem.splitSequence(u8, headers, "\r\n");
+        while (lines.next()) |line| {
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            if (!std.ascii.eqlIgnoreCase(line[0..colon], "content-length")) continue;
+            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            content_length = std.fmt.parseInt(usize, value, 10) catch return false;
+        }
+        return req.len >= header_end + 4 + content_length;
+    }
+
+    fn serveOne(self: *TestSignalRpcStub) void {
+        const deadline_ns: u64 = 30 * std.time.ns_per_s;
+        const step_ns: u64 = 10 * std.time.ns_per_ms;
+        var waited_ns: u64 = 0;
+        var conn = while (true) {
+            break self.server.accept() catch |err| switch (err) {
+                error.WouldBlock => {
+                    if (self.stop.load(.acquire) or waited_ns >= deadline_ns) return;
+                    std_compat.thread.sleep(step_ns);
+                    waited_ns += step_ns;
+                    continue;
+                },
+                else => return,
+            };
+        };
+        defer conn.stream.close();
+
+        var buf: [8192]u8 = undefined;
+        var len: usize = 0;
+        while (len < buf.len and !requestComplete(buf[0..len])) {
+            const n = conn.stream.read(buf[len..]) catch return;
+            if (n == 0) break;
+            len += n;
+        }
+        if (std.mem.indexOf(u8, buf[0..len], "\"method\":\"getAttachment\"") != null) {
+            self.saw_get_attachment.store(true, .release);
+        }
+        conn.stream.writeAll(response) catch {};
+    }
+};
+
 test "process envelope attachment only not skipped when ignore disabled" {
+    // The stub uses the same POSIX-only listener pattern as compat/net.zig tests.
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    // curlPost passes no --noproxy: an inherited http_proxy would route this
+    // loopback request away from the stub. build.zig (IsolatedTestHome) sets
+    // no_proxy=* on the test run, which is where it has to go — an
+    // EnvOverride here would not reach curl (see src/test_env.zig).
+
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var stub = TestSignalRpcStub{ .server = try addr.listen(.{ .force_nonblocking = true }) };
+    defer stub.server.deinit();
+    const stub_thread = try std.Thread.spawn(.{}, TestSignalRpcStub.serveOne, .{&stub});
+    var joined = false;
+    defer if (!joined) {
+        stub.stop.store(true, .release);
+        stub_thread.join();
+    };
+
+    var url_buf: [64]u8 = undefined;
+    const base_url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{stub.port()});
+
     const users = [_][]const u8{"*"};
     var ch = SignalChannel.init(
         std.testing.allocator,
-        "http://127.0.0.1:8686",
+        base_url,
         "+1234567890",
         &users,
         &.{},
@@ -2549,10 +2635,14 @@ test "process envelope attachment only not skipped when ignore disabled" {
         null,
         &.{"dummy_id"}, // has attachments
     );
+    joined = true;
+    stub_thread.join();
     try std.testing.expect(msg != null);
     const m = msg.?;
     defer m.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("[Attachment]", m.content);
+    // Not skipped: the attachment was actually fetched over JSON-RPC.
+    try std.testing.expect(stub.saw_get_attachment.load(.acquire));
 }
 
 test "process envelope source name sets first name" {

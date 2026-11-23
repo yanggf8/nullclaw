@@ -7724,16 +7724,9 @@ test "hasStartupProviderCredentials accepts local compatible provider without ap
 
 test "hasStartupProviderCredentials accepts gemini oauth env token" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
 
-    const env_name = try std.testing.allocator.dupeZ(u8, "GEMINI_OAUTH_TOKEN");
-    defer std.testing.allocator.free(env_name);
-    const env_value = try std.testing.allocator.dupeZ(u8, "ya29.test-oauth-token");
-    defer std.testing.allocator.free(env_value);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, env_value.ptr, 1));
-    defer _ = c.unsetenv(env_name.ptr);
+    var token_env = try yc.test_env.EnvOverride.init(std.testing.allocator, "GEMINI_OAUTH_TOKEN", "ya29.test-oauth-token");
+    defer token_env.restore();
 
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",

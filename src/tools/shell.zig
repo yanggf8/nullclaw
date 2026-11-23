@@ -1007,9 +1007,7 @@ test "validatePathEnvValue allows empty value" {
 
 test "shell path_env_vars passes validated vars to child" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
+    const test_env = @import("../test_env.zig");
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -1020,12 +1018,8 @@ test "shell path_env_vars passes validated vars to child" {
     const libs_path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_path, "mylibs" });
     defer std.testing.allocator.free(libs_path);
 
-    const key_z = try std.testing.allocator.dupeZ(u8, "TEST_LIB_PATH");
-    defer std.testing.allocator.free(key_z);
-    const value_z = try std.testing.allocator.dupeZ(u8, libs_path);
-    defer std.testing.allocator.free(value_z);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, value_z.ptr, 1));
-    defer _ = c.unsetenv(key_z.ptr);
+    var lib_path_env = try test_env.EnvOverride.init(std.testing.allocator, "TEST_LIB_PATH", libs_path);
+    defer lib_path_env.restore();
 
     var st = ShellTool{
         .workspace_dir = tmp_path,
@@ -1043,9 +1037,7 @@ test "shell path_env_vars passes validated vars to child" {
 
 test "shell sandboxed path_env_vars ignore allowed_paths outside workspace" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
+    const test_env = @import("../test_env.zig");
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -1063,12 +1055,8 @@ test "shell sandboxed path_env_vars ignore allowed_paths outside workspace" {
     defer std.testing.allocator.free(libs_path);
     try std_compat.fs.cwd().makePath(libs_path);
 
-    const key_z = try std.testing.allocator.dupeZ(u8, "TEST_LIB_PATH");
-    defer std.testing.allocator.free(key_z);
-    const value_z = try std.testing.allocator.dupeZ(u8, libs_path);
-    defer std.testing.allocator.free(value_z);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, value_z.ptr, 1));
-    defer _ = c.unsetenv(key_z.ptr);
+    var lib_path_env = try test_env.EnvOverride.init(std.testing.allocator, "TEST_LIB_PATH", libs_path);
+    defer lib_path_env.restore();
 
     var prefix = PrefixSandbox{};
     var st = ShellTool{

@@ -6985,6 +6985,11 @@ test "handleWhatsAppWebhookRoute rejects malformed JSON before sender extraction
     };
 
     handleWhatsAppWebhookRoute(&ctx);
+    if (!build_options.enable_channel_whatsapp) {
+        try std.testing.expectEqualStrings("404 Not Found", ctx.response_status);
+        try std.testing.expectEqualStrings("{\"error\":\"whatsapp channel disabled in this build\"}", ctx.response_body);
+        return;
+    }
     try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
     try std.testing.expectEqualStrings("{\"error\":\"invalid json payload\"}", ctx.response_body);
 }
@@ -7707,11 +7712,6 @@ pub fn run(
         }
     }
 
-    // Start the sequential job run queue worker thread.
-    state.startRunQueue() catch |err| {
-        std.log.scoped(.gateway).warn("failed to start run queue worker: {s}", .{@errorName(err)});
-    };
-
     // Register this GatewayState as the active state so the scheduler thread
     // can set its scheduler pointer via setSharedScheduler/clearSharedScheduler.
     g_state_mutex.lock();
@@ -7954,6 +7954,18 @@ pub fn run(
         .force_nonblocking = daemon_mode,
     });
     defer server.deinit();
+
+    // Start the sequential job run queue worker only once the port is ours.
+    // Its startup resets in_progress rows and then executes queued jobs from
+    // the cron DB, so a gateway that fails to bind (e.g. AddressInUse because
+    // another gateway is already serving that DB) must never start it.
+    state.startRunQueue() catch |err| {
+        std.log.scoped(.gateway).warn("failed to start run queue worker: {s}", .{@errorName(err)});
+    };
+    // Join the worker before the defers registered above free what it reads
+    // (cron_db_path, cron_db_backend, the audit logger behind the security
+    // policy). state.deinit() runs last and would join too late. Idempotent.
+    defer state.stopRunQueue();
 
     var stdout_buf: [4096]u8 = undefined;
     var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
@@ -13514,6 +13526,40 @@ test "run returns AddressInUse when port is already bound" {
     // Avoid calling run() for this conflict case on Windows: if the OS accepts
     // the second bind, run() owns the gateway accept loop and the test hangs.
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    const test_env = @import("test_env.zig");
+
+    // Hermetic: with config_ptr == null, run() loads the config and resolves
+    // the cron DB from NULLCLAW_HOME / HOME. Point both at a temp dir so this
+    // test can never open (and let a worker drain) the real ~/.nullclaw/cron.db.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const nullclaw_home = try std_compat.fs.path.join(std.testing.allocator, &.{ base, ".nullclaw" });
+    defer std.testing.allocator.free(nullclaw_home);
+    try std_compat.fs.makeDirAbsolute(nullclaw_home);
+    var home_env = try test_env.EnvOverride.init(std.testing.allocator, "HOME", base);
+    defer home_env.restore();
+    var nullclaw_home_env = try test_env.EnvOverride.init(std.testing.allocator, "NULLCLAW_HOME", nullclaw_home);
+    defer nullclaw_home_env.restore();
+
+    // A queue row another gateway (the one holding the port) is executing.
+    // The run-queue worker resets in_progress rows when it starts, so the row
+    // still being in_progress afterwards proves a failed bind never started
+    // the worker. Regression: run() used to start the worker before probing
+    // the port and then free cron_db_path/backend before joining it.
+    const db_path_str = try std_compat.fs.path.join(std.testing.allocator, &.{ nullclaw_home, "cron.db" });
+    defer std.testing.allocator.free(db_path_str);
+    const db_path = try std.testing.allocator.dupeZ(u8, db_path_str);
+    defer std.testing.allocator.free(db_path);
+    if (build_options.enable_sqlite) {
+        const db = try cron_mod.openCronDbAtPath(db_path);
+        defer cron_mod.closeCronDb(db);
+        try cron_mod.ensureRunQueueTable(db);
+        try cron_mod.dbEnqueueJob(db, "job-held-by-other-gateway", 1);
+        const claimed = (try cron_mod.dbDequeueNextJob(db, std.testing.allocator)).?;
+        std.testing.allocator.free(claimed.job_id);
+    }
 
     // Find an available port by binding to port 0
     const test_addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
@@ -13526,6 +13572,15 @@ test "run returns AddressInUse when port is already bound" {
     // Try to start gateway on the same port - should fail with AddressInUse
     const result = run(std.testing.allocator, "127.0.0.1", bound_port, null, null, null);
     try std.testing.expectError(error.AddressInUse, result);
+
+    if (build_options.enable_sqlite) {
+        const db = try cron_mod.openCronDbAtPath(db_path);
+        defer cron_mod.closeCronDb(db);
+        // Still in_progress => not dequeueable as pending.
+        const requeued = try cron_mod.dbDequeueNextJob(db, std.testing.allocator);
+        defer if (requeued) |r| std.testing.allocator.free(r.job_id);
+        try std.testing.expect(requeued == null);
+    }
 }
 
 test "handleCronRun rejects non-POST" {

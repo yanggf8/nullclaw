@@ -222,9 +222,7 @@ test "auto detect skips version-only linux sandbox shims" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 
     const platform = @import("../platform.zig");
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
+    const test_env = @import("../test_env.zig");
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -249,14 +247,8 @@ test "auto detect skips version-only linux sandbox shims" {
     const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
 
-    const key_z = try std.testing.allocator.dupeZ(u8, "PATH");
-    defer std.testing.allocator.free(key_z);
-
     const old_path = platform.getEnvOrNull(std.testing.allocator, "PATH");
     defer if (old_path) |path| std.testing.allocator.free(path);
-
-    const old_path_z = if (old_path) |path| try std.testing.allocator.dupeZ(u8, path) else null;
-    defer if (old_path_z) |path| std.testing.allocator.free(path);
 
     const effective_path = if (old_path) |path|
         try std.fmt.allocPrint(
@@ -268,18 +260,8 @@ test "auto detect skips version-only linux sandbox shims" {
         try std.testing.allocator.dupe(u8, tmp_path);
     defer std.testing.allocator.free(effective_path);
 
-    const tmp_path_z = try std.testing.allocator.dupeZ(u8, effective_path);
-    defer std.testing.allocator.free(tmp_path_z);
-
-    defer {
-        if (old_path_z) |path| {
-            _ = c.setenv(key_z.ptr, path.ptr, 1);
-        } else {
-            _ = c.unsetenv(key_z.ptr);
-        }
-    }
-
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, tmp_path_z.ptr, 1));
+    var path_env = try test_env.EnvOverride.init(std.testing.allocator, "PATH", effective_path);
+    defer path_env.restore();
 
     // Regression for #791: do not treat shims that only answer `--version`
     // as runnable Linux sandbox backends in auto-detect.

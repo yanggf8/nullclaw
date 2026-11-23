@@ -618,7 +618,8 @@ pub fn build(b: *std.Build) void {
     if (!is_wasi) {
         const compat_tests = b.addTest(.{ .root_module = compat_module });
         compat_tests.root_module.link_libc = true;
-        test_step.dependOn(&b.addRunArtifact(compat_tests).step);
+        const compat_tests_run = b.addRunArtifact(compat_tests);
+        test_step.dependOn(&compat_tests_run.step);
 
         const lib_tests = b.addTest(.{ .root_module = lib_mod.? });
         if (sqlite3) |lib| {
@@ -629,9 +630,13 @@ pub fn build(b: *std.Build) void {
         }
 
         const exe_tests = b.addTest(.{ .root_module = exe.root_module });
-        test_step.dependOn(&b.addRunArtifact(lib_tests).step);
-        test_step.dependOn(&b.addRunArtifact(exe_tests).step);
-
+        const lib_tests_run = b.addRunArtifact(lib_tests);
+        const exe_tests_run = b.addRunArtifact(exe_tests);
+        // No test may ever reach the developer's real ~/.nullclaw (cron.db,
+        // config, secrets), whatever the invoking shell exports.
+        _ = IsolatedTestHome.create(b, &.{ compat_tests_run, lib_tests_run, exe_tests_run });
+        test_step.dependOn(&lib_tests_run.step);
+        test_step.dependOn(&exe_tests_run.step);
     }
 }
 
@@ -642,3 +647,62 @@ test "parse channels option accepts weixin alias" {
     try std.testing.expect(parsed.enable_channel_wechat);
     try std.testing.expect(!parsed.enable_channel_wecom);
 }
+
+/// Points HOME and NULLCLAW_HOME of test Run steps at a fresh directory made
+/// for this invocation (`.zig-cache/tmp/test-home-<random>`, with an empty
+/// `.nullclaw` inside), so tests cannot read or write the real home even when
+/// a test forgets to isolate itself. Also sets no_proxy=* so no test traffic
+/// goes through the developer's HTTP proxy. The directory is created when the test
+/// step runs, not at configure time, and is left in place for inspection.
+const IsolatedTestHome = struct {
+    step: std.Build.Step,
+    runs: []const *std.Build.Step.Run,
+
+    fn create(b: *std.Build, runs: []const *std.Build.Step.Run) *IsolatedTestHome {
+        const self = b.allocator.create(IsolatedTestHome) catch @panic("OOM");
+        self.* = .{
+            .step = std.Build.Step.init(.{
+                .id = .custom,
+                .name = "isolate test HOME",
+                .owner = b,
+                .makeFn = make,
+            }),
+            .runs = b.allocator.dupe(*std.Build.Step.Run, runs) catch @panic("OOM"),
+        };
+        for (runs) |run| {
+            // Clone the env map now so make() only edits this run's own copy.
+            _ = run.getEnvMap();
+            run.step.dependOn(&self.step);
+        }
+        return self;
+    }
+
+    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+        _ = options;
+        const self: *IsolatedTestHome = @fieldParentPtr("step", step);
+        const b = step.owner;
+        const io = b.graph.io;
+
+        var rand_int: u64 = undefined;
+        io.random(@ptrCast(&rand_int));
+        const sub_path = b.fmt("tmp/test-home-{x:0>16}", .{rand_int});
+        b.cache_root.handle.createDirPath(io, b.fmt("{s}/.nullclaw", .{sub_path})) catch |err|
+            return step.fail("unable to create isolated test HOME '{f}{s}': {t}", .{ b.cache_root, sub_path, err });
+        const home = b.cache_root.handle.realPathFileAlloc(io, sub_path, b.allocator) catch |err|
+            return step.fail("unable to resolve isolated test HOME '{f}{s}': {t}", .{ b.cache_root, sub_path, err });
+        const nullclaw_home = b.pathJoin(&.{ home, ".nullclaw" });
+
+        for (self.runs) |run| {
+            run.setEnvironmentVariable("HOME", home);
+            run.setEnvironmentVariable("NULLCLAW_HOME", nullclaw_home);
+            // Windows resolves the home directory from USERPROFILE.
+            run.setEnvironmentVariable("USERPROFILE", home);
+            // Tests are offline and talk only to loopback stubs; an inherited
+            // http_proxy / all_proxy would route that traffic away (and a
+            // stalling proxy hangs the suite). Spawned children get the
+            // startup environ, so this has to be set here, not in a test.
+            run.setEnvironmentVariable("no_proxy", "*");
+            run.setEnvironmentVariable("NO_PROXY", "*");
+        }
+    }
+};
