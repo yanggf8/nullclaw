@@ -727,7 +727,7 @@ fn dbAtomicDequeue(db: *c.sqlite3, allocator: std.mem.Allocator) !?types.Dequeue
 
     // Find oldest pending row.
     const sel_sql =
-        "SELECT id, job_id FROM cron_run_queue WHERE status='pending' " ++
+        "SELECT id, job_id, manual FROM cron_run_queue WHERE status='pending' " ++
         "ORDER BY enqueued_at ASC LIMIT 1";
     var sel: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(db, sel_sql, -1, &sel, null) != c.SQLITE_OK) {
@@ -755,6 +755,7 @@ fn dbAtomicDequeue(db: *c.sqlite3, allocator: std.mem.Allocator) !?types.Dequeue
     const job_id_len: usize = @intCast(c.sqlite3_column_bytes(sel, 1));
     const job_id = try allocator.dupe(u8, job_id_raw[0..job_id_len]);
     errdefer allocator.free(job_id);
+    const manual = c.sqlite3_column_int(sel, 2) != 0;
 
     // Mark in_progress.
     const upd_sql = "UPDATE cron_run_queue SET status='in_progress', started_at=?1 WHERE id=?2";
@@ -781,6 +782,7 @@ fn dbAtomicDequeue(db: *c.sqlite3, allocator: std.mem.Allocator) !?types.Dequeue
     // Convert cron.CronJobSpec -> types.CronJobSpec.
     return types.DequeueResult{
         .queue_row_id = queue_row_id,
+        .manual = manual,
         .spec = types.CronJobSpec{
             .id = legacy_spec.id,
             .job_type = @enumFromInt(@intFromEnum(legacy_spec.job_type)),
@@ -1726,6 +1728,47 @@ test "dbManualEnqueueJob does not re-fire on subsequent tick" {
     // A tick at the same 'now' must NOT enqueue again (next_run_secs is now in future).
     const n = try be.backend().tick(now);
     try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "DbCronBackend dequeue carries the queue row's origin" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/origin.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    var be = try DbCronBackend.init(allocator, db_path_z);
+    defer be.deinit();
+    const iface = be.backend();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const job = try iface.add(a, .{ .expression = "30 8 * * 1-5", .command = "echo test" });
+    const now: i64 = 1774917000; // 2026-03-31 08:30 CST (a Tuesday)
+    _ = try iface.update(job.id, .{ .next_run_secs = now - 60 });
+
+    // The scheduler's tick queues a scheduled run; POST /cron/run's
+    // dbManualEnqueueJob queues an operator run one second later.
+    try std.testing.expectEqual(@as(usize, 1), try iface.tick(now));
+    try cron.dbManualEnqueueJob(db_path_z, job.id, now + 1);
+
+    const scheduled = (try iface.dequeue(a)).?;
+    try std.testing.expectEqualStrings(job.id, scheduled.spec.id);
+    try std.testing.expect(!scheduled.manual);
+
+    const manual = (try iface.dequeue(a)).?;
+    try std.testing.expectEqualStrings(job.id, manual.spec.id);
+    try std.testing.expect(manual.manual);
+    try std.testing.expect(manual.queue_row_id != scheduled.queue_row_id);
+
+    try std.testing.expect((try iface.dequeue(a)) == null);
 }
 
 test "dbManualEnqueueJob returns JobNotFound for unknown id" {

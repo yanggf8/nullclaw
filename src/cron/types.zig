@@ -268,6 +268,10 @@ pub const CronJobSpec = struct {
 pub const DequeueResult = struct {
     queue_row_id: i64,
     spec: CronJobSpec,
+    /// The run was queued by an operator (POST /cron/run), not by the
+    /// scheduler. Recorded as cron_runs.manual and kept out of the
+    /// scheduled-run streak.
+    manual: bool = false,
 };
 
 /// Raw output from a completed job run. Caller-owned, no JSON formatting.
