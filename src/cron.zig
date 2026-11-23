@@ -1607,6 +1607,15 @@ pub fn putSkillBudgetEnv(
 }
 
 pub fn monotonicSeconds() f64 {
+    if (comptime builtin.os.tag == .windows) {
+        // No clock_gettime here: QueryPerformanceCounter is Windows' monotonic
+        // clock, the one Rust's Instant and Python's time.monotonic() read.
+        var count: std.os.windows.LARGE_INTEGER = undefined;
+        var freq: std.os.windows.LARGE_INTEGER = undefined;
+        if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&count).toBool()) return 0;
+        if (!std.os.windows.ntdll.RtlQueryPerformanceFrequency(&freq).toBool() or freq <= 0) return 0;
+        return @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(freq));
+    }
     var ts: std.posix.timespec = undefined;
     switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => {},

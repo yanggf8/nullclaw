@@ -314,6 +314,16 @@ fn runCurlRequestWithStatus(
     child.stderr_behavior = .Pipe;
 
     try child.spawn();
+    // Every error return below stops the child boundedly. The stderr drain's
+    // abort runs first (it ends the child without closing its pipes, then joins
+    // the drain); the cancel watcher is joined before either.
+    errdefer process_util.abortChild(&child);
+    // stderr drains on its own thread while stdout is read: reading them in
+    // turn deadlocks once curl fills the stderr pipe.
+    var stderr_drain: process_util.StderrDrain = .{ .limit = 16 * 1024 };
+    defer stderr_drain.deinit();
+    stderr_drain.start(&child);
+    errdefer stderr_drain.abort(&child);
 
     const cancel_flag = http_util.currentThreadInterruptFlag();
     const AtomicBool = std.atomic.Value(bool);
@@ -327,7 +337,7 @@ fn runCurlRequestWithStatus(
             while (!ctx.done.load(.acquire)) {
                 if (ctx.cancel_flag.load(.acquire)) {
                     if (comptime @import("builtin").os.tag == .windows) {
-                        _ = ctx.child.kill() catch {};
+                        process_util.terminateWindowsChildKeepHandles(ctx.child);
                     } else {
                         // The calling thread owns the child and is blocked on
                         // its pipes: signal only, it reaps.
@@ -356,30 +366,23 @@ fn runCurlRequestWithStatus(
             stdin_file.writeAll(b) catch {
                 stdin_file.close();
                 child.stdin = null;
-                process_util.abortChild(&child);
                 return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
             };
             stdin_file.close();
             child.stdin = null;
         } else {
-            process_util.abortChild(&child);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
         }
     }
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, max_response_size + 64) catch {
-        process_util.abortChild(&child);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
     };
     errdefer allocator.free(stdout);
 
-    const stderr_raw = if (child.stderr) |stderr_file|
-        stderr_file.readToEndAlloc(allocator, 16 * 1024) catch null
-    else
-        null;
-    defer if (stderr_raw) |buf| allocator.free(buf);
-
-    var stderr_copy: ?[]u8 = try duplicateTrimmedStderr(allocator, stderr_raw);
+    // Before wait(), which closes the pipe the drain may still be reading.
+    stderr_drain.finish();
+    var stderr_copy: ?[]u8 = try duplicateTrimmedStderr(allocator, stderr_drain.bytes.items);
     defer if (stderr_copy) |buf| allocator.free(buf);
 
     const term = child.wait() catch return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;

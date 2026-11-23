@@ -455,6 +455,10 @@ fn codexStreamRequest(
     child.stderr_behavior = .Ignore;
 
     try child.spawn();
+    // Any error return below (an allocation failure while accumulating the
+    // stream, say) leaves curl running with nobody reading its stdout: stop it
+    // boundedly. A no-op once the child has been reaped.
+    errdefer process_util.abortChild(&child);
 
     if (child.stdin) |stdin_file| {
         stdin_file.writeAll(body) catch {
@@ -582,6 +586,8 @@ fn codexStreamRequest(
     }
 
     const term = child.wait() catch {
+        // The recovery below returns normally, past the errdefer.
+        process_util.abortChild(&child);
         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_terminal)) {
             callback(ctx, root.StreamChunk.finalChunk());
             return finalizeCodexStreamResult(allocator, accumulated.items);

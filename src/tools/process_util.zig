@@ -27,6 +27,14 @@ extern "kernel32" fn WideCharToMultiByte(
 
 extern "kernel32" fn GetACP() callconv(.winapi) std.os.windows.UINT;
 extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) std.os.windows.UINT;
+extern "kernel32" fn PeekNamedPipe(
+    pipe: std.os.windows.HANDLE,
+    buffer: ?*anyopaque,
+    buffer_size: std.os.windows.DWORD,
+    bytes_read: ?*std.os.windows.DWORD,
+    total_bytes_avail: ?*std.os.windows.DWORD,
+    bytes_left_this_message: ?*std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.BOOL;
 extern "kernel32" fn GetProcessId(process_handle: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.DWORD;
 extern "kernel32" fn WaitForSingleObject(
     handle: std.os.windows.HANDLE,
@@ -100,10 +108,25 @@ fn terminateWindowsProcessTreeByPid(pid: std.os.windows.DWORD) void {
     } else |_| {}
 }
 
+/// Windows: terminate a child WITHOUT touching our handles to it. Child.kill()
+/// also closes the child's stdio pipes and process handle, which is wrong from
+/// a watcher (the owner may be reading those pipes) and before a drain thread
+/// is joined. The owner's own wait() reaps and closes them.
+///
+/// Like Child.kill() it does nothing once `term` is recorded, i.e. once the
+/// owner's wait() has reaped the child and closed the handle.
+pub fn terminateWindowsChildKeepHandles(child: *const std_compat.process.Child) void {
+    if (comptime builtin.os.tag != .windows) return;
+    if (child.term != null) return;
+    _ = std.os.windows.ntdll.NtTerminateProcess(child.id, @enumFromInt(1));
+}
+
 fn terminateChild(child: *std_compat.process.Child) void {
     if (comptime builtin.os.tag == .windows) {
+        if (child.term != null) return;
         terminateWindowsProcessTreeByPid(GetProcessId(child.id));
-        _ = child.kill() catch {};
+        // Called from the watcher: the owner reads the pipes and reaps.
+        terminateWindowsChildKeepHandles(child);
     } else if (comptime builtin.os.tag == .wasi) {
         return;
     } else {
@@ -308,6 +331,236 @@ pub fn processExitedOrZombie(pid: std.posix.pid_t) bool {
     }
     return !processExists(pid);
 }
+
+/// Linux: does any process that is not a zombie still belong to group `pgid`?
+/// kill(-pgid, 0) cannot say: an exited but unreaped leader keeps its group
+/// reporting alive. Conservative — true whenever /proc cannot be read.
+/// Elsewhere this is `processGroupAlive`.
+fn processGroupHasLiveMember(pgid: std.posix.pid_t) bool {
+    if (!processGroupAlive(pgid)) return false;
+    if (comptime builtin.os.tag != .linux) return true;
+    var dir = std_compat.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return true;
+    defer dir.close();
+    var iter = dir.iterate();
+    while (iter.next() catch return true) |entry| {
+        _ = std.fmt.parseInt(std.posix.pid_t, entry.name, 10) catch continue;
+        var path_buf: [48]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{s}/stat", .{entry.name}) catch continue;
+        const file = std_compat.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue, // exited since the listing
+            else => return true, // e.g. out of fds: cannot tell
+        };
+        defer file.close();
+        var stat_buf: [512]u8 = undefined;
+        // Includes a process reaped since the open: the next poll looks again.
+        const n = file.read(&stat_buf) catch return true;
+        // "pid (comm) S ppid pgrp ..." — comm may hold ')' and spaces.
+        const stat = stat_buf[0..n];
+        const rparen = std.mem.lastIndexOfScalar(u8, stat, ')') orelse continue;
+        var fields = std.mem.tokenizeScalar(u8, stat[rparen + 1 ..], ' ');
+        const state = fields.next() orelse continue;
+        _ = fields.next() orelse continue; // ppid
+        const pgrp = std.fmt.parseInt(std.posix.pid_t, fields.next() orelse continue, 10) catch continue;
+        if (pgrp == pgid and state[0] != 'Z' and state[0] != 'X') return true;
+    }
+    return false;
+}
+
+/// Drains a child's stderr on its own thread while the caller reads stdout.
+///
+/// Reading the two pipes one after the other deadlocks as soon as the child
+/// fills the second (64 KiB on Linux) before closing the first: it blocks
+/// writing stderr, the caller blocks reading stdout. Keeps the first `limit`
+/// bytes; past that, or after an allocation failure, it records the fact and
+/// keeps reading into a scratch buffer, so the child never blocks on stderr.
+///
+/// The captured bytes live in `page_allocator`, never the caller's allocator:
+/// the drain thread grows its buffer while the caller's thread grows stdout,
+/// and callers pass arenas, which are not thread-safe. `takeOwned` copies the
+/// capture into the caller's allocator on the caller's thread.
+///
+/// Known limitation: off Linux, `finish` cannot tell an exited (unreaped)
+/// child from a live one, so a descendant that escaped the child's group (any
+/// surviving descendant, on Windows) and keeps stderr open without writing
+/// holds `finish` until it exits — as the sequential read before it did. A
+/// timeout or cancel still bounds `process_util.run` there (`requestStop`).
+///
+/// Lifecycle: `start` after spawn; `finish` once stdout is at EOF and BEFORE
+/// `wait()`, which closes the pipe the thread may still be reading; on an
+/// error return, `abort` before anything closes the child's pipes.
+pub const StderrDrain = struct {
+    limit: usize,
+    /// Let `finish` return as soon as the capture has overflowed (or hit an
+    /// allocation or read failure) instead of draining to EOF — for a caller
+    /// that fails on overflow and then aborts the child anyway. Without it the
+    /// drain keeps reading so the child never blocks on a full stderr pipe.
+    stop_on_overflow: bool = false,
+    file: ?std_compat.fs.File = null,
+    child_id: std_compat.process.Child.Id = undefined,
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+    overflowed: bool = false,
+    out_of_memory: bool = false,
+    read_error: ?(std.Io.File.ReadStreamingError || std.posix.PollError) = null,
+    stop: AtomicBool = AtomicBool.init(false),
+    finishing: AtomicBool = AtomicBool.init(false),
+    thread: ?std.Thread = null,
+
+    const buffer_allocator = std.heap.page_allocator;
+    /// How long a blocked drain takes to notice `abort`'s stop request.
+    const stop_poll_ms: i32 = 50;
+
+    pub fn start(self: *StderrDrain, child: *const std_compat.process.Child) void {
+        self.file = child.stderr;
+        self.child_id = child.id;
+        if (self.file == null) return;
+        // No thread: `finish` reads inline after stdout, the old behaviour.
+        self.thread = std.Thread.spawn(.{}, drainMain, .{self}) catch null;
+    }
+
+    fn drainMain(self: *StderrDrain) void {
+        const file = self.file orelse return;
+        var chunk: [4096]u8 = undefined;
+        var last_liveness_check_ns: i128 = 0;
+        while (true) {
+            if (self.stop.load(.acquire)) return;
+            if (self.stop_on_overflow and self.finishing.load(.acquire) and self.failed()) return;
+            // Wait for data in slices of `stop_poll_ms` rather than blocking in
+            // read(), so `abort` can stop a drain whose pipe a descendant that
+            // escaped the child's group (or its tree, on Windows) keeps open.
+            if (comptime builtin.os.tag == .windows) {
+                var avail: std.os.windows.DWORD = 0;
+                if (PeekNamedPipe(file.handle, null, 0, null, &avail, null).toBool() and avail == 0) {
+                    std_compat.thread.sleep(@as(u64, stop_poll_ms) * std.time.ns_per_ms);
+                    continue;
+                }
+                // Data waiting, or the peek failed because every writer is
+                // gone: the read below returns the bytes, EOF or the error.
+            } else if (comptime builtin.os.tag != .wasi) {
+                var fds = [_]std.posix.pollfd{.{
+                    .fd = file.handle,
+                    .events = std.posix.POLL.IN | std.posix.POLL.HUP,
+                    .revents = 0,
+                }};
+                const ready = std.posix.poll(&fds, stop_poll_ms) catch |err| {
+                    self.read_error = err;
+                    return;
+                };
+                // Once the caller is past stdout EOF, check every
+                // `stop_poll_ms` — idle or not, since an escaped writer can
+                // keep the pipe readable — whether the child has exited and
+                // no live process is left in its group. Then whoever still
+                // holds stderr escaped the group: take what is buffered and
+                // stop rather than wait for an EOF that may never come. For a
+                // child that leads no group, its own exit is what counts.
+                // (Linux only: elsewhere the unreaped child reads as alive,
+                // and the drain waits for EOF as before.)
+                if (self.finishing.load(.acquire)) {
+                    const now_ns = std_compat.time.monotonicNanoTimestamp();
+                    if (ready == 0 or now_ns - last_liveness_check_ns >= @as(i128, stop_poll_ms) * std.time.ns_per_ms) {
+                        last_liveness_check_ns = now_ns;
+                        if (processExitedOrZombie(self.child_id) and !processGroupHasLiveMember(self.child_id)) {
+                            self.keepBuffered(file, &chunk);
+                            return;
+                        }
+                    }
+                }
+                if (ready == 0) continue;
+            }
+            const n = file.read(&chunk) catch |err| {
+                self.read_error = err;
+                return;
+            };
+            if (n == 0) return;
+            self.keep(chunk[0..n]);
+        }
+    }
+
+    fn keep(self: *StderrDrain, data: []const u8) void {
+        if (self.failed()) return;
+        const take = @min(data.len, self.limit - self.bytes.items.len);
+        self.bytes.appendSlice(buffer_allocator, data[0..take]) catch {
+            self.out_of_memory = true;
+            return;
+        };
+        if (take < data.len) self.overflowed = true;
+    }
+
+    /// Read whatever is already in the pipe, without waiting for more. POSIX.
+    /// Bounded by the largest pipe Linux allows by default (pipe-max-size):
+    /// a writer that escaped the group and keeps the pipe non-empty would
+    /// otherwise hold this loop forever.
+    fn keepBuffered(self: *StderrDrain, file: std_compat.fs.File, chunk: []u8) void {
+        var budget: usize = 1024 * 1024;
+        while (budget > 0) {
+            if (self.stop.load(.acquire)) return;
+            var fds = [_]std.posix.pollfd{.{
+                .fd = file.handle,
+                .events = std.posix.POLL.IN | std.posix.POLL.HUP,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&fds, 0) catch return;
+            if (ready == 0) return;
+            const n = file.read(chunk) catch return;
+            if (n == 0) return;
+            self.keep(chunk[0..n]);
+            budget -|= n;
+        }
+    }
+
+    /// Ask the drain to return at its next poll, keeping what it has. For a
+    /// caller that no longer wants the rest of stderr, e.g. after a timeout.
+    pub fn requestStop(self: *StderrDrain) void {
+        self.stop.store(true, .release);
+    }
+
+    fn failed(self: *const StderrDrain) bool {
+        return self.overflowed or self.out_of_memory or self.read_error != null;
+    }
+
+    /// Block until the child's stderr reaches EOF — or, with
+    /// `stop_on_overflow`, until the capture has failed, or (Linux) until it
+    /// idles after the child and its group are gone. Idempotent.
+    pub fn finish(self: *StderrDrain) void {
+        self.finishing.store(true, .release);
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        } else if (self.file != null) {
+            self.drainMain();
+        }
+        self.file = null;
+    }
+
+    /// Error-path stop: end the child (with its group on POSIX) WITHOUT
+    /// closing its pipes, then stop and join the drain.
+    /// Bounded even when a descendant that escaped still holds stderr open:
+    /// the drain sees the stop request within `stop_poll_ms`. A later `abortChild`
+    /// reaps if needed and closes what is left. No-op once `finish` has run.
+    pub fn abort(self: *StderrDrain, child: *std_compat.process.Child) void {
+        const thread = self.thread orelse return;
+        if (comptime builtin.os.tag == .windows) {
+            // Unlike Child.kill(), this leaves our handles open for the drain,
+            // whose PeekNamedPipe loop sees the stop request below even if a
+            // descendant still holds the pipe.
+            terminateWindowsChildKeepHandles(child);
+        } else if (comptime builtin.os.tag != .wasi) {
+            terminateProcessGroupAndReap(child, timeout_term_grace_ns);
+        }
+        self.stop.store(true, .release);
+        thread.join();
+        self.thread = null;
+        self.file = null;
+    }
+
+    /// The capture, copied into `allocator`. Call after `finish`.
+    pub fn takeOwned(self: *const StderrDrain, allocator: std.mem.Allocator) ![]u8 {
+        return allocator.dupe(u8, self.bytes.items);
+    }
+
+    pub fn deinit(self: *StderrDrain) void {
+        self.bytes.deinit(buffer_allocator);
+    }
+};
 
 /// Close and forget the child's stdio pipes — what `Child.kill()`/`wait()`
 /// do on the way out, for a child whose `term` was recorded without them.
@@ -595,6 +848,12 @@ pub fn run(
     // instead of leaking it blocked on a full pipe. Declared before the
     // watcher's defer, so the watcher is joined first.
     errdefer abortChild(&child);
+    // stderr drains on its own thread while stdout is read below. Its abort
+    // runs after the watcher is joined and before abortChild closes the pipes.
+    var stderr_drain: StderrDrain = .{ .limit = opts.max_output_bytes, .stop_on_overflow = true };
+    defer stderr_drain.deinit();
+    stderr_drain.start(&child);
+    errdefer stderr_drain.abort(&child);
 
     const effective_cancel_flag = opts.cancel_flag orelse thread_interrupt_flag;
     const effective_timeout_ns = if (opts.timeout_ns) |limit|
@@ -631,14 +890,20 @@ pub fn run(
     errdefer allocator.free(stdout);
     stdout = try normalizeCapturedOutputOwned(allocator, stdout);
 
-    var stderr = if (child.stderr) |stderr_file| blk: {
-        break :blk stderr_file.readToEndAlloc(allocator, opts.max_output_bytes) catch |err| {
+    // After a timeout or cancel the rest of stderr is not wanted, and a
+    // process that escaped the kill may keep the pipe open: stop at once.
+    if (wasInterrupted(effective_cancel_flag) or timed_out.load(.acquire)) stderr_drain.requestStop();
+    stderr_drain.finish();
+    var stderr = blk: {
+        if (stderr_drain.overflowed or stderr_drain.out_of_memory or stderr_drain.read_error != null) {
             if (wasInterrupted(effective_cancel_flag) or timed_out.load(.acquire)) {
                 break :blk try allocator.dupe(u8, "");
             }
-            return err;
-        };
-    } else try allocator.dupe(u8, "");
+            if (stderr_drain.read_error) |err| return err;
+            return if (stderr_drain.out_of_memory) error.OutOfMemory else error.StreamTooLong;
+        }
+        break :blk try stderr_drain.takeOwned(allocator);
+    };
     errdefer allocator.free(stderr);
     stderr = try normalizeCapturedOutputOwned(allocator, stderr);
 
@@ -1047,6 +1312,255 @@ test "run aborts a TERM-ignoring child whose output overflows max_output_bytes" 
         std_compat.thread.sleep(20 * std.time.ns_per_ms);
     }
     try std.testing.expect(gone);
+}
+
+test "run reads a child that fills stderr before it closes stdout" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    // Regression: run() read stdout to EOF before touching stderr, so a child
+    // that wrote more than a pipe's worth of stderr first blocked on it while
+    // run() blocked on stdout — forever without a timeout. The timeout here
+    // only bounds the regression; the fixed run never reaches it.
+    const allocator = std.testing.allocator;
+    const start_ns = std_compat.time.nanoTimestamp();
+    const result = try run(allocator, &.{ "sh", "-c", "head -c 200000 /dev/zero | tr '\\0' e >&2; echo out" }, .{
+        .timeout_ns = 5 * std.time.ns_per_s,
+    });
+    defer result.deinit(allocator);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+    try std.testing.expect(!result.timed_out);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("out\n", result.stdout);
+    try std.testing.expectEqual(@as(usize, 200000), result.stderr.len);
+    try std.testing.expect(elapsed_ns < 4 * std.time.ns_per_s);
+}
+
+test "run fails a child whose stderr overflows max_output_bytes" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.StreamTooLong, run(allocator, &.{ "sh", "-c", "head -c 5000 /dev/zero >&2" }, .{
+        .max_output_bytes = 4096,
+    }));
+}
+
+test "run fails fast when stderr overflows and the child then holds stderr open" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    // Reading stderr to EOF after an overflow waited on a child that had
+    // closed stdout but kept stderr open; the old sequential read failed at
+    // once with StreamTooLong, and so must the drain.
+    const allocator = std.testing.allocator;
+    const start_ns = std_compat.time.nanoTimestamp();
+    try std.testing.expectError(error.StreamTooLong, run(allocator, &.{ "sh", "-c", "exec >&-; head -c 5000 /dev/zero >&2; exec sleep 30" }, .{
+        .max_output_bytes = 4096,
+    }));
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+    try std.testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+}
+
+test "run returns once the child is gone even if a descendant that left its group holds stderr" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    // stdout reaching EOF does not mean every stderr writer is gone: a
+    // setsid'd descendant keeps the pipe open, out of reach of the group kill
+    // and the timeout, and draining to EOF waited on it for good.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const pid_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "escapee" });
+    defer allocator.free(pid_path);
+    const command = try std.fmt.allocPrint(
+        allocator,
+        "setsid sh -c 'echo $$ > \"{s}\"; exec sleep 30' >/dev/null & echo out",
+        .{pid_path},
+    );
+    defer allocator.free(command);
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    const result = try run(allocator, &.{ "sh", "-c", command }, .{ .timeout_ns = 20 * std.time.ns_per_s });
+    defer result.deinit(allocator);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+
+    var escapee: ?std.posix.pid_t = null;
+    var i: usize = 0;
+    while (i < 100 and escapee == null) : (i += 1) {
+        if (std_compat.fs.cwd().readFileAlloc(allocator, pid_path, 64)) |bytes| {
+            defer allocator.free(bytes);
+            escapee = std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, bytes, " \t\r\n"), 10) catch null;
+        } else |_| {}
+        if (escapee == null) std_compat.thread.sleep(20 * std.time.ns_per_ms);
+    }
+    defer if (escapee) |pid| std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+
+    try std.testing.expect(escapee != null);
+    try std.testing.expect(!result.timed_out);
+    try std.testing.expectEqualStrings("out\n", result.stdout);
+    try std.testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+}
+
+test "run stops reading stderr after a timeout even if an escaped descendant keeps writing" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    // The timeout kills the child's group, but a setsid'd descendant that
+    // writes stderr every few ms never lets the drain go idle: without the
+    // stop request, run() read on until max_output_bytes filled.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const pid_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "escapee" });
+    defer allocator.free(pid_path);
+    const command = try std.fmt.allocPrint(
+        allocator,
+        "setsid sh -c 'echo $$ > \"{s}\"; while :; do echo x >&2; sleep 0.01; done' >/dev/null & exec sleep 30",
+        .{pid_path},
+    );
+    defer allocator.free(command);
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    const result = try run(allocator, &.{ "sh", "-c", command }, .{ .timeout_ns = 500 * std.time.ns_per_ms });
+    defer result.deinit(allocator);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+
+    var escapee: ?std.posix.pid_t = null;
+    var i: usize = 0;
+    while (i < 100 and escapee == null) : (i += 1) {
+        if (std_compat.fs.cwd().readFileAlloc(allocator, pid_path, 64)) |bytes| {
+            defer allocator.free(bytes);
+            escapee = std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, bytes, " \t\r\n"), 10) catch null;
+        } else |_| {}
+        if (escapee == null) std_compat.thread.sleep(20 * std.time.ns_per_ms);
+    }
+    defer if (escapee) |pid| std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+
+    try std.testing.expect(escapee != null);
+    try std.testing.expect(result.timed_out);
+    try std.testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+}
+
+test "run returns once the child is gone even if an escaped descendant keeps writing stderr" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    // A writer that escaped the group and writes every few ms keeps the pipe
+    // readable, so a liveness check made only when the pipe is idle never ran.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const pid_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "escapee" });
+    defer allocator.free(pid_path);
+    const command = try std.fmt.allocPrint(
+        allocator,
+        "setsid sh -c 'echo $$ > \"{s}\"; while :; do echo x >&2; sleep 0.01; done' >/dev/null & echo out",
+        .{pid_path},
+    );
+    defer allocator.free(command);
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    const result = try run(allocator, &.{ "sh", "-c", command }, .{ .timeout_ns = 20 * std.time.ns_per_s });
+    defer result.deinit(allocator);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+
+    var escapee: ?std.posix.pid_t = null;
+    var i: usize = 0;
+    while (i < 100 and escapee == null) : (i += 1) {
+        if (std_compat.fs.cwd().readFileAlloc(allocator, pid_path, 64)) |bytes| {
+            defer allocator.free(bytes);
+            escapee = std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, bytes, " \t\r\n"), 10) catch null;
+        } else |_| {}
+        if (escapee == null) std_compat.thread.sleep(20 * std.time.ns_per_ms);
+    }
+    defer if (escapee) |pid| std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+
+    try std.testing.expect(escapee != null);
+    try std.testing.expect(!result.timed_out);
+    try std.testing.expectEqualStrings("out\n", result.stdout);
+    try std.testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+}
+
+test "run keeps stderr of exactly max_output_bytes" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const result = try run(allocator, &.{ "sh", "-c", "head -c 4096 /dev/zero | tr '\\0' e >&2" }, .{
+        .max_output_bytes = 4096,
+    });
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 4096), result.stderr.len);
+}
+
+test "StderrDrain.abort ends a TERM-ignoring child holding stderr open and joins the drain" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var child = std_compat.process.Child.init(&.{ "sh", "-c", "trap '' TERM; echo ready; exec sleep 30" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.pgid = 0;
+    try child.spawn();
+    defer abortChild(&child);
+
+    var drain: StderrDrain = .{ .limit = 1024 };
+    defer drain.deinit();
+    drain.start(&child);
+    try std.testing.expect(drain.thread != null);
+
+    // The trap is installed once "ready" is out.
+    var ready: [6]u8 = undefined;
+    var got: usize = 0;
+    while (got < ready.len) {
+        const n = try child.stdout.?.read(ready[got..]);
+        if (n == 0) break;
+        got += n;
+    }
+    try std.testing.expectEqualStrings("ready\n", ready[0..got]);
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    drain.abort(&child);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+    try std.testing.expect(drain.thread == null);
+    try std.testing.expect(child.term != null);
+    // The pipes are left for abortChild to close.
+    try std.testing.expect(child.stderr != null);
+    try std.testing.expect(elapsed_ns < timeout_term_grace_ns + 2 * std.time.ns_per_s);
+}
+
+test "StderrDrain.abort returns when a descendant outside the child's group keeps stderr open" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    // The group kill cannot reach a setsid'd descendant, whose inherited
+    // stderr then never reaches EOF; joining a drain blocked in read() waited
+    // on it for good.
+    // The escapee prints its own pid after setsid (which may fork, so `$!`
+    // would name the wrong process).
+    const allocator = std.testing.allocator;
+    var child = std_compat.process.Child.init(&.{ "sh", "-c", "setsid sh -c 'echo $$; exec sleep 30' & exec sleep 30" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.pgid = 0;
+    try child.spawn();
+    defer abortChild(&child);
+
+    var drain: StderrDrain = .{ .limit = 1024 };
+    defer drain.deinit();
+    drain.start(&child);
+
+    var line: [32]u8 = undefined;
+    var got: usize = 0;
+    while (got < line.len) {
+        const n = try child.stdout.?.read(line[got..]);
+        if (n == 0) break;
+        got += n;
+        if (std.mem.indexOfScalar(u8, line[0..got], '\n') != null) break;
+    }
+    const escapee = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, line[0..got], " \t\r\n"), 10);
+    defer std.posix.kill(escapee, std.posix.SIG.KILL) catch {};
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    drain.abort(&child);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+    try std.testing.expect(drain.thread == null);
+    try std.testing.expect(child.term != null);
+    try std.testing.expect(!processExitedOrZombie(escapee));
+    try std.testing.expect(elapsed_ns < timeout_term_grace_ns + 2 * std.time.ns_per_s);
 }
 
 test "abortChild bounds a TERM-ignoring child and is a no-op once the child is reaped" {

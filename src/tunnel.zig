@@ -239,6 +239,29 @@ fn cleanupFailedStart(child: *?std_compat.process.Child, state: *TunnelState) vo
     state.* = .error_state;
 }
 
+/// How long `tailscale serve|funnel reset` may take before tsStop gives up on it.
+const TS_RESET_TIMEOUT_NS: u64 = 10 * std.time.ns_per_s;
+
+/// Undo the serve/funnel config before the tunnel process is stopped. Best
+/// effort, and bounded: a reset that cannot start is skipped rather than waited
+/// on, and one that hangs (tailscaled unreachable, say) is killed with its group
+/// after `timeout_ns`, so stopping a tunnel never blocks on it.
+fn runTailscaleReset(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ns: u64) void {
+    const result = process_util.run(allocator, argv, .{
+        .timeout_ns = timeout_ns,
+        .max_output_bytes = 64 * 1024,
+    }) catch |err| {
+        std.log.scoped(.tunnel).warn("tailscale reset did not run: {s}", .{@errorName(err)});
+        return;
+    };
+    defer result.deinit(allocator);
+    if (result.timed_out) {
+        std.log.scoped(.tunnel).warn("tailscale reset timed out after {d}s; stopping the tunnel anyway", .{timeout_ns / std.time.ns_per_s});
+    } else if (!result.success) {
+        std.log.scoped(.tunnel).warn("tailscale reset failed: exit={?d}", .{result.exit_code});
+    }
+}
+
 const TailscaleAuthError = error{
     InvalidAuthKey,
     AuthenticationFailed,
@@ -587,12 +610,7 @@ pub const TailscaleTunnel = struct {
         const self = resolve(ptr);
         // Reset tailscale serve/funnel before killing process
         const subcmd: []const u8 = if (self.funnel) "funnel" else "serve";
-        var reset_child = std_compat.process.Child.init(
-            &.{ "tailscale", subcmd, "reset" },
-            self.allocator,
-        );
-        reset_child.spawn() catch {};
-        _ = reset_child.wait() catch {};
+        runTailscaleReset(self.allocator, &.{ "tailscale", subcmd, "reset" }, TS_RESET_TIMEOUT_NS);
 
         if (self.child) |*child| {
             process_util.stopChild(child, process_util.shutdown_term_grace_ns);
@@ -1333,4 +1351,20 @@ test "CustomTunnel adapter stop" {
     const a = t.adapter();
     a.stop();
     try std.testing.expect(!a.isRunning());
+}
+
+test "runTailscaleReset kills a hung reset after its timeout instead of blocking the stop" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const started = std_compat.time.monotonicNanoTimestamp();
+    runTailscaleReset(std.testing.allocator, &.{ "sh", "-c", "trap '' TERM; sleep 30" }, 300 * std.time.ns_per_ms);
+    const elapsed_ns = std_compat.time.monotonicNanoTimestamp() - started;
+    try std.testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+}
+
+test "runTailscaleReset returns at once when the reset cannot be spawned" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const started = std_compat.time.monotonicNanoTimestamp();
+    runTailscaleReset(std.testing.allocator, &.{"/nonexistent/nullclaw-test-tailscale"}, 30 * std.time.ns_per_s);
+    const elapsed_ns = std_compat.time.monotonicNanoTimestamp() - started;
+    try std.testing.expect(elapsed_ns < 2 * std.time.ns_per_s);
 }

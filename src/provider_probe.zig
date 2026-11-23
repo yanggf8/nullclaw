@@ -95,7 +95,7 @@ fn runCommandProbe(allocator: std.mem.Allocator, argv: []const []const u8, timeo
             if (ctx.finished.load(.acquire)) return;
             ctx.timed_out.store(true, .release);
             if (comptime builtin.os.tag == .windows) {
-                _ = ctx.child.kill() catch {};
+                process_util.terminateWindowsChildKeepHandles(ctx.child);
             } else {
                 // The probing thread is blocked in child.wait(): reaping here
                 // too would race it for the same pid. Signal only — TERM,
