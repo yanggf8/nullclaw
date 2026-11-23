@@ -4346,10 +4346,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         maybeAlertJobStreak(state, arena, spec, .shell, cron_mod.execErrorRunResult(), run_trace_id, dr.manual);
                         continue;
                     };
-                    errdefer {
-                        _ = shell_child.kill() catch {};
-                        _ = shell_child.wait() catch {};
-                    }
+                    errdefer tools_mod.process_util.abortChild(&shell_child);
                     const shell_start_ns = std_compat.time.nanoTimestamp();
                     var shell_stdout: std.ArrayList(u8) = .empty;
                     defer shell_stdout.deinit(arena);
@@ -4623,10 +4620,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id, dr.manual);
                         continue;
                     };
-                    errdefer {
-                        _ = skill_child.kill() catch {};
-                        _ = skill_child.wait() catch {};
-                    }
+                    errdefer tools_mod.process_util.abortChild(&skill_child);
                     const skill_start_ns = std_compat.time.nanoTimestamp();
                     var skill_stdout: std.ArrayList(u8) = .empty;
                     defer skill_stdout.deinit(arena);
@@ -4908,10 +4902,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
                         continue;
                     };
-                    errdefer {
-                        _ = shell_child.kill() catch {};
-                        _ = shell_child.wait() catch {};
-                    }
+                    errdefer tools_mod.process_util.abortChild(&shell_child);
                     const shell_start_ns = std_compat.time.nanoTimestamp();
                     var shell_stdout: std.ArrayList(u8) = .empty;
                     defer shell_stdout.deinit(allocator);
@@ -5078,10 +5069,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         _ = cron_mod.dbUpsertAndVerify(sched, sched.getJob(id) orelse continue) catch {};
                         continue;
                     };
-                    errdefer {
-                        _ = skill_child.kill() catch {};
-                        _ = skill_child.wait() catch {};
-                    }
+                    errdefer tools_mod.process_util.abortChild(&skill_child);
                     const skill_start_ns = std_compat.time.nanoTimestamp();
                     var skill_stdout: std.ArrayList(u8) = .empty;
                     defer skill_stdout.deinit(allocator);

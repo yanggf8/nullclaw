@@ -1636,6 +1636,12 @@ pub fn collectChildOutputWithTimeout(
 ) !bool {
     const stdout_file = child.stdout.?;
     const stderr_file = child.stderr.?;
+    // Any error here (output over the cap, OOM, poll/read failure) leaves a
+    // live child whose pipes nobody will read again. Abort it boundedly —
+    // with its process group — rather than leave each caller to: several
+    // `catch` the error and go on to `wait()`, and the gateway worker's
+    // `errdefer` cannot fire at all (the worker returns void).
+    errdefer process_util.abortChild(child);
     var stdout_open = true;
     var stderr_open = true;
     var timed_out = false;
@@ -2206,10 +2212,7 @@ pub fn runAgentJob(
         break :spawn_loop;
     }
 
-    errdefer {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-    }
+    errdefer process_util.abortChild(&child);
 
     const start_ns = std_compat.time.nanoTimestamp();
 
@@ -8465,6 +8468,68 @@ test "collectChildOutputWithTimeout stays bounded for an interactive run, whose 
     // Documented trade-off: outside a group of its own, a descendant that
     // ignores TERM is not reached by the timeout (Ctrl-C still reaches it).
     try std.testing.expect(survived);
+}
+
+test "collectChildOutputWithTimeout aborts a TERM-ignoring child whose output overflows the cap, boundedly" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    // Regression: on a collector error (here StdoutStreamTooLong) the caller's
+    // `errdefer { kill(); wait(); }` SIGTERMed the `sh -c` wrapper alone and
+    // then waited without bound. The wrapper ignores TERM and waits for `head`,
+    // which is blocked writing into the still-open pipe, so the worker hung
+    // forever. Callers that `catch` the error and then `wait()` (cliRunJob,
+    // the retry paths) or `continue` (the gateway run-queue worker, whose
+    // errdefer never fires) hung or leaked the child the same way.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const pid_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "grandchild.pid" });
+    defer allocator.free(pid_path);
+    const command = try std.fmt.allocPrint(
+        allocator,
+        "trap '' TERM; sleep 30 & echo $! > \"{s}\"; head -c 2000000 /dev/zero; wait",
+        .{pid_path},
+    );
+    defer allocator.free(command);
+
+    var child = std_compat.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), command }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    process_util.applyProcessGroupPolicy(&child, false);
+    try child.spawn();
+    const pid = child.id;
+    // Never Child.kill() here: that is the unbounded wait under test.
+    defer if (child.term == null) {
+        std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
+        _ = child.wait() catch {};
+    };
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    const result = collectChildOutputWithTimeout(&child, allocator, &stdout, &stderr, 60, start_ns);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+
+    try std.testing.expectError(error.StdoutStreamTooLong, result);
+    // TERM grace + kill/reap + scheduling slack; the old path never returned.
+    try std.testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+    // The collector reaped the child and released the pipes, so the caller's
+    // wait() returns at once instead of blocking on the pid.
+    try std.testing.expectEqual(@as(?std_compat.process.Child.Term, .{ .signal = std.posix.SIG.KILL }), child.term);
+    try std.testing.expect(child.stdout == null and child.stderr == null);
+    try std.testing.expectEqual(std_compat.process.Child.Term{ .signal = std.posix.SIG.KILL }, try child.wait());
+    try std.testing.expect(process_util.processExitedOrZombie(pid));
+
+    const pid_bytes = try std_compat.fs.cwd().readFileAlloc(allocator, pid_path, 32);
+    defer allocator.free(pid_bytes);
+    const grandchild = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, pid_bytes, " \t\r\n"), 10);
+    // The TERM-ignoring descendant went with the group, not left orphaned.
+    try std.testing.expect(processGoneWithinForTest(grandchild));
 }
 
 test "retry helpers gate first retry and preserve prior failure class" {

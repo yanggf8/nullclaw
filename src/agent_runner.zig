@@ -46,6 +46,10 @@ fn collectChildOutputWithTimeout(
 ) !bool {
     const stdout_file = child.stdout.?;
     const stderr_file = child.stderr.?;
+    // On any error (output over the cap, OOM, poll/read failure) the child is
+    // still running and its pipes will not be read again: abort it boundedly,
+    // with its process group.
+    errdefer process_util.abortChild(child);
     var stdout_open = true;
     var stderr_open = true;
     var timed_out = false;
@@ -278,10 +282,7 @@ pub fn run(
         break :spawn_loop;
     }
 
-    errdefer {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-    }
+    errdefer process_util.abortChild(&child);
 
     const start_ns = std_compat.time.nanoTimestamp();
 
@@ -496,6 +497,71 @@ test "collectChildOutputWithTimeout does not wait for a descendant that left the
     // The post-kill drain is bounded: the escaped process's open pipe end
     // must not hold the collector the way the old `poll(-1)` did.
     try std.testing.expect(elapsed_ns < 1800 * std.time.ns_per_ms);
+}
+
+test "collectChildOutputWithTimeout aborts a TERM-ignoring child whose output overflows the cap, boundedly" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    // Regression: `run`'s `errdefer { kill(); wait(); }` SIGTERMed the `sh -c`
+    // wrapper alone and then waited without bound; the wrapper ignores TERM
+    // and waits for `head`, blocked writing into the still-open pipe, so a
+    // heartbeat agent run that overflowed its output cap hung the daemon.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const pid_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "grandchild.pid" });
+    defer allocator.free(pid_path);
+    const command = try std.fmt.allocPrint(
+        allocator,
+        "trap '' TERM; sleep 30 & echo $! > \"{s}\"; head -c 2000000 /dev/zero >&2; wait",
+        .{pid_path},
+    );
+    defer allocator.free(command);
+
+    var child = std_compat.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), command }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    process_util.applyProcessGroupPolicy(&child, false);
+    try child.spawn();
+    const pid = child.id;
+    // Never Child.kill() here: that is the unbounded wait under test.
+    defer if (child.term == null) {
+        std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
+        _ = child.wait() catch {};
+    };
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    const result = collectChildOutputWithTimeout(&child, allocator, &stdout, &stderr, 60, start_ns);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+
+    try std.testing.expectError(error.StderrStreamTooLong, result);
+    try std.testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(?std_compat.process.Child.Term, .{ .signal = std.posix.SIG.KILL }), child.term);
+    try std.testing.expect(child.stdout == null and child.stderr == null);
+    try std.testing.expectEqual(std_compat.process.Child.Term{ .signal = std.posix.SIG.KILL }, try child.wait());
+    try std.testing.expect(process_util.processExitedOrZombie(pid));
+
+    const pid_bytes = try std_compat.fs.cwd().readFileAlloc(allocator, pid_path, 32);
+    defer allocator.free(pid_bytes);
+    const grandchild = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, pid_bytes, " \t\r\n"), 10);
+    defer if (!process_util.processExitedOrZombie(grandchild)) std.posix.kill(grandchild, std.posix.SIG.KILL) catch {};
+    var gone = false;
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        if (process_util.processExitedOrZombie(grandchild)) {
+            gone = true;
+            break;
+        }
+        std_compat.thread.sleep(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(gone);
 }
 
 test "preferExecPath keeps regular executable path" {

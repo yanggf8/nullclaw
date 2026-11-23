@@ -320,6 +320,30 @@ pub fn closeChildStdio(child: *std_compat.process.Child) void {
     child.stderr = null;
 }
 
+/// Error-path cleanup for a spawned child: terminate it (with its process
+/// group on POSIX), reap it and release its stdio, never waiting unboundedly.
+///
+/// Use this instead of `errdefer { child.kill(); child.wait(); }`. On POSIX
+/// `Child.kill()` SIGTERMs the leader pid alone and then waits without bound,
+/// so a child that ignores TERM — or an `sh -c` wrapper waiting on a
+/// descendant blocked writing into a pipe nobody reads any more — wedges the
+/// caller forever.
+///
+/// Safe on a child that was already reaped or terminated (`child.term` set):
+/// it only releases any pipes still held. Afterwards `child.term` is set, so a
+/// later `wait()`/`kill()` returns at once.
+pub fn abortChild(child: *std_compat.process.Child) void {
+    if (comptime builtin.os.tag == .wasi) return;
+    if (comptime builtin.os.tag == .windows) {
+        // Unchanged Windows behaviour: TerminateProcess, then the reap.
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return;
+    }
+    if (child.term == null) terminateProcessGroupAndReap(child, timeout_term_grace_ns);
+    closeChildStdio(child);
+}
+
 fn processWatcherMain(ctx: *ProcessWatcherCtx) void {
     const poll_ns = 20 * std.time.ns_per_ms;
     var waited_ns: u64 = 0;
@@ -508,6 +532,11 @@ pub fn run(
     if (opts.env_map) |env| child.env_map = env;
 
     try child.spawn();
+    // On an error return (output over max_output_bytes, OOM, wait failure)
+    // nobody reads the pipes again: abort the child and its group boundedly
+    // instead of leaking it blocked on a full pipe. Declared before the
+    // watcher's defer, so the watcher is joined first.
+    errdefer abortChild(&child);
 
     const effective_cancel_flag = opts.cancel_flag orelse thread_interrupt_flag;
     const effective_timeout_ns = if (opts.timeout_ns) |limit|
@@ -913,6 +942,92 @@ test "terminateProcessGroupAndReap on an already-exited child returns at once an
     try std.testing.expect(elapsed_ns < timeout_term_grace_ns);
     // A second call is a no-op.
     terminateProcessGroupAndReap(&child, timeout_term_grace_ns);
+}
+
+test "run aborts a TERM-ignoring child whose output overflows max_output_bytes" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    // Regression: run() returned error.StreamTooLong with the child still
+    // alive (its `head` blocked writing into a pipe nobody read) and its
+    // process group leaked.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const pids_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "pids" });
+    defer allocator.free(pids_path);
+    const command = try std.fmt.allocPrint(
+        allocator,
+        "trap '' TERM; sleep 30 & echo \"$$ $!\" > \"{s}\"; head -c 2000000 /dev/zero; wait",
+        .{pids_path},
+    );
+    defer allocator.free(command);
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    const result = run(allocator, &.{ "sh", "-c", command }, .{ .max_output_bytes = 4096 });
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+    try std.testing.expectError(error.StreamTooLong, result);
+    try std.testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+
+    const pid_bytes = try std_compat.fs.cwd().readFileAlloc(allocator, pids_path, 64);
+    defer allocator.free(pid_bytes);
+    var it = std.mem.tokenizeAny(u8, pid_bytes, " \t\r\n");
+    const shell_pid = try std.fmt.parseInt(std.posix.pid_t, it.next().?, 10);
+    const grandchild = try std.fmt.parseInt(std.posix.pid_t, it.next().?, 10);
+    defer {
+        if (!processExitedOrZombie(shell_pid)) std.posix.kill(-shell_pid, std.posix.SIG.KILL) catch {};
+        if (!processExitedOrZombie(grandchild)) std.posix.kill(grandchild, std.posix.SIG.KILL) catch {};
+    }
+    try std.testing.expect(processExitedOrZombie(shell_pid));
+    var gone = false;
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        if (processExitedOrZombie(grandchild)) {
+            gone = true;
+            break;
+        }
+        std_compat.thread.sleep(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(gone);
+}
+
+test "abortChild bounds a TERM-ignoring child and is a no-op once the child is reaped" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var child = std_compat.process.Child.init(&.{ "sh", "-c", "trap '' TERM; sleep 30 & wait" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    applyProcessGroupPolicy(&child, false);
+    try child.spawn();
+    const pid = child.id;
+    defer if (child.term == null) {
+        std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
+        _ = child.wait() catch {};
+    };
+    std_compat.thread.sleep(100 * std.time.ns_per_ms); // let the trap take effect
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    abortChild(&child);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+
+    try std.testing.expectEqual(@as(?std_compat.process.Child.Term, .{ .signal = std.posix.SIG.KILL }), child.term);
+    try std.testing.expect(child.stdout == null and child.stderr == null);
+    try std.testing.expect(elapsed_ns < timeout_term_grace_ns + 500 * std.time.ns_per_ms);
+    try std.testing.expect(!processExists(pid)); // reaped, not a zombie
+    // Repeating it (errdefer after a collector that already aborted) is a no-op.
+    abortChild(&child);
+    try std.testing.expectEqual(std_compat.process.Child.Term{ .signal = std.posix.SIG.KILL }, try child.wait());
+
+    // A child reaped by an ordinary wait() keeps its real term untouched.
+    var done = std_compat.process.Child.init(&.{ "sh", "-c", "exit 3" }, allocator);
+    done.stdin_behavior = .Ignore;
+    done.stdout_behavior = .Pipe;
+    done.stderr_behavior = .Pipe;
+    try done.spawn();
+    try std.testing.expectEqual(std_compat.process.Child.Term{ .exited = 3 }, try done.wait());
+    abortChild(&done);
+    try std.testing.expectEqual(@as(?std_compat.process.Child.Term, .{ .exited = 3 }), done.term);
 }
 
 test "isolateProcessGroup isolates only when stdin is not a terminal" {
