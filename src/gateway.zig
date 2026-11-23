@@ -608,6 +608,9 @@ pub const GatewayState = struct {
     run_queue_cond: std_compat.sync.Condition = .{},
     run_queue_stop: bool = false,
     run_queue_thread: ?std.Thread = null,
+    // DB-direct worker: sleep between queue polls, and so also the latest a
+    // stop request is observed. Set before startRunQueue; tests shorten it.
+    run_queue_poll_ns: u64 = 1 * std.time.ns_per_s,
 
     pub fn init(allocator: std.mem.Allocator) GatewayState {
         return initWithVerifyToken(allocator, "");
@@ -4166,9 +4169,10 @@ fn runQueueWorker(state: *GatewayState) void {
             // When legacy: wait until there are items in the ArrayList.
             if (state.cron_db_path != null) {
                 if (!state.run_queue_stop) {
-                    // 1-second timeout so we don't miss rows if signal was lost.
+                    // Poll (run_queue_poll_ns, 1 s by default) so we don't
+                    // miss rows if signal was lost.
                     state.run_queue_mutex.unlock();
-                    std_compat.thread.sleep(1 * std.time.ns_per_s);
+                    std_compat.thread.sleep(state.run_queue_poll_ns);
                     state.run_queue_mutex.lock();
                 }
             } else {
@@ -10112,11 +10116,18 @@ test "streakCommandPreview keeps one bounded line and never splits UTF-8" {
     try std.testing.expect(cut.truncated);
 }
 
+/// Worker poll interval for the run-queue end-to-end tests. Production polls
+/// once a second; at that rate each test spent ~1 s per dequeue plus up to
+/// 1 s waiting for the worker to notice stop.
+const test_run_queue_poll_ns: u64 = 5 * std.time.ns_per_ms;
+/// How often those tests re-check for the worker's result.
+const test_worker_wait_step_ms: u64 = 5;
+
 /// Wait (bounded) for the run-queue worker to publish `want` messages.
 fn waitForOutbound(test_bus: *bus_mod.Bus, want: usize) void {
     var waited_ms: u64 = 0;
-    while (test_bus.outboundDepth() < want and waited_ms < 15_000) : (waited_ms += 50) {
-        std_compat.thread.sleep(50 * std.time.ns_per_ms);
+    while (test_bus.outboundDepth() < want and waited_ms < 15_000) : (waited_ms += test_worker_wait_step_ms) {
+        std_compat.thread.sleep(test_worker_wait_step_ms * std.time.ns_per_ms);
     }
 }
 
@@ -10185,6 +10196,7 @@ fn runShellJobThroughWorker(policy: security.SecurityPolicy) !struct { job_id: [
     pol.tracker = tracker;
     state.security_policy = pol;
 
+    state.run_queue_poll_ns = test_run_queue_poll_ns;
     try state.startRunQueue();
     waitForOutbound(&test_bus, 1);
     state.stopRunQueue();
@@ -10290,6 +10302,7 @@ const OriginWorkerFixture = struct {
         self.state = GatewayState.init(allocator);
         self.state.cron_db_path = self.db_path_z;
         if (use_backend) self.state.cron_db_backend = try cron_db_mod.DbCronBackend.init(allocator, self.db_path_z);
+        self.state.run_queue_poll_ns = test_run_queue_poll_ns;
         self.state.cron_alert_streak = 3;
         self.state.event_bus = &self.test_bus;
         self.state.alert_delivery = .{
@@ -10355,10 +10368,10 @@ const OriginWorkerFixture = struct {
     fn drain(self: *OriginWorkerFixture, want: usize) !void {
         try self.state.startRunQueue();
         var waited_ms: u64 = 0;
-        while (waited_ms < 15_000) : (waited_ms += 50) {
+        while (waited_ms < 15_000) : (waited_ms += test_worker_wait_step_ms) {
             const rows = try self.runRows();
             if (rows.len >= want) break;
-            std_compat.thread.sleep(50 * std.time.ns_per_ms);
+            std_compat.thread.sleep(test_worker_wait_step_ms * std.time.ns_per_ms);
         }
         self.state.stopRunQueue();
     }

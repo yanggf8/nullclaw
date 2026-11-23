@@ -33,6 +33,9 @@ pub const PairingGuard = struct {
     failed_count: u32,
     lockout_time: ?i128, // nanoTimestamp when locked out
     allocator: std.mem.Allocator,
+    /// Wall clock (Unix seconds) for runtime-token expiry. Tests substitute
+    /// a fixed clock so a TTL can elapse without sleeping.
+    clock: *const fn () i64 = std_compat.time.timestamp,
 
     pub fn init(allocator: std.mem.Allocator, require_pairing: bool, existing_tokens: []const []const u8) !PairingGuard {
         return initWithTokenTtl(allocator, require_pairing, existing_tokens, DEFAULT_TOKEN_TTL_SECS);
@@ -186,7 +189,7 @@ pub const PairingGuard = struct {
                 const token = generateToken();
                 const hashed = try hashTokenAlloc(self.allocator, &token);
                 try self.paired_tokens.put(hashed, .{
-                    .expires_at = tokenExpiresAt(self.token_ttl_secs),
+                    .expires_at = tokenExpiresAt(self.token_ttl_secs, self.clock()),
                     .configured = false,
                 });
 
@@ -227,7 +230,7 @@ pub const PairingGuard = struct {
     fn matchesToken(self: *const PairingGuard, token: []const u8, configured_only: bool) bool {
         var hash_buf: [64]u8 = undefined;
         const hashed = hashToken(token, &hash_buf);
-        const now = std_compat.time.timestamp();
+        const now = self.clock();
         // Scan every stored hash so authentication does not leak match position.
         var found: u8 = 0;
         var it = self.paired_tokens.iterator();
@@ -266,7 +269,7 @@ pub const PairingGuard = struct {
     /// Get count of paired tokens
     pub fn tokenCount(self: *const PairingGuard) usize {
         var count: usize = 0;
-        const now = std_compat.time.timestamp();
+        const now = self.clock();
         var it = self.paired_tokens.valueIterator();
         while (it.next()) |record| {
             if (isTokenRecordActive(record.*, now)) count += 1;
@@ -332,9 +335,9 @@ fn hashTokenAlloc(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
     return result;
 }
 
-fn tokenExpiresAt(token_ttl_secs: u32) ?i64 {
+fn tokenExpiresAt(token_ttl_secs: u32, now: i64) ?i64 {
     if (token_ttl_secs == 0) return null;
-    return std_compat.time.timestamp() + @as(i64, @intCast(token_ttl_secs));
+    return now + @as(i64, @intCast(token_ttl_secs));
 }
 
 fn isTokenRecordActive(record: PairingGuard.TokenRecord, now: i64) bool {
@@ -490,9 +493,19 @@ test "revoke token returns false for missing token" {
     try std.testing.expect(guard.isAuthenticated("zc_valid"));
 }
 
+/// Fixed wall clock for the TTL tests: they move it forward instead of
+/// sleeping through the TTL. Tests run one at a time, so a global is safe.
+var test_clock_now: i64 = 0;
+
+fn testClock() i64 {
+    return test_clock_now;
+}
+
 test "runtime-issued token expires when ttl elapses" {
     var guard = try PairingGuard.initWithTokenTtl(std.testing.allocator, true, &.{}, 1);
     defer guard.deinit();
+    test_clock_now = 1_700_000_000;
+    guard.clock = testClock;
 
     const code = guard.pairingCode() orelse return error.TestUnexpectedResult;
     const result = guard.attemptPair(code);
@@ -503,7 +516,8 @@ test "runtime-issued token expires when ttl elapses" {
     defer std.testing.allocator.free(token);
 
     try std.testing.expect(guard.isAuthenticated(token));
-    std_compat.thread.sleep(1100 * std.time.ns_per_ms);
+    // Issued at T with a 1 s TTL: valid through T, expired from T + 1.
+    test_clock_now += 1;
     try std.testing.expect(!guard.isAuthenticated(token));
     try std.testing.expect(!guard.hasPairedTokens());
 
@@ -521,8 +535,12 @@ test "preconfigured tokens remain active without runtime ttl metadata" {
     const tokens = [_][]const u8{"zc_valid"};
     var guard = try PairingGuard.initWithTokenTtl(std.testing.allocator, true, &tokens, 1);
     defer guard.deinit();
+    test_clock_now = 1_700_000_000;
+    guard.clock = testClock;
 
-    std_compat.thread.sleep(1100 * std.time.ns_per_ms);
+    try std.testing.expect(guard.isAuthenticated("zc_valid"));
+    // Well past the 1 s runtime TTL.
+    test_clock_now += 3600;
     try std.testing.expect(guard.isAuthenticated("zc_valid"));
     try std.testing.expect(guard.hasPairedTokens());
 }

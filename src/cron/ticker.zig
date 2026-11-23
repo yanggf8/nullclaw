@@ -8,11 +8,40 @@
 //! - Caller owns the MemoryCronBackend / DbCronBackend struct.
 //! - Caller owns the shutdown atomic — CronTicker holds a pointer, does not free.
 //! - CronTicker is a value type — copy freely, do not free.
+const builtin = @import("builtin");
 const std = @import("std");
 const std_compat = @import("compat");
 
 const cron = @import("root.zig");
 const memory_backend = @import("memory.zig");
+
+/// How finely CronTicker.run slices its wait between ticks, i.e. how soon it
+/// sees a shutdown request: 1 s. Tests that start a ticker may lower this
+/// (and restore it) so shutdown is seen within milliseconds; outside test
+/// builds `sleepSliceNs` ignores it at comptime.
+pub var test_sleep_slice_ns: u64 = std.time.ns_per_s;
+
+fn sleepSliceNs() u64 {
+    return if (builtin.is_test) test_sleep_slice_ns else std.time.ns_per_s;
+}
+
+/// Test builds only: how many times CronTicker.run has entered its sleep
+/// loop. The loop is reached only after tick() returns, so a non-zero value
+/// proves the first tick ran and the thread is now waiting in slices — the
+/// precondition for any "shutdown is observed promptly" assertion. Not
+/// touched outside test builds.
+pub var test_sleep_loops_entered: std.atomic.Value(u32) = .init(0);
+
+/// Test helper: wait (bounded) until CronTicker.run has entered its sleep
+/// loop at least once since `test_sleep_loops_entered` was reset to 0.
+pub fn testWaitForSleepLoop(timeout_ms: u64) bool {
+    var waited_ms: u64 = 0;
+    while (waited_ms < timeout_ms) : (waited_ms += 1) {
+        if (test_sleep_loops_entered.load(.acquire) > 0) return true;
+        std_compat.thread.sleep(1 * std.time.ns_per_ms);
+    }
+    return test_sleep_loops_entered.load(.acquire) > 0;
+}
 
 const WATCHDOG_CHECK_INTERVAL_NS: u64 = 60 * std.time.ns_per_s;
 const WATCHDOG_WARN_AFTER_NS: i128 = 10 * std.time.ns_per_min;
@@ -203,10 +232,12 @@ pub const CronTicker = struct {
             }
 
             // Sleep in 1-second slices so shutdown is observed promptly.
+            const slice_ns = sleepSliceNs();
+            if (builtin.is_test) _ = test_sleep_loops_entered.fetchAdd(1, .release);
             var slept_ns: u64 = 0;
             while (slept_ns < self.poll_interval_ns and !self.shutdown.load(.acquire)) {
-                std_compat.thread.sleep(std.time.ns_per_s);
-                slept_ns += std.time.ns_per_s;
+                std_compat.thread.sleep(slice_ns);
+                slept_ns += slice_ns;
             }
         }
     }
@@ -247,13 +278,27 @@ test "CronTicker.run exits promptly when shutdown flag is set" {
     var shutdown = std.atomic.Value(bool).init(false);
     var ticker = CronTicker.init(mem.backend(), 1, &shutdown);
 
+    // Observe shutdown per 10 ms slice instead of per second.
+    const saved_slice_ns = test_sleep_slice_ns;
+    test_sleep_slice_ns = 10 * std.time.ns_per_ms;
+    defer test_sleep_slice_ns = saved_slice_ns;
+
+    test_sleep_loops_entered.store(0, .release);
     const thread = try std.Thread.spawn(.{}, CronTicker.run, .{&ticker});
 
-    // Let the ticker enter its sleep loop, then request shutdown.
-    std_compat.thread.sleep(10 * std.time.ns_per_ms);
+    // Request shutdown only once the ticker is waiting in its sleep loop;
+    // a flag set before that would end run() at the outer loop check and
+    // make the timing assertion below pass without exercising the slices.
+    const in_sleep_loop = testWaitForSleepLoop(10_000);
+    const stop_requested_ns = std_compat.time.nanoTimestamp();
     shutdown.store(true, .release);
     thread.join();
-    // Reaching here without hanging is the assertion.
+    // Reaching here without hanging is the assertion, and "promptly" means
+    // well inside one poll interval (1 s): a loop that slept the whole
+    // interval instead of checking the flag per slice would take ~1 s.
+    const join_ns = std_compat.time.nanoTimestamp() - stop_requested_ns;
+    try std.testing.expect(in_sleep_loop);
+    try std.testing.expect(join_ns < 500 * std.time.ns_per_ms);
 }
 
 test "scheduler watchdog decision warns once then aborts stalled ticker" {

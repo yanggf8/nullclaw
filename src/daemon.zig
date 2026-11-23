@@ -3619,28 +3619,39 @@ test "schedulerThread DB-direct path wires CronTicker and exits on shutdown" {
     var event_bus = bus_mod.Bus.init();
 
     // Verify the DB file does not exist yet — so its presence after join
-    // proves the DB-direct branch (CronTicker.run → tick → dbTickAndEnqueue →
-    // openCronDbAtPath) actually executed.
+    // proves the DB-direct branch (DbCronBackend, opened by CronTicker.run)
+    // actually executed.
     std_compat.fs.accessAbsolute(db_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {}, // expected — file doesn't exist yet
         else => return err,
     };
 
+    // The ticker observes shutdown once per sleep slice (1 s in production);
+    // a 10 ms slice lets join() return as soon as shutdown is requested.
+    const cron_ticker_mod = @import("cron/ticker.zig");
+    const saved_slice_ns = cron_ticker_mod.test_sleep_slice_ns;
+    cron_ticker_mod.test_sleep_slice_ns = 10 * std.time.ns_per_ms;
+    defer cron_ticker_mod.test_sleep_slice_ns = saved_slice_ns;
+
+    cron_ticker_mod.test_sleep_loops_entered.store(0, .release);
     const thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.DAEMON_SERVICE_STACK_SIZE }, schedulerThread, .{
         std.testing.allocator, &config, &state, &event_bus,
     });
 
-    // Wait long enough for schedulerThread to complete its init sequence
-    // (RuntimeObserver, CronScheduler, loadJobs, setSharedScheduler) and
-    // enter the DB-direct branch where CronTicker.run calls tick() once
-    // before sleeping. 2 seconds is generous for test-machine variance.
-    std_compat.thread.sleep(2 * std.time.ns_per_s);
+    // Wait (bounded) until schedulerThread has finished its init sequence
+    // (RuntimeObserver, CronScheduler, loadJobs, setSharedScheduler), entered
+    // the DB-direct branch and completed CronTicker.run's first tick(): the
+    // ticker reaches its sleep loop only after that tick returns. Waiting for
+    // db_path alone is not enough — run()'s startup inventory query opens the
+    // DB before the first tick. A fixed sleep here used to cost 2 s.
+    const ticked = cron_ticker_mod.testWaitForSleepLoop(10_000);
     shutdown_requested.store(true, .release);
     thread.join();
+    try std.testing.expect(ticked);
 
-    // The DB file's existence proves the DB-direct branch ran: only
-    // CronTicker.run → tick → dbTickAndEnqueue → openCronDbAtPath creates it.
-    // The legacy in-memory path and the skip-loop path never touch this file.
+    // The DB file's existence proves the DB-direct branch ran (the legacy
+    // in-memory path and the skip-loop path never touch this file); `ticked`
+    // above proves its first tick completed.
     std_compat.fs.accessAbsolute(db_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return error.DbDirectBranchDidNotExecute,
         else => return err,

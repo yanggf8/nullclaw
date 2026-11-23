@@ -1888,6 +1888,174 @@ test "Observer interface dispatches correctly" {
 
 // ── OtelObserver tests ──────────────────────────────────────────
 
+/// Loopback OTLP/HTTP collector for tests that flush. It accepts connections
+/// on 127.0.0.1 until deinit, records each request's target and body, and
+/// answers 200. Pointing an OtelObserver at it makes a flush a real export
+/// (curl → loopback) that the test can inspect, instead of a curl to the
+/// default https://localhost:4318 whose duration depends on how the host
+/// treats a closed port (instant refusal, or a silent drop that waits out
+/// the full --max-time). curl is a spawned child, so it sees the test run's
+/// startup environment: no_proxy=* is set on the Run step (build.zig).
+///
+/// POSIX only, like TestSignalRpcStub: compat/net's nonblocking accept is a
+/// no-op on Windows/WASI, where the serving thread could never be stopped.
+/// There the collector is disabled, `endpoint()` is null (the observer keeps
+/// its default endpoint, as before) and only the export checks are skipped.
+const TestOtlpCollector = struct {
+    enabled: bool,
+    server: std_compat.net.Server,
+    thread: std.Thread,
+    stop: std.atomic.Value(bool),
+    mutex: std_compat.sync.Mutex,
+    requests: std.ArrayListUnmanaged(Request),
+    url_buf: [64]u8,
+    url_len: usize,
+
+    const Request = struct { target: []u8, body: []u8 };
+
+    const response_body = "{}";
+    const response = std.fmt.comptimePrint(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {d}\r\n\r\n",
+        .{response_body.len},
+    ) ++ response_body;
+
+    const supported = builtin.os.tag != .windows and builtin.os.tag != .wasi;
+
+    /// Initialise in place: the serving thread holds `self`.
+    fn start(self: *TestOtlpCollector) !void {
+        if (comptime !supported) {
+            self.enabled = false;
+            return;
+        }
+        const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+        self.* = .{
+            .enabled = true,
+            .server = try addr.listen(.{ .force_nonblocking = true }),
+            .thread = undefined,
+            .stop = .init(false),
+            .mutex = .{},
+            .requests = .empty,
+            .url_buf = undefined,
+            .url_len = 0,
+        };
+        errdefer self.server.deinit();
+        const url = try std.fmt.bufPrint(&self.url_buf, "http://127.0.0.1:{d}", .{self.server.listen_address.in.getPort()});
+        self.url_len = url.len;
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    fn deinit(self: *TestOtlpCollector) void {
+        if (!self.enabled) return;
+        self.stop.store(true, .release);
+        self.thread.join();
+        self.server.deinit();
+        for (self.requests.items) |req| {
+            std.testing.allocator.free(req.target);
+            std.testing.allocator.free(req.body);
+        }
+        self.requests.deinit(std.testing.allocator);
+    }
+
+    fn endpoint(self: *const TestOtlpCollector) ?[]const u8 {
+        if (!self.enabled) return null;
+        return self.url_buf[0..self.url_len];
+    }
+
+    fn expectNoExport(self: *TestOtlpCollector) !void {
+        if (!self.enabled) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try std.testing.expectEqual(@as(usize, 0), self.requests.items.len);
+    }
+
+    /// The single export received so far (null when disabled); fails the test
+    /// unless exactly one arrived, at the OTLP traces path. A flush is
+    /// synchronous (curl waits for the response, and the request is recorded
+    /// before the response is written), so it is visible once flush returns.
+    fn expectOneExport(self: *TestOtlpCollector) !?Request {
+        if (!self.enabled) return null;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try std.testing.expectEqual(@as(usize, 1), self.requests.items.len);
+        const req = self.requests.items[0];
+        try std.testing.expectEqualStrings("/v1/traces", req.target);
+        return req;
+    }
+
+    fn serve(self: *TestOtlpCollector) void {
+        while (!self.stop.load(.acquire)) {
+            var conn = self.server.accept() catch |err| switch (err) {
+                error.WouldBlock => {
+                    std_compat.thread.sleep(1 * std.time.ns_per_ms);
+                    continue;
+                },
+                else => return,
+            };
+            defer conn.stream.close();
+            self.handle(conn.stream) catch {};
+        }
+    }
+
+    fn handle(self: *TestOtlpCollector, stream: std_compat.net.Stream) !void {
+        const allocator = std.testing.allocator;
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(allocator);
+        var chunk: [4096]u8 = undefined;
+        var header_end: ?usize = null;
+        var content_length: usize = 0;
+        while (header_end == null or buf.items.len < header_end.? + 4 + content_length) {
+            const n = try stream.read(&chunk);
+            if (n == 0) return error.EndOfStream;
+            try buf.appendSlice(allocator, chunk[0..n]);
+            if (header_end != null) continue;
+            const end = std.mem.indexOf(u8, buf.items, "\r\n\r\n") orelse continue;
+            header_end = end;
+            var expect_continue = false;
+            var lines = std.mem.splitSequence(u8, buf.items[0..end], "\r\n");
+            while (lines.next()) |line| {
+                const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+                const name = line[0..colon];
+                const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+                if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+                    content_length = try std.fmt.parseInt(usize, value, 10);
+                } else if (std.ascii.eqlIgnoreCase(name, "expect") and std.ascii.eqlIgnoreCase(value, "100-continue")) {
+                    expect_continue = true;
+                }
+            }
+            // curl holds a larger body back until it sees 100 Continue (or
+            // gives up waiting, which would cost the test a second).
+            if (expect_continue) try stream.writeAll("HTTP/1.1 100 Continue\r\n\r\n");
+        }
+
+        const end = header_end.?;
+        const request_line_end = std.mem.indexOf(u8, buf.items, "\r\n") orelse return error.BadRequest;
+        var parts = std.mem.splitScalar(u8, buf.items[0..request_line_end], ' ');
+        _ = parts.next();
+        const target = parts.next() orelse return error.BadRequest;
+
+        const owned_target = try allocator.dupe(u8, target);
+        errdefer allocator.free(owned_target);
+        const owned_body = try allocator.dupe(u8, buf.items[end + 4 .. end + 4 + content_length]);
+        errdefer allocator.free(owned_body);
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            try self.requests.append(allocator, .{ .target = owned_target, .body = owned_body });
+        }
+        try stream.writeAll(response);
+    }
+};
+
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, pos, needle)) |at| {
+        count += 1;
+        pos = at + needle.len;
+    }
+    return count;
+}
+
 test "OtelObserver name" {
     var otel = OtelObserver.init(std.testing.allocator, null, null);
     defer otel.deinit();
@@ -1987,7 +2155,10 @@ test "OtelObserver span building on agent_start" {
 }
 
 test "OtelObserver resets trace after turn_complete" {
-    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    var collector: TestOtlpCollector = undefined;
+    try collector.start();
+    defer collector.deinit();
+    var otel = OtelObserver.init(std.testing.allocator, collector.endpoint(), null);
     defer otel.deinit();
     const obs = otel.observer();
 
@@ -2002,6 +2173,12 @@ test "OtelObserver resets trace after turn_complete" {
 
     try std.testing.expectEqual(@as(usize, 1), otel.spans.items.len);
     try std.testing.expect(!std.mem.eql(u8, &first_trace_id, &otel.spans.items[0].trace_id));
+
+    // The completed turn went out under the first trace; the new span did not.
+    if (try collector.expectOneExport()) |req| {
+        try std.testing.expectEqual(@as(usize, 2), countOccurrences(req.body, &first_trace_id));
+        try std.testing.expect(std.mem.indexOf(u8, req.body, &otel.spans.items[0].trace_id) == null);
+    }
 }
 
 test "OtelObserver isolates trace context per thread" {
@@ -2378,37 +2555,56 @@ test "OtelObserver JSON multiple spans" {
 }
 
 test "OtelObserver flushes buffered spans on turn complete" {
-    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    var collector: TestOtlpCollector = undefined;
+    try collector.start();
+    defer collector.deinit();
+    var otel = OtelObserver.init(std.testing.allocator, collector.endpoint(), null);
     defer otel.deinit();
     const obs = otel.observer();
 
     const start = ObserverEvent{ .agent_start = .{ .provider = "a", .model = "b" } };
     obs.recordEvent(&start);
     try std.testing.expectEqual(@as(usize, 1), otel.spans.items.len);
+    try collector.expectNoExport();
 
     const complete = ObserverEvent{ .turn_complete = {} };
     obs.recordEvent(&complete);
 
     try std.testing.expectEqual(@as(usize, 0), otel.spans.items.len);
+    if (try collector.expectOneExport()) |req| {
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(req.body, "\"name\":\"agent.start\""));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(req.body, "\"name\":\"turn.complete\""));
+    }
 }
 
 test "OtelObserver flushes buffered spans on agent end" {
-    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    var collector: TestOtlpCollector = undefined;
+    try collector.start();
+    defer collector.deinit();
+    var otel = OtelObserver.init(std.testing.allocator, collector.endpoint(), null);
     defer otel.deinit();
     const obs = otel.observer();
 
     const start = ObserverEvent{ .agent_start = .{ .provider = "a", .model = "b" } };
     obs.recordEvent(&start);
     try std.testing.expectEqual(@as(usize, 1), otel.spans.items.len);
+    try collector.expectNoExport();
 
     const end = ObserverEvent{ .agent_end = .{ .duration_ms = 12, .tokens_used = 3 } };
     obs.recordEvent(&end);
 
     try std.testing.expectEqual(@as(usize, 0), otel.spans.items.len);
+    if (try collector.expectOneExport()) |req| {
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(req.body, "\"name\":\"agent.start\""));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(req.body, "\"name\":\"agent.end\""));
+    }
 }
 
 test "OtelObserver batch flush at 10 spans" {
-    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    var collector: TestOtlpCollector = undefined;
+    try collector.start();
+    defer collector.deinit();
+    var otel = OtelObserver.init(std.testing.allocator, collector.endpoint(), null);
     defer otel.deinit();
     const obs = otel.observer();
 
@@ -2418,12 +2614,15 @@ test "OtelObserver batch flush at 10 spans" {
         obs.recordEvent(&event);
     }
     try std.testing.expectEqual(@as(usize, 9), otel.spans.items.len);
+    try collector.expectNoExport();
 
-    // 10th event triggers flush attempt (curl fails, spans get cleared anyway)
+    // 10th event triggers the flush: one export carrying all ten spans.
     const event = ObserverEvent{ .heartbeat_tick = {} };
     obs.recordEvent(&event);
-    // After flush attempt (curl fails), spans are cleared
-    try std.testing.expect(otel.spans.items.len < 10);
+    try std.testing.expectEqual(@as(usize, 0), otel.spans.items.len);
+    if (try collector.expectOneExport()) |req| {
+        try std.testing.expectEqual(@as(usize, 10), countOccurrences(req.body, "\"name\":\"heartbeat.tick\""));
+    }
 }
 
 test "OtelObserver metrics create spans" {
@@ -2497,7 +2696,10 @@ test "OtelObserver llm_response has duration-adjusted start" {
 }
 
 test "OtelObserver vtable through Observer interface" {
-    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    var collector: TestOtlpCollector = undefined;
+    try collector.start();
+    defer collector.deinit();
+    var otel = OtelObserver.init(std.testing.allocator, collector.endpoint(), null);
     defer otel.deinit();
     const obs = otel.observer();
 
@@ -2507,7 +2709,14 @@ test "OtelObserver vtable through Observer interface" {
     obs.recordEvent(&event);
     const metric = ObserverMetric{ .tokens_used = 10 };
     obs.recordMetric(&metric);
-    obs.flush(); // flush attempt (curl fails silently)
+    try std.testing.expectEqual(@as(usize, 2), otel.spans.items.len);
+    obs.flush();
+
+    try std.testing.expectEqual(@as(usize, 0), otel.spans.items.len);
+    if (try collector.expectOneExport()) |req| {
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(req.body, "\"name\":\"heartbeat.tick\""));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(req.body, "\"name\":\"metric.tokens_used\""));
+    }
 }
 
 test "OtelObserver requests_total counter" {

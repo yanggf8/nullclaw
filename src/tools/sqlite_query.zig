@@ -644,12 +644,15 @@ const TestDb = struct {
         if (c.sqlite3_exec(db, "CREATE TABLE big (id INTEGER, payload TEXT);", null, null, null) != c.SQLITE_OK) {
             return error.PopulateFailed;
         }
+        // One transaction: autocommitting each row syncs the file per INSERT.
+        if (c.sqlite3_exec(db, "BEGIN;", null, null, null) != c.SQLITE_OK) return error.PopulateFailed;
         var i: usize = 0;
         while (i < n) : (i += 1) {
             var buf: [128]u8 = undefined;
             const sql = try std.fmt.bufPrintZ(&buf, "INSERT INTO big VALUES ({d}, 'row{d}');", .{ i, i });
             if (c.sqlite3_exec(db, sql.ptr, null, null, null) != c.SQLITE_OK) return error.PopulateFailed;
         }
+        if (c.sqlite3_exec(db, "COMMIT;", null, null, null) != c.SQLITE_OK) return error.PopulateFailed;
     }
 
     fn populateSensitive(path: [*:0]const u8) !void {
@@ -1193,12 +1196,15 @@ test "sqlite_query: redacted output stays within max_result_bytes" {
         if (c.sqlite3_exec(db, "CREATE TABLE emails (email TEXT);", null, null, null) != c.SQLITE_OK) {
             return error.PopulateFailed;
         }
+        // One transaction: autocommitting each row syncs the file per INSERT.
+        if (c.sqlite3_exec(db, "BEGIN;", null, null, null) != c.SQLITE_OK) return error.PopulateFailed;
         var i: usize = 0;
         while (i < 40) : (i += 1) {
             if (c.sqlite3_exec(db, "INSERT INTO emails VALUES ('a@b.co');", null, null, null) != c.SQLITE_OK) {
                 return error.PopulateFailed;
             }
         }
+        if (c.sqlite3_exec(db, "COMMIT;", null, null, null) != c.SQLITE_OK) return error.PopulateFailed;
     }
 
     var sqt = SqliteQueryTool{
