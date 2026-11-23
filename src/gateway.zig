@@ -4299,6 +4299,7 @@ fn runQueueWorker(state: *GatewayState) void {
                             var bad_result = cron_mod.execErrorRunResult();
                             bad_result.failure_class = blocked.failure_class;
                             complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, bad_result, run_trace_id, "cron_scheduler_shell");
+                            maybeAlertJobStreak(state, arena, spec, .shell, bad_result, run_trace_id);
                             continue;
                         },
                         .fail_closed => {
@@ -4306,6 +4307,7 @@ fn runQueueWorker(state: *GatewayState) void {
                             var bad_result = cron_mod.execErrorRunResult();
                             bad_result.failure_class = "policy_denied";
                             complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, bad_result, run_trace_id, "cron_scheduler_shell");
+                            maybeAlertJobStreak(state, arena, spec, .shell, bad_result, run_trace_id);
                             continue;
                         },
                     }
@@ -4316,6 +4318,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     }) catch |err| {
                         log.err("[{s}] env setup failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_shell");
+                        maybeAlertJobStreak(state, arena, spec, .shell, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     defer shell_env.deinit();
@@ -4331,6 +4334,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     shell_child.spawn() catch |err| {
                         log.err("[{s}] exec failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_shell");
+                        maybeAlertJobStreak(state, arena, spec, .shell, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     errdefer {
@@ -4352,11 +4356,13 @@ fn runQueueWorker(state: *GatewayState) void {
                     ) catch |err| {
                         log.err("[{s}] collect failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_shell");
+                        maybeAlertJobStreak(state, arena, spec, .shell, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     const shell_term = shell_child.wait() catch |err| {
                         log.err("[{s}] wait failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_shell");
+                        maybeAlertJobStreak(state, arena, spec, .shell, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     if (shell_timed_out) log.warn("[{s}] timed out after {d}s", .{ spec.id, timeout });
@@ -4445,6 +4451,13 @@ fn runQueueWorker(state: *GatewayState) void {
                             "no output";
                         sendCronRepairAlert(state, arena, spec, "shell", run_result, run_trace_id, preview);
                     }
+                    // Aggregated operator escalation — same contract as the
+                    // skill branch: ONE operator-first alert when this run
+                    // newly makes N consecutive scheduled non-ok runs,
+                    // beside any per-run alert above.
+                    if (run_result.verified != 1) {
+                        maybeAlertJobStreak(state, arena, spec, .shell, run_result, run_trace_id);
+                    }
                     log.info("[{s}] completed ({s})", .{ spec.id, status });
                 },
                 .agent => {
@@ -4459,6 +4472,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     }) catch |err| {
                         log.err("[{s}] agent failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_agent");
+                        maybeAlertJobStreak(state, arena, spec, .agent, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     var raw_agent = agent_result.output;
@@ -4521,6 +4535,13 @@ fn runQueueWorker(state: *GatewayState) void {
                             "no output";
                         sendCronRepairAlert(state, arena, spec, "agent", run_result, run_trace_id, preview);
                     }
+                    // Aggregated operator escalation — same contract as the
+                    // skill branch: ONE operator-first alert when this run
+                    // newly makes N consecutive scheduled non-ok runs,
+                    // beside any per-run alert above.
+                    if (run_result.verified != 1) {
+                        maybeAlertJobStreak(state, arena, spec, .agent, run_result, run_trace_id);
+                    }
                     log.info("[{s}] completed ({s})", .{ spec.id, status });
                 },
                 .skill => {
@@ -4550,7 +4571,7 @@ fn runQueueWorker(state: *GatewayState) void {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' resolution failed: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
-                        maybeAlertSkillStreak(state, arena, spec, cron_mod.execErrorRunResult(), run_trace_id);
+                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     defer arena.free(raw_skill_cmd);
@@ -4562,14 +4583,14 @@ fn runQueueWorker(state: *GatewayState) void {
                     }) catch |err| {
                         log.err("[{s}] skill env setup failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_skill");
-                        maybeAlertSkillStreak(state, arena, spec, cron_mod.execErrorRunResult(), run_trace_id);
+                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     defer skill_env.deinit();
                     cron_mod.putSkillBudgetEnv(&skill_env, timeout, skill_started_s) catch |err| {
                         log.err("[{s}] skill env setup failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, "cron_scheduler_skill");
-                        maybeAlertSkillStreak(state, arena, spec, cron_mod.execErrorRunResult(), run_trace_id);
+                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     var skill_child = std_compat.process.Child.init(
@@ -4588,7 +4609,7 @@ fn runQueueWorker(state: *GatewayState) void {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' failed to start: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
-                        maybeAlertSkillStreak(state, arena, spec, cron_mod.execErrorRunResult(), run_trace_id);
+                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     errdefer {
@@ -4614,7 +4635,7 @@ fn runQueueWorker(state: *GatewayState) void {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' output collection failed: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
-                        maybeAlertSkillStreak(state, arena, spec, cron_mod.execErrorRunResult(), run_trace_id);
+                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     const skill_term = skill_child.wait() catch |err| {
@@ -4624,7 +4645,7 @@ fn runQueueWorker(state: *GatewayState) void {
                             const em = std.fmt.allocPrint(arena, "[cron] skill '{s}' wait failed: {s} trace={s}", .{ spec.skill_name orelse "?", @errorName(err), run_trace_id }) catch null;
                             if (em) |msg| _ = cron_mod.deliverResult(state.allocator, alert_del, msg, false, eb) catch {};
                         }
-                        maybeAlertSkillStreak(state, arena, spec, cron_mod.execErrorRunResult(), run_trace_id);
+                        maybeAlertJobStreak(state, arena, spec, .skill, cron_mod.execErrorRunResult(), run_trace_id);
                         continue;
                     };
                     if (skill_timed_out) log.warn("[{s}] skill timed out after {d}s", .{ spec.id, timeout });
@@ -4735,7 +4756,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     // above. Edge-triggered by detectRunStreak; an ok run
                     // re-arms without any stored state.
                     if (run_result.verified != 1) {
-                        maybeAlertSkillStreak(state, arena, spec, run_result, run_trace_id);
+                        maybeAlertJobStreak(state, arena, spec, .skill, run_result, run_trace_id);
                     }
                     // Log the final Telegram outcome on failure, not attempt 1.
                     // Stdout is typically a delivery confirmation; stderr is errors.
@@ -5188,14 +5209,38 @@ fn alertDeliveryOperatorFirst(state: *const GatewayState, spec: anytype) cron_mo
     return cron_mod.DeliveryConfig{};
 }
 
+/// Longest command preview a shell streak escalation carries.
+const STREAK_CMD_PREVIEW_MAX: usize = 80;
+
+/// One-line, bounded preview of a shell job's command for the streak alert:
+/// cut at the first line break and at STREAK_CMD_PREVIEW_MAX bytes, never
+/// inside a UTF-8 sequence. `truncated` reports whether anything was dropped.
+fn streakCommandPreview(cmd: []const u8) struct { text: []const u8, truncated: bool } {
+    const line_end = std.mem.indexOfAny(u8, cmd, "\r\n") orelse cmd.len;
+    var end = @min(line_end, STREAK_CMD_PREVIEW_MAX);
+    while (end > 0 and end < cmd.len and (cmd[end] & 0xC0) == 0x80) end -= 1;
+    return .{ .text = cmd[0..end], .truncated = end < cmd.len };
+}
+
 /// Fire ONE aggregated escalation when the current run newly makes
-/// `cron_alert_streak` consecutive scheduled non-ok runs. Call after
-/// complete() has written the current run row — detectRunStreak anchors on
-/// its trace id. Edge-triggered: no state to store, an ok run re-arms.
-fn maybeAlertSkillStreak(
+/// `cron_alert_streak` consecutive scheduled non-ok runs. Applies to every
+/// job type the run-queue worker executes — detectRunStreak is keyed on the
+/// job id and scheduled rows only, so nothing in it is skill-specific; until
+/// 2026-11-23 only the skill branch called it, so a shell or agent job on
+/// repair_policy=none could fail every night without anyone being told.
+/// Call after complete() has written the current run row — detectRunStreak
+/// anchors on its trace id. Edge-triggered: no state to store, an ok run
+/// re-arms.
+///
+/// `job_kind` is comptime so each instantiation only touches the fields its
+/// kind has: a skill is named by skill_name (falling back to the id), shell
+/// and agent jobs by id — skill_name is null for them — and a shell alert
+/// also carries a one-line command preview.
+fn maybeAlertJobStreak(
     state: *const GatewayState,
     arena: std.mem.Allocator,
     spec: anytype,
+    comptime job_kind: cron_mod.JobType,
     run_result: cron_mod.RunResult,
     run_trace_id: []const u8,
 ) void {
@@ -5231,14 +5276,26 @@ fn maybeAlertSkillStreak(
     }
     const fc = run_result.failure_class orelse "unknown";
     const ra = run_result.repair_action orelse "none";
-    const msg = std.fmt.allocPrint(
+    const subject: []const u8 = switch (job_kind) {
+        .skill => spec.skill_name orelse spec.id,
+        .shell, .agent => spec.id,
+    };
+    const head = std.fmt.allocPrint(
         arena,
-        "[cron] skill '{s}' non-ok for {d} consecutive scheduled runs (threshold {d}): failure={s} repair={s} trace={s}",
-        .{ spec.skill_name orelse spec.id, info.streak, threshold, fc, ra, run_trace_id },
+        "[cron] {s} '{s}' non-ok for {d} consecutive scheduled runs (threshold {d}): failure={s} repair={s} trace={s}",
+        .{ job_kind.asStr(), subject, info.streak, threshold, fc, ra, run_trace_id },
     ) catch {
         log.warn("streak: allocPrint failed for job {s}", .{spec.id});
         return;
     };
+    const msg = if (job_kind == .shell) blk: {
+        const preview = streakCommandPreview(spec.command);
+        break :blk std.fmt.allocPrint(
+            arena,
+            "{s}\ncmd: {s}{s}",
+            .{ head, preview.text, if (preview.truncated) "..." else "" },
+        ) catch head;
+    } else head;
     const delivered = cron_mod.deliverResult(
         state.allocator,
         alertDeliveryOperatorFirst(state, spec),
@@ -9526,11 +9583,22 @@ test "sendCronRepairAlert uses alert delivery fallback for alert_only shell fail
     try std.testing.expect(std.mem.indexOf(u8, msg.content, "stderr preview") != null);
 }
 
+const StreakSeedRow = struct { ts: i64, verified: u8, trace_id: ?[]const u8 };
+
 /// Seed scheduled cron_runs rows through dbCompleteJob — the same writer the
 /// scheduler itself uses — so detector reads what production writes.
-fn seedStreakHistory(
+fn seedStreakHistory(db_path_z: [:0]const u8, rows: []const StreakSeedRow) !void {
+    try seedStreakHistoryFor(db_path_z, "cct-job", "cron_scheduler_skill", "contract_degraded", rows);
+}
+
+/// seedStreakHistory for any job: shell/agent rows carry their own worker
+/// source and the failure class their branch actually writes.
+fn seedStreakHistoryFor(
     db_path_z: [:0]const u8,
-    rows: []const struct { ts: i64, verified: u8, trace_id: ?[]const u8 },
+    job_id: []const u8,
+    source: []const u8,
+    failure_class: []const u8,
+    rows: []const StreakSeedRow,
 ) !void {
     const db = try cron_mod.openCronDbAtPath(db_path_z);
     defer cron_mod.closeCronDb(db);
@@ -9541,13 +9609,13 @@ fn seedStreakHistory(
             else => .{
                 .exit_code = 0,
                 .timed_out = false,
-                .failure_class = "contract_degraded",
+                .failure_class = failure_class,
                 .verified = r.verified,
             },
         };
         try cron_mod.dbCompleteJob(
             db,
-            "cct-job",
+            job_id,
             @intCast(r.ts),
             r.ts,
             if (r.verified == 1) "ok" else "error",
@@ -9556,7 +9624,7 @@ fn seedStreakHistory(
             rr,
             r.trace_id,
             false,
-            "cron_scheduler_skill",
+            source,
             null,
         );
     }
@@ -9624,7 +9692,7 @@ test "skill streak escalation alerts the operator channel once at threshold" {
         .verified = 2,
     };
 
-    maybeAlertSkillStreak(&state, a, spec, run_result, "cct-job:3");
+    maybeAlertJobStreak(&state, a, spec, .skill, run_result, "cct-job:3");
 
     try std.testing.expectEqual(@as(usize, 1), test_bus.outboundDepth());
     var msg = test_bus.consumeOutbound().?;
@@ -9687,7 +9755,7 @@ test "skill streak escalation stays quiet below the threshold" {
         .verified = 2,
     };
 
-    maybeAlertSkillStreak(&state, a, spec, run_result, "cct-job:2");
+    maybeAlertJobStreak(&state, a, spec, .skill, run_result, "cct-job:2");
 
     try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
 }
@@ -9744,7 +9812,7 @@ test "skill streak escalation fires for repeated pre-exec failures" {
         delivery: cron_mod.DeliveryConfig = .{},
     }{};
 
-    maybeAlertSkillStreak(&state, a, spec, cron_mod.execErrorRunResult(), "cct-job:3");
+    maybeAlertJobStreak(&state, a, spec, .skill, cron_mod.execErrorRunResult(), "cct-job:3");
 
     try std.testing.expectEqual(@as(usize, 1), test_bus.outboundDepth());
     var msg = test_bus.consumeOutbound().?;
@@ -9805,12 +9873,337 @@ test "skill streak escalation falls back to the job channel without operator con
         .verified = 3,
     };
 
-    maybeAlertSkillStreak(&state, a, spec, run_result, "cct-job:3");
+    maybeAlertJobStreak(&state, a, spec, .skill, run_result, "cct-job:3");
 
     try std.testing.expectEqual(@as(usize, 1), test_bus.outboundDepth());
     var msg = test_bus.consumeOutbound().?;
     defer msg.deinit(allocator);
     try std.testing.expectEqualStrings("job-chat", msg.chat_id);
+}
+
+/// Drive maybeAlertJobStreak once for `job_kind` against freshly seeded
+/// history and report what reached the bus: null when nothing was sent,
+/// otherwise the single message's content (caller frees). Fails if more than
+/// one message went out, or if the alert did not go operator-first.
+fn runStreakScenario(
+    comptime job_kind: cron_mod.JobType,
+    spec: anytype,
+    source: []const u8,
+    failure_class: []const u8,
+    rows: []const StreakSeedRow,
+    alert_streak: u8,
+    run_result: cron_mod.RunResult,
+    anchor: []const u8,
+) !?[]u8 {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/streak_scenario.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    try seedStreakHistoryFor(db_path_z, spec.id, source, failure_class, rows);
+
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    var test_bus = bus_mod.Bus.init();
+    defer test_bus.close();
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    state.cron_db_path = db_path_z;
+    state.cron_alert_streak = alert_streak;
+    state.event_bus = &test_bus;
+    state.alert_delivery = .{
+        .mode = .always,
+        .channel = try a.dupe(u8, "telegram"),
+        .to = try a.dupe(u8, "ops-chat"),
+        .best_effort = true,
+    };
+
+    maybeAlertJobStreak(&state, a, spec, job_kind, run_result, anchor);
+
+    const depth = test_bus.outboundDepth();
+    if (depth == 0) return null;
+    try std.testing.expectEqual(@as(usize, 1), depth);
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("ops-chat", msg.chat_id);
+    return try allocator.dupe(u8, msg.content);
+}
+
+const streak_shell_spec = struct {
+    id: []const u8 = "shell-job",
+    command: []const u8 = "/opt/bin/price cds fetch",
+    repair_policy: cron_mod.RepairPolicy = .none,
+    delivery: cron_mod.DeliveryConfig = .{},
+}{};
+
+const streak_agent_spec = struct {
+    id: []const u8 = "agent-job",
+    repair_policy: cron_mod.RepairPolicy = .none,
+    delivery: cron_mod.DeliveryConfig = .{},
+}{};
+
+test "shell streak escalation alerts the operator once at threshold" {
+    // Regression: job-dc786668 (shell, repair_policy=none, delivery none)
+    // exited 127 on 7 consecutive scheduled runs and nobody was told — only
+    // the skill branch ever ran the streak detector.
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const content = (try runStreakScenario(.shell, streak_shell_spec, "cron_scheduler_shell", "exec_error", &.{
+        .{ .ts = 100, .verified = 3, .trace_id = "shell-job:1" },
+        .{ .ts = 101, .verified = 3, .trace_id = "shell-job:2" },
+        .{ .ts = 102, .verified = 3, .trace_id = "shell-job:3" },
+    }, 3, cron_mod.classifyExecRun(127, false), "shell-job:3")).?;
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings(
+        "[cron] shell 'shell-job' non-ok for 3 consecutive scheduled runs (threshold 3): failure=exec_error repair=none trace=shell-job:3\ncmd: /opt/bin/price cds fetch",
+        content,
+    );
+}
+
+test "shell streak escalation stays quiet below the threshold" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const content = try runStreakScenario(.shell, streak_shell_spec, "cron_scheduler_shell", "exec_error", &.{
+        .{ .ts = 100, .verified = 3, .trace_id = "shell-job:1" },
+        .{ .ts = 101, .verified = 3, .trace_id = "shell-job:2" },
+    }, 3, cron_mod.classifyExecRun(127, false), "shell-job:2");
+    try std.testing.expect(content == null);
+}
+
+test "shell streak escalation fires once per streak and an ok run re-arms it" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const history = [_]StreakSeedRow{
+        .{ .ts = 100, .verified = 3, .trace_id = "shell-job:1" },
+        .{ .ts = 101, .verified = 3, .trace_id = "shell-job:2" },
+        .{ .ts = 102, .verified = 3, .trace_id = "shell-job:3" },
+        .{ .ts = 103, .verified = 3, .trace_id = "shell-job:4" },
+        .{ .ts = 104, .verified = 1, .trace_id = "shell-job:5" },
+        .{ .ts = 105, .verified = 3, .trace_id = "shell-job:6" },
+        .{ .ts = 106, .verified = 3, .trace_id = "shell-job:7" },
+        .{ .ts = 107, .verified = 3, .trace_id = "shell-job:8" },
+    };
+    const fail = cron_mod.classifyExecRun(127, false);
+    // The 4th consecutive failure does not repeat the escalation.
+    try std.testing.expect((try runStreakScenario(.shell, streak_shell_spec, "cron_scheduler_shell", "exec_error", history[0..4], 3, fail, "shell-job:4")) == null);
+    // After the ok run the count restarts: two failures stay quiet...
+    try std.testing.expect((try runStreakScenario(.shell, streak_shell_spec, "cron_scheduler_shell", "exec_error", history[0..7], 3, fail, "shell-job:7")) == null);
+    // ...and the third fires again.
+    const content = (try runStreakScenario(.shell, streak_shell_spec, "cron_scheduler_shell", "exec_error", history[0..8], 3, fail, "shell-job:8")).?;
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings(
+        "[cron] shell 'shell-job' non-ok for 3 consecutive scheduled runs (threshold 3): failure=exec_error repair=none trace=shell-job:8\ncmd: /opt/bin/price cds fetch",
+        content,
+    );
+}
+
+test "shell streak escalation is disabled by alert_streak=0" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const content = try runStreakScenario(.shell, streak_shell_spec, "cron_scheduler_shell", "exec_error", &.{
+        .{ .ts = 100, .verified = 3, .trace_id = "shell-job:1" },
+        .{ .ts = 101, .verified = 3, .trace_id = "shell-job:2" },
+        .{ .ts = 102, .verified = 3, .trace_id = "shell-job:3" },
+    }, 0, cron_mod.classifyExecRun(127, false), "shell-job:3");
+    try std.testing.expect(content == null);
+}
+
+test "agent streak escalation alerts the operator once at threshold" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const content = (try runStreakScenario(.agent, streak_agent_spec, "cron_scheduler_agent", "timeout", &.{
+        .{ .ts = 100, .verified = 3, .trace_id = "agent-job:1" },
+        .{ .ts = 101, .verified = 3, .trace_id = "agent-job:2" },
+        .{ .ts = 102, .verified = 3, .trace_id = "agent-job:3" },
+    }, 3, cron_mod.classifyExecRun(0, true), "agent-job:3")).?;
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings(
+        "[cron] agent 'agent-job' non-ok for 3 consecutive scheduled runs (threshold 3): failure=timeout repair=none trace=agent-job:3",
+        content,
+    );
+}
+
+test "agent streak escalation stays quiet below the threshold" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const content = try runStreakScenario(.agent, streak_agent_spec, "cron_scheduler_agent", "timeout", &.{
+        .{ .ts = 100, .verified = 3, .trace_id = "agent-job:1" },
+        .{ .ts = 101, .verified = 3, .trace_id = "agent-job:2" },
+    }, 3, cron_mod.classifyExecRun(0, true), "agent-job:2");
+    try std.testing.expect(content == null);
+}
+
+test "agent streak escalation re-arms after an ok run" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const history = [_]StreakSeedRow{
+        .{ .ts = 100, .verified = 3, .trace_id = "agent-job:1" },
+        .{ .ts = 101, .verified = 3, .trace_id = "agent-job:2" },
+        .{ .ts = 102, .verified = 1, .trace_id = "agent-job:3" },
+        .{ .ts = 103, .verified = 3, .trace_id = "agent-job:4" },
+        .{ .ts = 104, .verified = 3, .trace_id = "agent-job:5" },
+        .{ .ts = 105, .verified = 3, .trace_id = "agent-job:6" },
+    };
+    const fail = cron_mod.classifyExecRun(1, false);
+    // Two failures, an ok, then two more: the ok broke the run, so still quiet.
+    try std.testing.expect((try runStreakScenario(.agent, streak_agent_spec, "cron_scheduler_agent", "exec_error", history[0..5], 3, fail, "agent-job:5")) == null);
+    const content = (try runStreakScenario(.agent, streak_agent_spec, "cron_scheduler_agent", "exec_error", history[0..6], 3, fail, "agent-job:6")).?;
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings(
+        "[cron] agent 'agent-job' non-ok for 3 consecutive scheduled runs (threshold 3): failure=exec_error repair=none trace=agent-job:6",
+        content,
+    );
+}
+
+test "agent streak escalation is disabled by alert_streak=0" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const content = try runStreakScenario(.agent, streak_agent_spec, "cron_scheduler_agent", "timeout", &.{
+        .{ .ts = 100, .verified = 3, .trace_id = "agent-job:1" },
+        .{ .ts = 101, .verified = 3, .trace_id = "agent-job:2" },
+        .{ .ts = 102, .verified = 3, .trace_id = "agent-job:3" },
+    }, 0, cron_mod.classifyExecRun(0, true), "agent-job:3");
+    try std.testing.expect(content == null);
+}
+
+test "streakCommandPreview keeps one bounded line and never splits UTF-8" {
+    const short = streakCommandPreview("/opt/bin/price cds fetch");
+    try std.testing.expectEqualStrings("/opt/bin/price cds fetch", short.text);
+    try std.testing.expect(!short.truncated);
+
+    const multi = streakCommandPreview("cd /srv && ./run.sh\necho done");
+    try std.testing.expectEqualStrings("cd /srv && ./run.sh", multi.text);
+    try std.testing.expect(multi.truncated);
+
+    // 79 ASCII bytes then a 3-byte character straddling the 80-byte limit:
+    // the cut backs off to byte 79 instead of emitting half a codepoint.
+    const long = "a" ** 79 ++ "臺北";
+    const cut = streakCommandPreview(long);
+    try std.testing.expectEqualStrings("a" ** 79, cut.text);
+    try std.testing.expect(cut.truncated);
+}
+
+/// Wait (bounded) for the run-queue worker to publish `want` messages.
+fn waitForOutbound(test_bus: *bus_mod.Bus, want: usize) void {
+    var waited_ms: u64 = 0;
+    while (test_bus.outboundDepth() < want and waited_ms < 15_000) : (waited_ms += 50) {
+        std_compat.thread.sleep(50 * std.time.ns_per_ms);
+    }
+}
+
+/// End-to-end through runQueueWorker's shell branch: seed two prior
+/// scheduled failures for a real cron_jobs row, enqueue it, let the worker
+/// run it under `policy`, and return the one message it published.
+fn runShellJobThroughWorker(policy: security.SecurityPolicy) !struct { job_id: []u8, content: []u8 } {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const db_path_str = try std.fmt.allocPrint(allocator, "{s}/streak_worker.db", .{base});
+    defer allocator.free(db_path_str);
+    const db_path_z = try allocator.dupeZ(u8, db_path_str);
+    defer allocator.free(db_path_z);
+
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    var backend = try cron_db_mod.DbCronBackend.init(allocator, db_path_z);
+    defer backend.deinit();
+    // Shaped like job-dc786668: shell, verify none, repair none, no delivery.
+    const job = try backend.backend().add(a, .{
+        .expression = "0 4 1 1 1",
+        .job_type = .shell,
+        .command = "exit 127",
+    });
+
+    // Real clock: dbCompleteJob prunes rows older than 30 days relative to
+    // the run it is writing, so the seeded history must be recent.
+    const now = std_compat.time.timestamp();
+    try seedStreakHistoryFor(db_path_z, job.id, "cron_scheduler_shell", "exec_error", &.{
+        .{ .ts = now - 200, .verified = 3, .trace_id = try std.fmt.allocPrint(a, "{s}:prev-1", .{job.id}) },
+        .{ .ts = now - 100, .verified = 3, .trace_id = try std.fmt.allocPrint(a, "{s}:prev-2", .{job.id}) },
+    });
+    try cron_mod.dbManualEnqueueJob(db_path_z, job.id, now);
+
+    var test_bus = bus_mod.Bus.init();
+    defer test_bus.close();
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    state.cron_db_path = db_path_z;
+    state.cron_alert_streak = 3;
+    state.event_bus = &test_bus;
+    state.alert_delivery = .{
+        .mode = .always,
+        .channel = try a.dupe(u8, "telegram"),
+        .to = try a.dupe(u8, "ops-chat"),
+        .best_effort = true,
+    };
+    // GatewayState.deinit frees both with state.allocator.
+    const tracker = try allocator.create(security.RateTracker);
+    tracker.* = security.RateTracker.init(allocator, 100);
+    state.security_tracker = tracker;
+    const pol = try allocator.create(security.SecurityPolicy);
+    pol.* = policy;
+    pol.tracker = tracker;
+    state.security_policy = pol;
+
+    try state.startRunQueue();
+    waitForOutbound(&test_bus, 1);
+    state.stopRunQueue();
+
+    try std.testing.expectEqual(@as(usize, 1), test_bus.outboundDepth());
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("ops-chat", msg.chat_id);
+    return .{
+        .job_id = try allocator.dupe(u8, job.id),
+        .content = try allocator.dupe(u8, msg.content),
+    };
+}
+
+test "run-queue worker escalates a shell streak when the command exits 127" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const r = try runShellJobThroughWorker(.{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_medium_risk_commands = false,
+        .block_high_risk_commands = false,
+    });
+    defer std.testing.allocator.free(r.job_id);
+    defer std.testing.allocator.free(r.content);
+    const want = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "[cron] shell '{s}' non-ok for 3 consecutive scheduled runs (threshold 3): failure=exec_error repair=none trace={s}:1\ncmd: exit 127",
+        .{ r.job_id, r.job_id },
+    );
+    defer std.testing.allocator.free(want);
+    try std.testing.expectEqualStrings(want, r.content);
+}
+
+test "run-queue worker escalates a shell streak on a policy-blocked run" {
+    // The pre-spawn exits (policy, env, spawn, collect, wait) write a
+    // scheduled error row and `continue`; they must run the detector too.
+    // An allowlist without `exit` blocks the command before anything spawns.
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const r = try runShellJobThroughWorker(.{
+        .autonomy = .supervised,
+        .allowed_commands = &.{"echo"},
+    });
+    defer std.testing.allocator.free(r.job_id);
+    defer std.testing.allocator.free(r.content);
+    const want = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "[cron] shell '{s}' non-ok for 3 consecutive scheduled runs (threshold 3): failure=policy_denied repair=none trace={s}:1\ncmd: exit 127",
+        .{ r.job_id, r.job_id },
+    );
+    defer std.testing.allocator.free(want);
+    try std.testing.expectEqualStrings(want, r.content);
 }
 
 // ── Bearer Token Validation tests ───────────────────────────────
