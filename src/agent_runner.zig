@@ -8,6 +8,7 @@ const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
 const platform = @import("platform.zig");
+const process_util = @import("tools/process_util.zig");
 
 pub const AgentRunResult = struct {
     success: bool,
@@ -16,6 +17,11 @@ pub const AgentRunResult = struct {
 
 pub const MAX_OUTPUT_BYTES: usize = 1_048_576;
 const POLL_STEP_NS: u64 = 200 * std.time.ns_per_ms;
+/// After a timeout kill, how long to keep draining output the group wrote
+/// before it died. EOF normally arrives at once (the whole group is dead);
+/// the bound only matters if a descendant left the group and still holds the
+/// pipes, which must not keep the collector waiting.
+const POST_KILL_DRAIN_NS: u64 = 200 * std.time.ns_per_ms;
 const LINUX_SELF_EXE_PATH = "/proc/self/exe";
 const DELETED_EXE_SUFFIX = " (deleted)";
 
@@ -43,6 +49,14 @@ fn collectChildOutputWithTimeout(
     var stdout_open = true;
     var stderr_open = true;
     var timed_out = false;
+    var drain_deadline_ns: i128 = 0;
+    // The timeout path reaps the child and records its term, so wait() will
+    // not close the pipes for us.
+    defer {
+        if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            if (timed_out) process_util.closeChildStdio(child);
+        }
+    }
     var read_buf: [4096]u8 = undefined;
     while (true) {
         if (!stdout_open and !stderr_open) break;
@@ -78,7 +92,9 @@ fn collectChildOutputWithTimeout(
                 std_compat.thread.sleep(POLL_STEP_NS);
             }
         } else {
-            const poll_ms: i32 = if (timeout_secs == 0 or timed_out)
+            const poll_ms: i32 = if (timed_out)
+                drainPollMs(drain_deadline_ns)
+            else if (timeout_secs == 0)
                 -1
             else
                 @intCast(@divTrunc(POLL_STEP_NS, std.time.ns_per_ms));
@@ -121,15 +137,27 @@ fn collectChildOutputWithTimeout(
                     if (stderr.items.len > MAX_OUTPUT_BYTES) return error.StderrStreamTooLong;
                 }
             }
+
+            if (timed_out and std_compat.time.monotonicNanoTimestamp() >= drain_deadline_ns) break;
         }
 
         if (!timed_out and hasTimeoutExpired(start_ns, timeout_secs)) {
             try terminateChildHard(child);
             timed_out = true;
+            // Monotonic: a wall-clock step must not stretch the bounded drain.
+            drain_deadline_ns = std_compat.time.monotonicNanoTimestamp() + POST_KILL_DRAIN_NS;
         }
     }
 
     return timed_out;
+}
+
+/// Poll timeout for the bounded post-kill drain: the time left until
+/// `deadline_ns`, never negative (which would mean "wait forever").
+fn drainPollMs(deadline_ns: i128) i32 {
+    const left_ns = deadline_ns - std_compat.time.monotonicNanoTimestamp();
+    if (left_ns <= 0) return 0;
+    return @intCast(@divTrunc(left_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
 }
 
 fn terminateChildHard(child: *std_compat.process.Child) !void {
@@ -139,10 +167,11 @@ fn terminateChildHard(child: *std_compat.process.Child) !void {
     }
     if (comptime builtin.os.tag == .wasi) return error.UnsupportedOperation;
 
-    std.posix.kill(child.id, std.posix.SIG.KILL) catch |err| switch (err) {
-        error.ProcessNotFound => return,
-        else => return err,
-    };
+    // The child runs in its own process group (see `run`), so the timeout
+    // reaches every descendant: a grandchild that inherited the pipes would
+    // otherwise hold them open, and the collector with them, for as long as
+    // it lives.
+    process_util.terminateProcessGroupAndReap(child, process_util.timeout_term_grace_ns);
 }
 
 fn buildAgentOutput(
@@ -209,6 +238,7 @@ pub fn run(
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
         child.cwd = exec_cwd;
+        process_util.isolateProcessGroup(&child);
 
         child.spawn() catch |err| switch (err) {
             error.FileNotFound => {
@@ -325,6 +355,7 @@ test "collectChildOutputWithTimeout kills process after deadline" {
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    process_util.applyProcessGroupPolicy(&child, false);
     try child.spawn();
     errdefer {
         _ = child.kill() catch {};
@@ -336,14 +367,16 @@ test "collectChildOutputWithTimeout kills process after deadline" {
     var stderr: std.ArrayList(u8) = .empty;
     defer stderr.deinit(allocator);
 
+    const start_ns = std_compat.time.nanoTimestamp();
     const timed_out = try collectChildOutputWithTimeout(
         &child,
         allocator,
         &stdout,
         &stderr,
         1,
-        std_compat.time.nanoTimestamp(),
+        start_ns,
     );
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
     const term = try child.wait();
 
     try std.testing.expect(timed_out);
@@ -352,6 +385,117 @@ test "collectChildOutputWithTimeout kills process after deadline" {
         else => false,
     };
     try std.testing.expect(!completed_ok);
+    // Regression: only the shell was SIGKILLed and the collector then waited
+    // for EOF, which the `sleep 2` grandchild held off — a 1s timeout took 2s.
+    try std.testing.expect(elapsed_ns < 1800 * std.time.ns_per_ms);
+    try std.testing.expectEqualStrings("", stdout.items);
+}
+
+test "collectChildOutputWithTimeout kills the timed-out child's descendants" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const pid_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "grandchild.pid" });
+    defer allocator.free(pid_path);
+    const command = try std.fmt.allocPrint(allocator, "sleep 30 & echo $! > \"{s}\"; wait", .{pid_path});
+    defer allocator.free(command);
+
+    var child = std_compat.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), command }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    process_util.applyProcessGroupPolicy(&child, false);
+    try child.spawn();
+    errdefer {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    }
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    const timed_out = try collectChildOutputWithTimeout(&child, allocator, &stdout, &stderr, 1, start_ns);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+    // The collector reaped the child, so it must also have released the pipes.
+    try std.testing.expect(child.stdout == null and child.stderr == null);
+    _ = try child.wait();
+
+    const pid_bytes = try std_compat.fs.cwd().readFileAlloc(allocator, pid_path, 32);
+    defer allocator.free(pid_bytes);
+    const grandchild = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, pid_bytes, " \t\r\n"), 10);
+    defer if (process_util.processExists(grandchild)) std.posix.kill(grandchild, std.posix.SIG.KILL) catch {};
+
+    try std.testing.expect(timed_out);
+    // Regression: the grandchild held the pipes open, so the "1s" timeout
+    // lasted as long as the grandchild (30s here, forever for a stuck one).
+    try std.testing.expect(elapsed_ns < 1800 * std.time.ns_per_ms);
+    // Killed, not orphaned. A zombie awaiting PID 1's reap counts as gone.
+    var gone = false;
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        if (process_util.processExitedOrZombie(grandchild)) {
+            gone = true;
+            break;
+        }
+        std_compat.thread.sleep(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(gone);
+}
+
+test "collectChildOutputWithTimeout does not wait for a descendant that left the process group" {
+    // `setsid` the command is util-linux; the escape itself is what is tested.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const pid_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "escaped.pid" });
+    defer allocator.free(pid_path);
+    // setsid moves the background sleep into a new session (and group) that
+    // the timeout cannot reach, while it keeps the inherited pipes open.
+    const command = try std.fmt.allocPrint(allocator, "setsid sleep 30 & echo $! > \"{s}\"; wait", .{pid_path});
+    defer allocator.free(command);
+
+    var child = std_compat.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), command }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    process_util.applyProcessGroupPolicy(&child, false);
+    try child.spawn();
+    errdefer {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    }
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    const timed_out = try collectChildOutputWithTimeout(&child, allocator, &stdout, &stderr, 1, start_ns);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+    _ = try child.wait();
+
+    const pid_bytes = try std_compat.fs.cwd().readFileAlloc(allocator, pid_path, 32);
+    defer allocator.free(pid_bytes);
+    const escaped = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, pid_bytes, " \t\r\n"), 10);
+    // Out of the timeout's reach by construction; clean it up here.
+    std.posix.kill(escaped, std.posix.SIG.KILL) catch {};
+
+    try std.testing.expect(timed_out);
+    // The post-kill drain is bounded: the escaped process's open pipe end
+    // must not hold the collector the way the old `poll(-1)` did.
+    try std.testing.expect(elapsed_ns < 1800 * std.time.ns_per_ms);
 }
 
 test "preferExecPath keeps regular executable path" {

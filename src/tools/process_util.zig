@@ -2,6 +2,7 @@ const std = @import("std");
 const std_compat = @import("compat");
 const AtomicBool = std.atomic.Value(bool);
 const builtin = @import("builtin");
+const thread_stacks = @import("../thread_stacks.zig");
 
 // Win32 APIs used for codepage fallback decoding on Windows.
 extern "kernel32" fn MultiByteToWideChar(
@@ -120,6 +121,205 @@ fn terminateChild(child: *std_compat.process.Child) void {
     }
 }
 
+/// How long a timed-out process group gets between SIGTERM and SIGKILL.
+/// Long enough for a TERM handler to flush and exit, short enough that a
+/// child ignoring TERM stalls the collecting worker by at most this much.
+/// Paid only when something outlives TERM: the wait ends as soon as the
+/// whole group is gone.
+pub const timeout_term_grace_ns: u64 = 500 * std.time.ns_per_ms;
+/// Bound on reaping the direct child after SIGKILL. SIGKILL cannot be caught,
+/// but a process stuck in uninterruptible sleep cannot act on it either; the
+/// collecting worker must not wedge behind one.
+const kill_reap_bound_ns: u64 = 1 * std.time.ns_per_s;
+const group_poll_ns: u64 = 10 * std.time.ns_per_ms;
+
+/// Give a not-yet-spawned child its own process group (pgid = its pid), so a
+/// timeout can signal the child together with every descendant it spawns —
+/// e.g. the real command behind an `sh -c` wrapper — unless we run
+/// interactively.
+///
+/// Rule: isolate only when our own stdin is NOT a terminal. The gateway under
+/// systemd (stdin = /dev/null) and scripted CLI runs isolate. An interactive
+/// `nullclaw cron run` keeps the child in our (foreground) group, so Ctrl-C
+/// still reaches the child and its descendants, and a child that opens
+/// /dev/tty is not stopped by SIGTTIN as a background group. Such a child has
+/// no group of its own, so `terminateProcessGroupAndReap` signals the pid
+/// alone — still bounded, but its descendants are not reached.
+///
+/// No-op on Windows/WASI, which have no POSIX process groups.
+pub fn isolateProcessGroup(child: *std_compat.process.Child) void {
+    applyProcessGroupPolicy(child, std_compat.fs.File.stdin().isTty());
+}
+
+/// `isolateProcessGroup` with the "is our stdin a terminal" answer supplied,
+/// so tests can exercise both branches without a real tty.
+pub fn applyProcessGroupPolicy(child: *std_compat.process.Child, stdin_is_tty: bool) void {
+    if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (shouldIsolateProcessGroup(stdin_is_tty)) child.pgid = 0;
+    }
+}
+
+pub fn shouldIsolateProcessGroup(stdin_is_tty: bool) bool {
+    return !stdin_is_tty;
+}
+
+/// Signal the child's process group; when there is no such group (the child
+/// was not spawned with `isolateProcessGroup`) or it cannot be signalled,
+/// signal the child itself. Errors are ignored: a child that is already gone
+/// needs no signal.
+fn signalGroupAndLeader(pid: std.posix.pid_t, sig: std.posix.SIG) void {
+    std.posix.kill(-pid, sig) catch {
+        std.posix.kill(pid, sig) catch {};
+    };
+}
+
+/// True while any member of process group `pgid` exists. EPERM means a member
+/// exists that we may not signal, so it counts as alive.
+fn processGroupAlive(pgid: std.posix.pid_t) bool {
+    std.posix.kill(-pgid, @as(std.posix.SIG, @enumFromInt(0))) catch |err| switch (err) {
+        error.ProcessNotFound => return false,
+        else => return true,
+    };
+    return true;
+}
+
+/// Non-blocking reap of the direct child. True once it has been reaped — or
+/// once there is nothing left to reap (ECHILD: e.g. SIGCHLD set to SIG_IGN),
+/// so the caller never blocks on a pid that will not report.
+fn tryReapChild(pid: std.posix.pid_t) bool {
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    const rc = std.posix.system.waitpid(pid, &status, std.posix.W.NOHANG);
+    return switch (std.posix.errno(rc)) {
+        .SUCCESS => rc != 0,
+        .CHILD => true,
+        else => false, // EINTR: try again on the next poll
+    };
+}
+
+/// Terminate a timed-out child together with its process group, and reap it,
+/// without ever waiting unboundedly. POSIX only.
+///
+///   1. SIGTERM to the group (falls back to the pid when it has no group);
+///   2. wait up to `grace_ns` for the child to exit and the group to empty,
+///      reaping the child as soon as it exits;
+///   3. SIGKILL to whatever is left of the group, and to the child if it is
+///      still unreaped;
+///   4. reap the child, bounded by `kill_reap_bound_ns`.
+///
+/// Leaves `child.term` set to SIGKILL — exactly what `Child.kill()` records —
+/// so a later `wait()`/`kill()` returns it without touching the (possibly
+/// reused) pid again. Does NOT close the stdio pipes: a caller can still drain
+/// them, and must then call `closeChildStdio`.
+pub fn terminateProcessGroupAndReap(child: *std_compat.process.Child, grace_ns: u64) void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        // No process groups here; callers keep their own platform path.
+        _ = child.kill() catch {};
+    } else {
+        terminateProcessGroupAndReapPosix(child, grace_ns);
+    }
+}
+
+fn terminateProcessGroupAndReapPosix(child: *std_compat.process.Child, grace_ns: u64) void {
+    if (child.term != null) return;
+
+    const pid = child.id;
+    signalGroupAndLeader(pid, std.posix.SIG.TERM);
+
+    var reaped = false;
+    var waited_ns: u64 = 0;
+    while (true) {
+        if (!reaped) reaped = tryReapChild(pid);
+        if (reaped and !processGroupAlive(pid)) break;
+        if (waited_ns >= grace_ns) break;
+        std_compat.thread.sleep(group_poll_ns);
+        waited_ns +|= group_poll_ns;
+    }
+
+    // Once the child is reaped its pid may be reused, so only the group (whose
+    // id outlives the leader while members remain) is signalled after that.
+    if (processGroupAlive(pid)) std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
+    if (!reaped) {
+        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+        waited_ns = 0;
+        while (true) {
+            reaped = tryReapChild(pid);
+            if (reaped or waited_ns >= kill_reap_bound_ns) break;
+            std_compat.thread.sleep(group_poll_ns);
+            waited_ns +|= group_poll_ns;
+        }
+        if (!reaped) {
+            std.log.warn("child pid={d} not reaped within {d}ms of SIGKILL; reaping it in the background", .{ pid, kill_reap_bound_ns / std.time.ns_per_ms });
+            reapInBackground(pid);
+        }
+    }
+
+    child.term = .{ .signal = std.posix.SIG.KILL };
+}
+
+/// Hand an unreaped child to a detached thread that blocks in waitpid until
+/// it finally exits. `child.term` is recorded without a reap, so nothing else
+/// would ever wait on this pid: in the long-lived daemon it would stay a
+/// zombie forever. If the thread cannot be spawned the pid is left as before.
+fn reapInBackground(pid: std.posix.pid_t) void {
+    const thread = std.Thread.spawn(
+        .{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE },
+        blockingReap,
+        .{pid},
+    ) catch |err| {
+        std.log.warn("child pid={d}: background reaper not started ({s}); it stays unreaped", .{ pid, @errorName(err) });
+        return;
+    };
+    thread.detach();
+}
+
+fn blockingReap(pid: std.posix.pid_t) void {
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) {
+        const rc = std.posix.system.waitpid(pid, &status, 0);
+        switch (std.posix.errno(rc)) {
+            .INTR => continue,
+            else => return, // reaped, or ECHILD: nothing left to reap
+        }
+    }
+}
+
+/// Test aid: true once `pid` has exited, counting an unreaped zombie as
+/// exited. `processExists` (kill(pid, 0)) still sees a zombie, so a killed
+/// orphan reads as alive until PID 1 reaps it — which a container's PID 1 may
+/// never do promptly. Linux reads the state from /proc; elsewhere it falls
+/// back to `processExists`.
+pub fn processExitedOrZombie(pid: std.posix.pid_t) bool {
+    if (comptime builtin.os.tag == .linux) {
+        var path_buf: [48]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/stat", .{pid}) catch return !processExists(pid);
+        var stat_buf: [512]u8 = undefined;
+        const file = std_compat.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return true,
+            else => return !processExists(pid),
+        };
+        defer file.close();
+        const n = file.read(&stat_buf) catch return !processExists(pid);
+        const stat = stat_buf[0..n];
+        // "pid (comm) S ..." — comm may contain ')' and spaces, so take the
+        // state from after the LAST ')'.
+        const rparen = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return !processExists(pid);
+        if (rparen + 2 >= stat.len) return !processExists(pid);
+        return stat[rparen + 2] == 'Z';
+    }
+    return !processExists(pid);
+}
+
+/// Close and forget the child's stdio pipes — what `Child.kill()`/`wait()`
+/// do on the way out, for a child whose `term` was recorded without them.
+pub fn closeChildStdio(child: *std_compat.process.Child) void {
+    if (child.stdin) |f| f.close();
+    child.stdin = null;
+    if (child.stdout) |f| f.close();
+    child.stdout = null;
+    if (child.stderr) |f| f.close();
+    child.stderr = null;
+}
+
 fn processWatcherMain(ctx: *ProcessWatcherCtx) void {
     const poll_ns = 20 * std.time.ns_per_ms;
     var waited_ns: u64 = 0;
@@ -150,7 +350,7 @@ fn wasInterrupted(cancel_flag: ?*const AtomicBool) bool {
     return false;
 }
 
-fn processExists(pid: std.posix.pid_t) bool {
+pub fn processExists(pid: std.posix.pid_t) bool {
     std.posix.kill(pid, @as(std.posix.SIG, @enumFromInt(0))) catch |err| switch (err) {
         error.ProcessNotFound => return false,
         else => return true,
@@ -606,6 +806,188 @@ test "run timeout kills spawned shell descendants" {
     }
 
     try std.testing.expect(exited);
+}
+
+fn waitForFileForTest(path: []const u8) bool {
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        std_compat.fs.cwd().access(path, .{}) catch {
+            std_compat.thread.sleep(20 * std.time.ns_per_ms);
+            continue;
+        };
+        return true;
+    }
+    return false;
+}
+
+test "terminateProcessGroupAndReap sends SIGTERM to descendants before SIGKILL" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const ready_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "ready" });
+    defer allocator.free(ready_path);
+    const term_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "term" });
+    defer allocator.free(term_path);
+    // A grandchild that records the SIGTERM it receives, then exits.
+    const command = try std.fmt.allocPrint(
+        allocator,
+        "(trap 'echo term > \"{s}\"; exit 0' TERM; echo ready > \"{s}\"; while :; do sleep 0.05; done) & wait",
+        .{ term_path, ready_path },
+    );
+    defer allocator.free(command);
+
+    var child = std_compat.process.Child.init(&.{ "sh", "-c", command }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    applyProcessGroupPolicy(&child, false);
+    try child.spawn();
+    errdefer {
+        std.posix.kill(-child.id, std.posix.SIG.KILL) catch {};
+        _ = child.wait() catch {};
+    }
+    try std.testing.expect(waitForFileForTest(ready_path));
+
+    terminateProcessGroupAndReap(&child, timeout_term_grace_ns);
+
+    try std.testing.expectEqual(std_compat.process.Child.Term{ .signal = std.posix.SIG.KILL }, try child.wait());
+    // The grandchild got TERM (a chance to clean up), not just the final KILL.
+    const marker = try std_compat.fs.cwd().readFileAlloc(allocator, term_path, 32);
+    defer allocator.free(marker);
+    try std.testing.expectEqualStrings("term\n", marker);
+}
+
+test "terminateProcessGroupAndReap kills a TERM-ignoring child that has no process group of its own" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    // Spawned WITHOUT isolateProcessGroup: the group signal finds no group
+    // (and must never reach the caller's own group), so the pid is signalled.
+    var child = std_compat.process.Child.init(&.{ "sh", "-c", "trap '' TERM; exec sleep 30" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    errdefer {
+        std.posix.kill(child.id, std.posix.SIG.KILL) catch {};
+        _ = child.wait() catch {};
+    }
+    const pid = child.id;
+    std_compat.thread.sleep(100 * std.time.ns_per_ms); // let the trap take effect
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    terminateProcessGroupAndReap(&child, timeout_term_grace_ns);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+
+    try std.testing.expectEqual(std_compat.process.Child.Term{ .signal = std.posix.SIG.KILL }, try child.wait());
+    try std.testing.expect(!processExists(pid));
+    try std.testing.expect(elapsed_ns < timeout_term_grace_ns + 500 * std.time.ns_per_ms);
+}
+
+test "terminateProcessGroupAndReap on an already-exited child returns at once and records its term" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var child = std_compat.process.Child.init(&.{ "sh", "-c", "exit 0" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    applyProcessGroupPolicy(&child, false);
+    try child.spawn();
+    errdefer {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    }
+    std_compat.thread.sleep(100 * std.time.ns_per_ms); // now an unreaped zombie
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    terminateProcessGroupAndReap(&child, timeout_term_grace_ns);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+    closeChildStdio(&child);
+
+    // Reaped here, so wait() must return the recorded term rather than
+    // waiting on the pid a second time.
+    try std.testing.expectEqual(std_compat.process.Child.Term{ .signal = std.posix.SIG.KILL }, try child.wait());
+    try std.testing.expect(child.stdout == null and child.stderr == null);
+    try std.testing.expect(elapsed_ns < timeout_term_grace_ns);
+    // A second call is a no-op.
+    terminateProcessGroupAndReap(&child, timeout_term_grace_ns);
+}
+
+test "isolateProcessGroup isolates only when stdin is not a terminal" {
+    // Regression: an interactive `nullclaw cron run` put its child in a new
+    // group, so Ctrl-C left the child and its descendants running.
+    try std.testing.expect(shouldIsolateProcessGroup(false));
+    try std.testing.expect(!shouldIsolateProcessGroup(true));
+
+    var interactive = std_compat.process.Child.init(&.{"true"}, std.testing.allocator);
+    applyProcessGroupPolicy(&interactive, true);
+    try std.testing.expectEqual(@as(?std.posix.pid_t, null), interactive.pgid);
+
+    var scripted = std_compat.process.Child.init(&.{"true"}, std.testing.allocator);
+    applyProcessGroupPolicy(&scripted, false);
+    const expected: ?std.posix.pid_t = if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) null else 0;
+    try std.testing.expectEqual(expected, scripted.pgid);
+}
+
+test "reapInBackground reaps a child that exits after the caller gave up on it" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    // Regression: past the post-SIGKILL bound the term was recorded unreaped
+    // and nothing ever waited on the pid — a permanent zombie in the daemon.
+    var child = std_compat.process.Child.init(&.{ "sleep", "0.3" }, std.testing.allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    const pid = child.id;
+
+    reapInBackground(pid);
+
+    // kill(pid, 0) succeeds on a zombie, so "gone" here means reaped.
+    var reaped = false;
+    var i: usize = 0;
+    while (i < 150) : (i += 1) {
+        if (!processExists(pid)) {
+            reaped = true;
+            break;
+        }
+        std_compat.thread.sleep(20 * std.time.ns_per_ms);
+    }
+    if (!reaped) _ = tryReapChild(pid);
+    try std.testing.expect(reaped);
+}
+
+test "processExitedOrZombie counts an unreaped zombie as exited and a live process as not" {
+    // Zombies are recognised through /proc only; elsewhere the helper falls
+    // back to kill(pid, 0), which still sees an unreaped zombie.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var live = std_compat.process.Child.init(&.{ "sleep", "30" }, allocator);
+    live.stdin_behavior = .Ignore;
+    live.stdout_behavior = .Ignore;
+    live.stderr_behavior = .Ignore;
+    try live.spawn();
+    defer {
+        std.posix.kill(live.id, std.posix.SIG.KILL) catch {};
+        _ = live.wait() catch {};
+    }
+    try std.testing.expect(!processExitedOrZombie(live.id));
+
+    var done = std_compat.process.Child.init(&.{ "sh", "-c", "exit 0" }, allocator);
+    done.stdin_behavior = .Ignore;
+    done.stdout_behavior = .Ignore;
+    done.stderr_behavior = .Ignore;
+    try done.spawn();
+    defer _ = done.wait() catch {};
+    var i: usize = 0;
+    while (i < 100 and !processExitedOrZombie(done.id)) : (i += 1) {
+        std_compat.thread.sleep(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(processExitedOrZombie(done.id));
+    // Still a zombie (not yet reaped): kill(pid, 0) alone calls it alive.
+    try std.testing.expect(processExists(done.id));
 }
 
 test "RunResult deinit frees buffers" {

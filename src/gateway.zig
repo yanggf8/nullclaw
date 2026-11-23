@@ -4339,6 +4339,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     shell_child.stderr_behavior = .Pipe;
                     shell_child.cwd = state.cron_workspace_dir;
                     shell_child.env_map = &shell_env;
+                    tools_mod.process_util.isolateProcessGroup(&shell_child);
                     shell_child.spawn() catch |err| {
                         log.err("[{s}] exec failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, dr.manual, "cron_scheduler_shell");
@@ -4394,6 +4395,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         retry_child.stderr_behavior = .Pipe;
                         retry_child.cwd = state.cron_workspace_dir;
                         retry_child.env_map = &shell_env;
+                        tools_mod.process_util.isolateProcessGroup(&retry_child);
                         retry_child.spawn() catch |err| {
                             log.err("[{s}] shell retry spawn failed: {s}", .{ spec.id, @errorName(err) });
                             break;
@@ -4610,6 +4612,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     skill_child.stderr_behavior = .Pipe;
                     skill_child.cwd = state.cron_workspace_dir;
                     skill_child.env_map = &skill_env;
+                    tools_mod.process_util.isolateProcessGroup(&skill_child);
                     skill_child.spawn() catch |err| {
                         log.err("[{s}] skill exec failed: {s}", .{ spec.id, @errorName(err) });
                         complete(&state.cron_db_backend, state.cron_db_path, spec.id, dr.queue_row_id, start_ts, "error", null, spec.delete_after_run, false, cron_mod.execErrorRunResult(), run_trace_id, dr.manual, "cron_scheduler_skill");
@@ -4687,6 +4690,7 @@ fn runQueueWorker(state: *GatewayState) void {
                         retry_child.stderr_behavior = .Pipe;
                         retry_child.cwd = state.cron_workspace_dir;
                         retry_child.env_map = &skill_env;
+                        tools_mod.process_util.isolateProcessGroup(&retry_child);
                         retry_child.spawn() catch |err| {
                             log.err("[{s}] skill retry spawn failed: {s}", .{ spec.id, @errorName(err) });
                             break;
@@ -4892,6 +4896,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     shell_child.stderr_behavior = .Pipe;
                     shell_child.cwd = run_cwd;
                     shell_child.env_map = &shell_env;
+                    tools_mod.process_util.isolateProcessGroup(&shell_child);
                     shell_child.spawn() catch |err| {
                         log.err("job '{s}' exec failed: {s}", .{ id, @errorName(err) });
                         state.scheduler_mutex.lock();
@@ -5061,6 +5066,7 @@ fn runQueueWorker(state: *GatewayState) void {
                     skill_child.stderr_behavior = .Pipe;
                     skill_child.cwd = run_cwd;
                     skill_child.env_map = &skill_env;
+                    tools_mod.process_util.isolateProcessGroup(&skill_child);
                     skill_child.spawn() catch |err| {
                         log.err("[{s}] skill exec failed: {s}", .{ id, @errorName(err) });
                         state.scheduler_mutex.lock();

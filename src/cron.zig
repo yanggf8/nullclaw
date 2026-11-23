@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const config_paths = @import("config_paths.zig");
 const platform = @import("platform.zig");
+const process_util = @import("tools/process_util.zig");
 const bus = @import("bus.zig");
 const fs_compat = @import("fs_compat.zig");
 const json_util = @import("json_util.zig");
@@ -1763,7 +1764,7 @@ pub fn collectChildOutputWithTimeout(
         if (!timed_out and hasTimeoutExpired(start_ns, timeout_secs)) {
             try terminateAgentChildHard(child);
             timed_out = true;
-            // terminateAgentChildHard -> child.kill() waits and closes the
+            // terminateAgentChildHard reaps the child and closes the
             // stdout/stderr pipe handles. Continuing to poll those now-dead
             // fds is pointless and risks a busy-spin on POLLNVAL — stop here.
             break;
@@ -1774,7 +1775,17 @@ pub fn collectChildOutputWithTimeout(
 }
 
 fn terminateAgentChildHard(child: *std_compat.process.Child) !void {
-    _ = try child.kill();
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        _ = try child.kill();
+        return;
+    }
+    // Every child collected here is spawned in its own process group
+    // (process_util.isolateProcessGroup), so the timeout reaches the real
+    // command behind an `sh -c` wrapper and anything it spawned, instead of
+    // orphaning them. Bounded throughout: Child.kill() would SIGTERM the
+    // wrapper alone and then wait for it without limit.
+    process_util.terminateProcessGroupAndReap(child, process_util.timeout_term_grace_ns);
+    process_util.closeChildStdio(child);
 }
 
 /// Extract the final answer from agent stdout, stripping intermediate tool-call
@@ -2155,6 +2166,7 @@ pub fn runAgentJob(
         child.stderr_behavior = .Pipe;
         child.cwd = exec_cwd;
         child.env_map = &env_map;
+        process_util.isolateProcessGroup(&child);
 
         child.spawn() catch |err| switch (err) {
             error.FileNotFound => {
@@ -5744,6 +5756,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
             skill_child.stderr_behavior = .Pipe;
             skill_child.cwd = run_cwd;
             skill_child.env_map = &skill_env;
+            process_util.isolateProcessGroup(&skill_child);
             skill_child.spawn() catch |err| {
                 const m = std.fmt.bufPrint(&msg_buf, "error: skill spawn failed: {s}\n", .{@errorName(err)}) catch "error: skill spawn failed\n";
                 stderr_h.writeAll(m) catch {};
@@ -5788,6 +5801,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8, dry_run: bool) !v
                 retry_child.stderr_behavior = .Pipe;
                 retry_child.cwd = run_cwd;
                 retry_child.env_map = &skill_env;
+                process_util.isolateProcessGroup(&retry_child);
                 if (retry_child.spawn()) |_| {
                     const retry_start_ns = std_compat.time.nanoTimestamp();
                     const retry_timed_out = collectChildOutputWithTimeout(
@@ -8330,6 +8344,127 @@ test "classifyExecRun maps success timeout and exec errors" {
     try std.testing.expectEqual(@as(u8, 3), exec_error.verified);
     try std.testing.expectEqual(@as(u8, 7), exec_error.exit_code);
     try std.testing.expectEqualStrings("exec_error", exec_error.failure_class.?);
+}
+
+const TimedOutShellRunForTest = struct {
+    timed_out: bool,
+    elapsed_ns: i128,
+    term: std_compat.process.Child.Term,
+    stdout_len: usize,
+    stdio_closed: bool,
+    grandchild: std.posix.pid_t,
+};
+
+/// Run `sh -c "<prefix>sleep 30 & echo $! > PIDFILE; wait"` through
+/// collectChildOutputWithTimeout with a 1s timeout, spawned the way the
+/// gateway (`stdin_is_tty = false`) or an interactive `nullclaw cron run`
+/// (`stdin_is_tty = true`) spawns shell/skill jobs, and report what the
+/// collector did.
+fn runTimedOutShellForTest(allocator: std.mem.Allocator, prefix: []const u8, stdin_is_tty: bool) !TimedOutShellRunForTest {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const pid_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "grandchild.pid" });
+    defer allocator.free(pid_path);
+    const command = try std.fmt.allocPrint(allocator, "{s}sleep 30 & echo $! > \"{s}\"; wait", .{ prefix, pid_path });
+    defer allocator.free(command);
+
+    var child = std_compat.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), command }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    process_util.applyProcessGroupPolicy(&child, stdin_is_tty);
+    try child.spawn();
+    errdefer {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    }
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+
+    const start_ns = std_compat.time.nanoTimestamp();
+    const timed_out = try collectChildOutputWithTimeout(&child, allocator, &stdout, &stderr, 1, start_ns);
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+    const stdio_closed = child.stdout == null and child.stderr == null;
+    const term = try child.wait();
+
+    const pid_bytes = try std_compat.fs.cwd().readFileAlloc(allocator, pid_path, 32);
+    defer allocator.free(pid_bytes);
+    const grandchild = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, pid_bytes, " \t\r\n"), 10);
+    return .{
+        .timed_out = timed_out,
+        .elapsed_ns = elapsed_ns,
+        .term = term,
+        .stdout_len = stdout.items.len,
+        .stdio_closed = stdio_closed,
+        .grandchild = grandchild,
+    };
+}
+
+/// Poll until `pid` has exited — an unreaped zombie counts, since reaping a
+/// killed orphan is PID 1's job and not every PID 1 does it promptly. Kills
+/// it on the way out if it is still running.
+fn processGoneWithinForTest(pid: std.posix.pid_t) bool {
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        if (process_util.processExitedOrZombie(pid)) return true;
+        std_compat.thread.sleep(20 * std.time.ns_per_ms);
+    }
+    std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+    return false;
+}
+
+test "collectChildOutputWithTimeout kills the timed-out shell's descendants" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    // Regression: the timeout signalled only the `sh -c` wrapper, so the real
+    // command (here `sleep 30`) kept running as an orphan after the run was
+    // recorded as a timeout — and a retry_once retry then ran beside it.
+    const r = try runTimedOutShellForTest(std.testing.allocator, "", false);
+    const gone = processGoneWithinForTest(r.grandchild);
+    try std.testing.expect(r.timed_out);
+    try std.testing.expectEqual(std_compat.process.Child.Term{ .signal = std.posix.SIG.KILL }, r.term);
+    try std.testing.expectEqual(@as(usize, 0), r.stdout_len);
+    try std.testing.expect(r.stdio_closed);
+    // Both die on SIGTERM, so the grace period ends early.
+    try std.testing.expect(r.elapsed_ns < 1800 * std.time.ns_per_ms);
+    try std.testing.expect(gone);
+}
+
+test "collectChildOutputWithTimeout returns within the grace bound when the child ignores SIGTERM" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    // Regression: Child.kill() sends SIGTERM and then waits without bound, so a
+    // child ignoring TERM blocked the run-queue worker until it chose to exit.
+    const r = try runTimedOutShellForTest(std.testing.allocator, "trap '' TERM; ", false);
+    const gone = processGoneWithinForTest(r.grandchild);
+    try std.testing.expect(r.timed_out);
+    try std.testing.expectEqual(std_compat.process.Child.Term{ .signal = std.posix.SIG.KILL }, r.term);
+    // timeout (1s) + poll step lag (<=200ms) + TERM grace + scheduling slack.
+    const bound_ns: i128 = std.time.ns_per_s + process_util.timeout_term_grace_ns + 800 * std.time.ns_per_ms;
+    try std.testing.expect(r.elapsed_ns < bound_ns);
+    try std.testing.expect(gone);
+}
+
+test "collectChildOutputWithTimeout stays bounded for an interactive run, whose child keeps our process group" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    // An interactive `nullclaw cron run` (stdin is a terminal) does not
+    // isolate the child, so Ctrl-C keeps reaching it. The timeout then has no
+    // group to signal: it must fall back to the pid and still return within
+    // the grace bound even though the child ignores SIGTERM.
+    const r = try runTimedOutShellForTest(std.testing.allocator, "trap '' TERM; ", true);
+    const survived = !process_util.processExitedOrZombie(r.grandchild);
+    std.posix.kill(r.grandchild, std.posix.SIG.KILL) catch {};
+    try std.testing.expect(r.timed_out);
+    try std.testing.expectEqual(std_compat.process.Child.Term{ .signal = std.posix.SIG.KILL }, r.term);
+    try std.testing.expect(r.stdio_closed);
+    const bound_ns: i128 = std.time.ns_per_s + process_util.timeout_term_grace_ns + 800 * std.time.ns_per_ms;
+    try std.testing.expect(r.elapsed_ns < bound_ns);
+    // Documented trade-off: outside a group of its own, a descendant that
+    // ignores TERM is not reached by the timeout (Ctrl-C still reaches it).
+    try std.testing.expect(survived);
 }
 
 test "retry helpers gate first retry and preserve prior failure class" {
